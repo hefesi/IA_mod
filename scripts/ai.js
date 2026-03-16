@@ -7,6 +7,7 @@ var UnitCommand = Packages.mindustry.ai.UnitCommand;
 var Vec2 = Packages.arc.math.geom.Vec2;
 var Build = Packages.mindustry.world.Build;
 var BlockGroup = Packages.mindustry.world.meta.BlockGroup;
+var BlockFlag = Packages.mindustry.world.meta.BlockFlag;
 var Socket = Packages.java.net.Socket;
 var InetSocketAddress = Packages.java.net.InetSocketAddress;
 var OutputStreamWriter = Packages.java.io.OutputStreamWriter;
@@ -30,6 +31,9 @@ var config = {
   maxPowerClusters: 2,
   maxPumps: 2,
   maxLiquidHubs: 1,
+  maxThermals: 2,
+  maxCoolantTargets: 2,
+  thermalSearchRadius: 12,
   memorySize: 3,
   repeatPenalty: 25,
   actionCooldown: 180,
@@ -48,10 +52,13 @@ var config = {
   rlQTableBlend: 0.7,
   aiEnabledDefault: true,
   aiChatToggle: true,
+  aiTapToggle: true,
+  tapToggleWindow: 30,
   liquidSearchRadius: 10,
   maxConduitSteps: 80,
   liquidHubSearchRadius: 8,
   preferLiquidTank: false,
+  preferCryofluid: true,
   mobileSafeMode: true,
   mobileLogicInterval: 60,
   mobileCommandInterval: 180,
@@ -75,11 +82,15 @@ var state = {
   powerClusters: 0,
   pumpCount: 0,
   liquidHubCount: 0,
+  thermalCount: 0,
   actionHistory: [],
   lastActionTicks: {},
   aiEnabled: true,
   lastFactoryConfigTick: -9999,
-  lastErrorTick: -9999
+  lastErrorTick: -9999,
+  lastTapTick: -9999,
+  lastTapX: -1,
+  lastTapY: -1
 };
 
 // --- RL logging helpers (offline training via logs) ---
@@ -229,6 +240,7 @@ function snapshotState(core, enemyCore, enemies, team) {
     power: state.powerClusters,
     pumps: state.pumpCount,
     liquidHubs: state.liquidHubCount,
+    thermals: state.thermalCount,
     enemies: enemies,
     wave: state.waveIndex,
     enemyCore: enemyCore != null ? 1 : 0,
@@ -254,12 +266,7 @@ function emitTransition(prevState, actionName, nextState, info) {
 function setAiEnabled(enabled, player) {
   state.aiEnabled = enabled;
   var msg = enabled ? "IA ligada." : "IA desligada.";
-  Log.info("[IA] " + msg);
-  try {
-    if (player != null) player.sendMessage(msg);
-  } catch (e) {
-    // ignore
-  }
+  notify(msg, player);
 }
 
 function isMobileSafe() {
@@ -276,6 +283,20 @@ function applyMobileSafeMode() {
   if (config.liquidSearchRadius > config.mobileLiquidSearchRadius) config.liquidSearchRadius = config.mobileLiquidSearchRadius;
 }
 
+function notify(msg, player) {
+  try {
+    if (player != null) player.sendMessage(msg);
+  } catch (e) {
+    // ignore
+  }
+  try {
+    if (Vars.ui != null && Vars.ui.announce != null) Vars.ui.announce(msg);
+  } catch (e2) {
+    // ignore
+  }
+  Log.info("[IA] " + msg);
+}
+
 function unitTypeByName(name) {
   if (name == null) return null;
   try {
@@ -289,8 +310,9 @@ function unitTypeByName(name) {
 
 function configureBuild(build, value) {
   if (build == null) return false;
+  var player = getLocalPlayer();
   try {
-    if (Vars.player != null) {
+    if (player != null) {
       build.configure(value);
       return true;
     }
@@ -304,7 +326,7 @@ function configureBuild(build, value) {
     // ignore
   }
   try {
-    Call.tileConfig(Vars.player, build, value);
+    Call.tileConfig(player, build, value);
     return true;
   } catch (e3) {
     // ignore
@@ -447,12 +469,14 @@ function qScoresForState(stateObj) {
 }
 
 function getTeam() {
-  if (Vars.player != null) return Vars.player.team();
+  var player = getLocalPlayer();
+  if (player != null) return player.team();
   return Vars.state.rules.defaultTeam;
 }
 
 function getCore(team) {
-  if (Vars.player != null && Vars.player.core() != null) return Vars.player.core();
+  var player = getLocalPlayer();
+  if (player != null && player.core() != null) return player.core();
   try {
     var data = Vars.state.teams.get(team);
     if (data != null) return data.core();
@@ -460,6 +484,24 @@ function getCore(team) {
     // ignore
   }
   return null;
+}
+
+function getLocalPlayer() {
+  if (Vars.player != null) return Vars.player;
+  var found = null;
+  try {
+    Groups.player.each(function(p){
+      if (found == null && p != null && p.isLocal != null && p.isLocal()) found = p;
+    });
+    if (found == null) {
+      Groups.player.each(function(p){
+        if (found == null && p != null) found = p;
+      });
+    }
+  } catch (e) {
+    // ignore
+  }
+  return found;
 }
 
 function worldWidth() {
@@ -521,8 +563,9 @@ function placeBlock(block, x, y, rotation, team) {
   var tile = tileAt(x, y);
   if (tile == null) return false;
   if (!canPlaceBlock(block, x, y, rotation || 0, team)) return false;
-  if (Vars.player == null) return false;
-  Call.constructFinish(Vars.player, block, x, y, rotation || 0, team, false);
+  var player = getLocalPlayer();
+  if (player == null) return false;
+  Call.constructFinish(player, block, x, y, rotation || 0, team, false);
   return true;
 }
 
@@ -621,11 +664,23 @@ function findLiquidTiles(cx, cy, radius, maxCount) {
       if (tile == null) continue;
       if (tile.floor() != null && tile.floor().isLiquid && tile.block() == Blocks.air) {
         var dist2 = dx * dx + dy * dy;
-        found.push({ x: tile.x, y: tile.y, dist2: dist2, liquid: tile.floor().liquidDrop });
+        var liq = tile.floor().liquidDrop;
+        var score = 0;
+        if (liq != null) {
+          score += liq.heatCapacity;
+          if (liq.coolant) score += 2;
+          if (liq.temperature != null) score -= liq.temperature * 0.3;
+          if (liq.flammability != null) score -= liq.flammability * 0.2;
+          if (config.preferCryofluid && liq == Liquids.cryofluid) score += 5;
+        }
+        found.push({ x: tile.x, y: tile.y, dist2: dist2, liquid: liq, score: score });
       }
     }
   }
-  found.sort(function(a, b){ return a.dist2 - b.dist2; });
+  found.sort(function(a, b){
+    if (b.score != a.score) return b.score - a.score;
+    return a.dist2 - b.dist2;
+  });
   if (found.length > maxCount) found.length = maxCount;
   return found;
 }
@@ -813,19 +868,20 @@ function appendSeq(dst, src, limit) {
 }
 
 function commandUnitIds(team, ids, buildTarget, pos) {
-  if (Vars.player == null) return;
+  var player = getLocalPlayer();
+  if (player == null) return;
   if (ids == null || ids.size == 0) return;
   var arr = toIntArray(ids);
 
   // Move command works as a generic rally/attack order.
   try {
-    InputHandler.setUnitCommand(Vars.player, arr, UnitCommand.moveCommand);
+    InputHandler.setUnitCommand(player, arr, UnitCommand.moveCommand);
   } catch (e) {
     // ignore
   }
 
   try {
-    InputHandler.commandUnits(Vars.player, arr, buildTarget, null, pos, false, true);
+    InputHandler.commandUnits(player, arr, buildTarget, null, pos, false, true);
   } catch (e2) {
     // ignore
   }
@@ -946,6 +1002,36 @@ function findCoolantTarget(team, liquid, fromX, fromY) {
   return best;
 }
 
+function findCoolantTargets(team, liquid, fromX, fromY, limit) {
+  var targets = [];
+  if (liquid == null) return targets;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null) return;
+    if (b.block.group != BlockGroup.turrets) return;
+    if (!b.block.hasLiquids || b.liquids == null) return;
+    try {
+      if (!b.block.consumesLiquid(liquid)) return;
+    } catch (e) {
+      return;
+    }
+    var dx = b.tile.x - fromX;
+    var dy = b.tile.y - fromY;
+    var dist = dx * dx + dy * dy;
+    targets.push({ build: b, dist: dist });
+  });
+  targets.sort(function(a, b){ return a.dist - b.dist; });
+  if (limit != null && targets.length > limit) targets.length = limit;
+  var out = [];
+  for (var i = 0; i < targets.length; i++) out.push(targets[i].build);
+  return out;
+}
+
+function findHeatSpot(core, team) {
+  var cx = core.tile.x;
+  var cy = core.tile.y;
+  return findPlaceForBlock(Blocks.thermalGenerator, cx, cy, config.thermalSearchRadius, team);
+}
+
 function actionMine(core) {
   var team = getTeam();
   var ore = findBestOreNearCore(core);
@@ -996,15 +1082,43 @@ function actionLiquid(core) {
   }
   if (pump == null) return false;
 
-  var target = hubPos != null ? hubPos : { x: cx, y: cy };
-  var coolantTarget = findCoolantTarget(team, pumpLiquid, pump.x, pump.y);
-  if (coolantTarget != null) {
-    target = { x: coolantTarget.tile.x, y: coolantTarget.tile.y };
+  var coolantLiquid = pumpLiquid;
+  if (config.preferCryofluid && hub != null && hub.liquids != null) {
+    try {
+      if (hub.liquids.get(Liquids.cryofluid) > 0) coolantLiquid = Liquids.cryofluid;
+    } catch (e0) {
+      // ignore
+    }
   }
-  var step = stepToward(pump.x, pump.y, target.x, target.y);
-  var sx = pump.x + step.dx;
-  var sy = pump.y + step.dy;
-  placeConduitPath(team, sx, sy, target.x, target.y, config.maxConduitSteps);
+
+  var coolantTargets = findCoolantTargets(team, coolantLiquid, pump.x, pump.y, config.maxCoolantTargets);
+  if (hubPos != null) {
+    var stepHub = stepToward(pump.x, pump.y, hubPos.x, hubPos.y);
+    var sxHub = pump.x + stepHub.dx;
+    var syHub = pump.y + stepHub.dy;
+    placeConduitPath(team, sxHub, syHub, hubPos.x, hubPos.y, config.maxConduitSteps);
+
+    for (var ct = 0; ct < coolantTargets.length; ct++) {
+      var t = coolantTargets[ct];
+      placeConduitPath(team, hubPos.x, hubPos.y, t.tile.x, t.tile.y, config.maxConduitSteps);
+    }
+  } else if (coolantTargets.length > 0) {
+    var last = { x: pump.x, y: pump.y };
+    for (var ct2 = 0; ct2 < coolantTargets.length; ct2++) {
+      var t2 = coolantTargets[ct2];
+      var step = stepToward(last.x, last.y, t2.tile.x, t2.tile.y);
+      var sx = last.x + step.dx;
+      var sy = last.y + step.dy;
+      placeConduitPath(team, sx, sy, t2.tile.x, t2.tile.y, config.maxConduitSteps);
+      last = { x: t2.tile.x, y: t2.tile.y };
+    }
+  } else {
+    var target = { x: cx, y: cy };
+    var step2 = stepToward(pump.x, pump.y, target.x, target.y);
+    var sx2 = pump.x + step2.dx;
+    var sy2 = pump.y + step2.dy;
+    placeConduitPath(team, sx2, sy2, target.x, target.y, config.maxConduitSteps);
+  }
 
   var node = clampToBounds(pump.x + 1, pump.y);
   placeBlock(Blocks.powerNode, node.x, node.y, 0, team);
@@ -1038,6 +1152,16 @@ function actionDefend(core) {
 function actionPower(core) {
   if (state.powerClusters >= config.maxPowerClusters) return false;
   return placePowerCluster(getTeam(), core.tile.x + 4, core.tile.y + 2);
+}
+
+function actionThermal(core) {
+  if (state.thermalCount >= config.maxThermals) return false;
+  var team = getTeam();
+  var spot = findHeatSpot(core, team);
+  if (spot == null) return false;
+  if (!placeBlock(Blocks.thermalGenerator, spot.x, spot.y, 0, team)) return false;
+  state.thermalCount++;
+  return true;
 }
 
 function actionRally(core, enemyCore) {
@@ -1088,11 +1212,15 @@ Events.on(WorldLoadEvent, function(){
   state.powerClusters = 0;
   state.pumpCount = 0;
   state.liquidHubCount = 0;
+  state.thermalCount = 0;
   state.actionHistory = [];
   state.lastActionTicks = {};
   state.aiEnabled = config.aiEnabledDefault;
   state.lastFactoryConfigTick = -9999;
   state.lastErrorTick = -9999;
+  state.lastTapTick = -9999;
+  state.lastTapX = -1;
+  state.lastTapY = -1;
   rlSocketClose();
   rlSocket.queue = [];
   rlQTable = null;
@@ -1131,6 +1259,32 @@ Events.on(PlayerChatEvent, function(e){
 
   setAiEnabled(enabled, e.player);
   e.cancelled = true;
+});
+
+Events.on(TapEvent, function(e){
+  if (!config.aiTapToggle) return;
+  if (e == null || e.tile == null) return;
+  if (e.player != null && e.player.isLocal != null && !e.player.isLocal()) return;
+  var build = e.tile.build;
+  if (build == null || build.block == null) return;
+  try {
+    if (build.block.flags == null || !build.block.flags.contains(BlockFlag.core)) return;
+  } catch (e2) {
+    return;
+  }
+
+  var sameTile = (state.lastTapX == e.tile.x && state.lastTapY == e.tile.y);
+  var within = (state.tick - state.lastTapTick) <= config.tapToggleWindow;
+  if (sameTile && within) {
+    setAiEnabled(!state.aiEnabled, e.player);
+    state.lastTapTick = -9999;
+    state.lastTapX = -1;
+    state.lastTapY = -1;
+  } else {
+    state.lastTapTick = state.tick;
+    state.lastTapX = e.tile.x;
+    state.lastTapY = e.tile.y;
+  }
 });
 
 function runAiLogic() {
@@ -1181,6 +1335,11 @@ function runAiLogic() {
   }
 
   var actions = [
+    {
+      name: "thermal",
+      score: (state.thermalCount < config.maxThermals ? (powerNeedScore + 35) : 0),
+      run: function(){ return actionThermal(core2); }
+    },
     {
       name: "attackWave",
       score: wantsAttack ? 100 : 0,
