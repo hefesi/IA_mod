@@ -137,7 +137,8 @@ var rlQTableLastErrorTick = -9999;
 var aiHud = {
   table: null,
   button: null,
-  debugLabel: null
+  debugLabel: null,
+  useIcon: false
 };
 
 function rlSocketConnected() {
@@ -336,27 +337,48 @@ function buildHudButton() {
   if (Vars.ui == null || Vars.ui.hudGroup == null) return;
   if (Core.scene == null) return;
 
-  var table = new Table();
-  table.setFillParent(true);
-  table.touchable = Touchable.childrenOnly;
-  table.top().left().margin(6);
+  try {
+    var table = new Table();
+    table.setFillParent(true);
+    table.touchable = Touchable.childrenOnly;
+    table.top().left().margin(6);
 
-  var cell = table.button(Icon.pause, Styles.clearTogglei, function(){
-    setAiEnabled(!state.aiEnabled, getLocalPlayer());
-  });
-  cell.size(46, 46);
-  var btn = cell.get();
+    var useIcon = (Icon != null && Icon.play != null && Icon.pause != null);
+    var cell;
+    if (useIcon) {
+      cell = table.button(Icon.pause, Styles.clearTogglei, function(){
+        setAiEnabled(!state.aiEnabled, getLocalPlayer());
+      });
+      cell.size(46, 46);
+    } else {
+      cell = table.button("IA", Styles.flatBordert, function(){
+        setAiEnabled(!state.aiEnabled, getLocalPlayer());
+      });
+      cell.size(72, 38);
+    }
+    var btn = cell.get();
 
-  var labelCell = table.row().label("IA debug").left();
-  labelCell.style(Styles.outlineLabel);
-  labelCell.padTop(4);
-  var label = labelCell.get();
+    var labelCell = table.row().label("IA debug").left();
+    labelCell.padTop(4);
+    var label = labelCell.get();
+    try {
+      label.setStyle(Styles.outlineLabel);
+    } catch (e0) {
+      // ignore
+    }
 
-  aiHud.table = table;
-  aiHud.button = btn;
-  aiHud.debugLabel = label;
-  Vars.ui.hudGroup.addChild(table);
-  updateHudButton();
+    aiHud.table = table;
+    aiHud.button = btn;
+    aiHud.debugLabel = label;
+    aiHud.useIcon = useIcon;
+    Vars.ui.hudGroup.addChild(table);
+    updateHudButton();
+  } catch (e) {
+    aiHud.table = null;
+    aiHud.button = null;
+    aiHud.debugLabel = null;
+    aiHud.useIcon = false;
+  }
 }
 
 function updateHudButton() {
@@ -366,13 +388,15 @@ function updateHudButton() {
   } catch (e) {
     // ignore
   }
-  try {
-    var style = aiHud.button.getStyle();
-    if (style != null && style.imageUp != null) {
-      style.imageUp = state.aiEnabled ? Icon.pause : Icon.play;
+  if (aiHud.useIcon) {
+    try {
+      var style = aiHud.button.getStyle();
+      if (style != null && style.imageUp != null) {
+        style.imageUp = state.aiEnabled ? Icon.pause : Icon.play;
+      }
+    } catch (e2) {
+      // ignore
     }
-  } catch (e2) {
-    // ignore
   }
 }
 
@@ -409,6 +433,8 @@ function ensureHudButton() {
     }
     aiHud.table = null;
     aiHud.button = null;
+    aiHud.debugLabel = null;
+    aiHud.useIcon = false;
   }
   buildHudButton();
 }
@@ -1375,6 +1401,7 @@ Events.on(WorldLoadEvent, function(){
   aiHud.table = null;
   aiHud.button = null;
   aiHud.debugLabel = null;
+  aiHud.useIcon = false;
   ensureHudButton();
   if (config.rlPolicyMode != "heuristic") loadQTable();
   Log.info("[IA] Mundo carregado. Preparando plano de base.");
