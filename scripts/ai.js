@@ -104,6 +104,7 @@ var config = {
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
   controllerResetPenalty: -1,
   controllerResetCooldown: 300,
+  controllerResetCooldownEnabled: true,
   resourceReserve: {
     "copper": 120,
     "lead": 100,
@@ -495,14 +496,19 @@ function updateHudDebug() {
   var core = getCore(team);
   var pOk = player != null ? "ok" : "null";
   var cOk = core != null ? "ok" : "null";
+  var resourceLow = core != null ? isResourceLow(core) : false;
+  var enemiesNearby = core != null ? enemyNearby(team, core, config.waveEnemyScanRadius) : false;
+  var survivalMode = resourceLow || !enemiesNearby;
+  var lastResetAgo = state.lastControllerResetTick != null ? (state.tick - state.lastControllerResetTick) : -1;
+
   var text = "IA " + (state.aiEnabled ? "ON" : "OFF") +
     " | p:" + pOk +
     " c:" + cOk +
-    " obs:" + (config.observerMode ? "1" : "0") +
-    " built:" + (state.built ? "1" : "0") +
+    " surv:" + (survivalMode ? "1" : "0") +
     " r:" + Math.round(state.lastReward * 100) / 100 +
     " tick:" + state.tick +
     " last:" + (state.lastAction == "" ? "-" : state.lastAction) +
+    " reset:" + lastResetAgo +
     (state.lastPlaceFail != "" ? (" fail:" + state.lastPlaceFail) : "");
   try {
     aiHud.debugLabel.setText(text);
@@ -567,8 +573,8 @@ function ensurePlayerControlled() {
   }
 
   // Prevent flip-flopping controller assignments too frequently.
-  if (state.lastControllerResetTick == null) state.lastControllerResetTick = 0;
-  if ((state.tick - state.lastControllerResetTick) < config.controllerResetCooldown) return;
+  if (state.lastControllerResetTick == null) state.lastControllerResetTick = -9999;
+  if (state.playerControllerMode != null && (state.tick - state.lastControllerResetTick) < config.controllerResetCooldown) return;
 
   if (desiredMode === "player") {
     try {
@@ -1063,10 +1069,13 @@ function computeReward(prevState, actionName, nextState, info) {
     }
   }
 
-  // Penalize invalid/failed actions.
+  // Penalize invalid/failed actions, but only when it is a true resource failure.
   if (info != null && info.ok === false) {
     reward += config.rlRewardFail;
-    reward += config.rlRewardInvalidAction;
+    var reason = info.failReason != null ? String(info.failReason) : "";
+    if (reason.startsWith("no-items") || reason.startsWith("locked")) {
+      reward += config.rlRewardInvalidAction;
+    }
   }
 
   // Penalize controller resets (AI switching control mid-game).
@@ -1567,6 +1576,30 @@ function findEnemyCore(team) {
   return found;
 }
 
+function isResourceLow(core) {
+  if (core == null || core.items == null) return false;
+  var copper = availableCoreItems(core, Items.copper);
+  var lead = availableCoreItems(core, Items.lead);
+  var reserve = config.resourceReserve != null ? config.resourceReserve : {};
+  var reqCopper = reserve.copper != null ? reserve.copper : 0;
+  var reqLead = reserve.lead != null ? reserve.lead : 0;
+  return copper < reqCopper || lead < reqLead;
+}
+
+function enemyNearby(team, core, radius) {
+  if (core == null || radius == null || radius <= 0) return false;
+  var found = false;
+  var maxDist2 = radius * radius;
+  Groups.unit.each(function(u){
+    if (found) return;
+    if (u == null || u.team == team) return;
+    var dx = u.x - core.x;
+    var dy = u.y - core.y;
+    if (dx * dx + dy * dy <= maxDist2) found = true;
+  });
+  return found;
+}
+
 function collectUnitIds(team) {
   var ids = new IntSeq();
   var playerId = -1;
@@ -1959,13 +1992,21 @@ function collectRallyIds(buckets) {
 }
 
 function getRallyPoint(core, enemyCore, dist) {
-  var dx = enemyCore.x - core.x;
-  var dy = enemyCore.y - core.y;
-  var len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-  var rx = Math.round(core.x + (dx / len) * dist);
-  var ry = Math.round(core.y + (dy / len) * dist);
-  var clamped = clampToBounds(rx, ry);
-  return new Vec2(clamped.x, clamped.y);
+  if (core == null) return new Vec2(0, 0);
+  if (enemyCore != null) {
+    var dx = enemyCore.x - core.x;
+    var dy = enemyCore.y - core.y;
+    var len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+    var rx = Math.round(core.x + (dx / len) * dist);
+    var ry = Math.round(core.y + (dy / len) * dist);
+    var clamped = clampToBounds(rx, ry);
+    return new Vec2(clamped.x, clamped.y);
+  }
+  // If we don't know enemy position, just rally in a fixed direction (east) so units still move.
+  var rx2 = Math.round(core.x + dist);
+  var ry2 = core.y;
+  var clamped2 = clampToBounds(rx2, ry2);
+  return new Vec2(clamped2.x, clamped2.y);
 }
 
 function pushHistory(name) {
@@ -2223,7 +2264,8 @@ function actionRally(core, enemyCore) {
   var rally = getRallyPoint(core, enemyCore, config.rallyDistance);
   var rallyIds = collectRallyIds(buckets);
   commandUnitIds(team, rallyIds, null, rally);
-  return rallyIds.size > 0;
+  // Always return true if we issued a command (even if no units were found) to avoid penalizing the policy.
+  return true;
 }
 
 function actionAttackWave(core, enemyCore) {
@@ -2286,6 +2328,7 @@ Events.on(WorldLoadEvent, function(){
   state.playerControlledUnitId = -1;
   state.playerControllerSet = false;
   state.controllerResetPenalty = 0;
+  state.lastControllerResetTick = -9999;
   state.nnModel = null;
   state.nnLastLoadTick = -9999;
   state.nnLastSaveTick = -9999;
@@ -2401,7 +2444,10 @@ function runAiStep(core, team) {
   var enemies = countEnemyUnits(team);
   var availCopper = availableCoreItems(core, Items.copper);
   var availLead = availableCoreItems(core, Items.lead);
-  var wantsAttack = enemyCore != null && shouldAttack(core);
+  var resourceLow = isResourceLow(core);
+  var noEnemiesNearby = (enemies == 0) || !enemyNearby(team, core, config.waveEnemyScanRadius);
+  var survivalMode = resourceLow || noEnemiesNearby;
+  var wantsAttack = !survivalMode && enemyCore != null && shouldAttack(core);
   var canDrill = coreHasItemsFor(Blocks.mechanicalDrill, team);
   var canDuo = coreHasItemsFor(Blocks.duo, team);
   var canPowerNode = coreHasItemsFor(Blocks.powerNode, team);
@@ -2452,6 +2498,23 @@ function runAiStep(core, team) {
   addAction("power", (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0), actionHandlers.power);
   addAction("liquid", (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0), runCore(actionLiquid));
   addAction("noop", 0, actionHandlers.noop);
+
+  // Survival mode: quando recursos estão baixos ou não há inimigos próximos,
+  // priorizar defesa/retirada (rally + torres) e reduzir a agressividade.
+  if (survivalMode) {
+    for (var ai = 0; ai < actions.length; ai++) {
+      var a = actions[ai];
+      if (a.name === "attackWave") {
+        a.score *= 0.2;
+      }
+      if (a.name === "rally") {
+        a.score += 40;
+      }
+      if (a.name === "defend") {
+        a.score += 40;
+      }
+    }
+  }
 
   if (config.rlPolicyMode != "heuristic") {
     if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
@@ -2511,18 +2574,20 @@ function runAiStep(core, team) {
     break;
   }
   var did = state.lastActionOk === true;
+  var failReason = state.lastPlaceFail;
 
   var core2 = getCore(team);
   var enemyCore2 = findEnemyCore(team);
   var enemies2 = countEnemyUnits(team);
   var afterState = snapshotState(core2, enemyCore2, enemies2, team);
-  var reward = computeReward(beforeState, pickedName, afterState, { ok: did });
+  var reward = computeReward(beforeState, pickedName, afterState, { ok: did, failReason: failReason });
   state.lastReward = reward;
   updateOnlineQTable(beforeState, pickedName, afterState, reward);
   updateNNModel(beforeState, pickedName, afterState, reward);
   saveQTableIfNeeded();
   saveNNModelIfNeeded();
   emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
+  state.lastPlaceFail = "";
 }
 
 
