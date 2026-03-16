@@ -4,5 +4,5 @@
   "author": "Henrique + Codex",
   "description": "IA de que monta base, controla unidades e adapta layout ao mapa.",
   "minGameVersion": "154",
-  "version": "0.3.11"
+  "version": "0.3.21"
 }

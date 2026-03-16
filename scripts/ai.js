@@ -12,6 +12,7 @@ var Table = Packages.arc.scene.ui.layout.Table;
 var Touchable = Packages.arc.scene.Touchable;
 var Styles = Packages.mindustry.ui.Styles;
 var Icon = Packages.mindustry.gen.Icon;
+var CommandAI = Packages.mindustry.ai.types.CommandAI;
 var Socket = Packages.java.net.Socket;
 var InetSocketAddress = Packages.java.net.InetSocketAddress;
 var OutputStreamWriter = Packages.java.io.OutputStreamWriter;
@@ -43,17 +44,35 @@ var config = {
   actionCooldown: 180,
   modName: "ia-base-ataque",
   rlLogEnabled: true,
-  rlSocketEnabled: false,
+  rlSocketEnabled: true,
   rlSocketHost: "127.0.0.1",
   rlSocketPort: 4567,
   rlSocketReconnectTicks: 300,
   rlSocketTimeoutMs: 200,
   rlSocketQueueMax: 200,
-  rlPolicyMode: "heuristic",
+  rlPolicyMode: "hybrid",
   rlQTableFile: "q_table.json",
   rlQTablePath: "",
   rlQTableReloadTicks: 0,
   rlQTableBlend: 0.7,
+  rlOnlineEnabled: true,
+  rlAlpha: 0.12,
+  rlGamma: 0.9,
+  rlRewardClamp: 120,
+  rlRewardFail: -2,
+  rlRewardCoreLost: -500,
+  rlRewardWin: 500,
+  rlRewardCoreDamageScale: 200,
+  rlRewardCopper: 0.02,
+  rlRewardLead: 0.02,
+  rlRewardDrill: 4,
+  rlRewardTurret: 6,
+  rlRewardPower: 3,
+  rlRewardPump: 2,
+  rlRewardLiquidHub: 3,
+  rlRewardThermal: 5,
+  rlRewardUnit: 0.2,
+  rlSaveInterval: 1800,
   aiEnabledDefault: true,
   aiChatToggle: true,
   aiTapToggle: true,
@@ -61,8 +80,22 @@ var config = {
   aiHudButton: true,
   aiDebugHud: true,
   debugUpdateInterval: 30,
+  autoDisableHudOnMobile: true,
   campaignSafeMode: true,
   warnInterval: 300,
+  aiControlPlayerUnit: true,
+  observerMode: true,
+  resourceReserve: {
+    "copper": 120,
+    "lead": 100,
+    "graphite": 40,
+    "metaglass": 40,
+    "silicon": 40,
+    "titanium": 60,
+    "thorium": 30,
+    "phase-fabric": 10,
+    "surge-alloy": 10
+  },
   liquidSearchRadius: 10,
   maxConduitSteps: 80,
   liquidHubSearchRadius: 8,
@@ -77,7 +110,16 @@ var config = {
   factoryConfigInterval: 600,
   preferredGroundUnit: "dagger",
   preferredAirUnit: "mono",
-  preferredNavalUnit: "risso"
+  preferredNavalUnit: "risso",
+  logicEnabled: true,
+  logicBuildInterval: 600,
+  logicSearchRadius: 8,
+  logicControlRadius: 12,
+  logicMaxProcessors: 3,
+  logicUseGround: true,
+  logicUseAir: true,
+  logicUseNaval: false,
+  logicAttackRadius: 8
 };
 
 var state = {
@@ -104,7 +146,15 @@ var state = {
   lastAction: "",
   lastActionOk: false,
   lastPlaceFail: "",
-  lastWarnTick: -9999
+  lastWarnTick: -9999,
+  lastReward: 0,
+  lastQSaveTick: -9999,
+  lastLogicTick: -9999,
+  logicControllers: {
+    ground: null,
+    air: null,
+    naval: null
+  }
 };
 
 // --- RL logging helpers (offline training via logs) ---
@@ -288,6 +338,7 @@ function setAiEnabled(enabled, player) {
   var msg = enabled ? "IA ligada." : "IA desligada.";
   notify(msg, player);
   updateHudButton();
+  setLogicProcessorsEnabled(enabled);
 }
 
 function isMobileSafe() {
@@ -299,9 +350,14 @@ function applyMobileSafeMode() {
   config.rlSocketEnabled = false;
   config.rlLogEnabled = false;
   config.rlPolicyMode = "heuristic";
+  config.rlSaveInterval = 0;
   if (config.commandInterval < config.mobileCommandInterval) config.commandInterval = config.mobileCommandInterval;
   if (config.factoryConfigInterval < config.mobileFactoryConfigInterval) config.factoryConfigInterval = config.mobileFactoryConfigInterval;
   if (config.liquidSearchRadius > config.mobileLiquidSearchRadius) config.liquidSearchRadius = config.mobileLiquidSearchRadius;
+  if (config.autoDisableHudOnMobile) {
+    config.aiHudButton = false;
+    config.aiDebugHud = false;
+  }
 }
 
 function notify(msg, player) {
@@ -411,7 +467,9 @@ function updateHudDebug() {
   var text = "IA " + (state.aiEnabled ? "ON" : "OFF") +
     " | p:" + pOk +
     " c:" + cOk +
+    " obs:" + (config.observerMode ? "1" : "0") +
     " built:" + (state.built ? "1" : "0") +
+    " r:" + Math.round(state.lastReward * 100) / 100 +
     " tick:" + state.tick +
     " last:" + (state.lastAction == "" ? "-" : state.lastAction) +
     (state.lastPlaceFail != "" ? (" fail:" + state.lastPlaceFail) : "");
@@ -437,6 +495,28 @@ function ensureHudButton() {
     aiHud.useIcon = false;
   }
   buildHudButton();
+}
+
+function ensurePlayerControlled() {
+  if (!config.aiControlPlayerUnit) return;
+  var player = getLocalPlayer();
+  if (player == null || player.unit() == null) return;
+  var unit = player.unit();
+  if (!state.aiEnabled || config.observerMode) {
+    try {
+      unit.controller(player);
+    } catch (e) {
+      // ignore
+    }
+    return;
+  }
+  try {
+    if (!(unit.controller() instanceof CommandAI)) {
+      unit.controller(new CommandAI());
+    }
+  } catch (e2) {
+    // ignore
+  }
 }
 
 function unitTypeByName(name) {
@@ -610,6 +690,117 @@ function qScoresForState(stateObj) {
   return scores;
 }
 
+function qActionIndex(name) {
+  if (rlQMeta == null || rlQMeta.actions == null) return -1;
+  for (var i = 0; i < rlQMeta.actions.length; i++) {
+    if (rlQMeta.actions[i] == name) return i;
+  }
+  return -1;
+}
+
+function ensureQRow(key) {
+  if (rlQTable == null) rlQTable = {};
+  var actions = rlQMeta.actions != null ? rlQMeta.actions : [];
+  var size = actions.length;
+  var row = rlQTable[key];
+  if (row == null) {
+    row = [];
+    for (var i = 0; i < size; i++) row.push(0);
+    rlQTable[key] = row;
+    return row;
+  }
+  if (row.length < size) {
+    for (var j = row.length; j < size; j++) row.push(0);
+  }
+  return row;
+}
+
+function maxArray(arr) {
+  if (arr == null || arr.length == 0) return 0;
+  var max = arr[0];
+  for (var i = 1; i < arr.length; i++) {
+    if (arr[i] > max) max = arr[i];
+  }
+  return max;
+}
+
+function computeReward(prevState, actionName, nextState, info) {
+  if (prevState == null || nextState == null) return 0;
+  var reward = 0;
+  reward += (nextState.copper - prevState.copper) * config.rlRewardCopper;
+  reward += (nextState.lead - prevState.lead) * config.rlRewardLead;
+  reward += (nextState.drills - prevState.drills) * config.rlRewardDrill;
+  reward += (nextState.turrets - prevState.turrets) * config.rlRewardTurret;
+  reward += (nextState.power - prevState.power) * config.rlRewardPower;
+  reward += (nextState.pumps - prevState.pumps) * config.rlRewardPump;
+  reward += (nextState.liquidHubs - prevState.liquidHubs) * config.rlRewardLiquidHub;
+  reward += (nextState.thermals - prevState.thermals) * config.rlRewardThermal;
+  reward += (nextState.unitsTotal - prevState.unitsTotal) * config.rlRewardUnit;
+
+  var dCore = nextState.coreHealthFrac - prevState.coreHealthFrac;
+  reward += dCore * config.rlRewardCoreDamageScale;
+
+  if (prevState.corePresent == 1 && nextState.corePresent == 0) reward += config.rlRewardCoreLost;
+  if (prevState.enemyCore == 1 && nextState.enemyCore == 0) reward += config.rlRewardWin;
+
+  if (info != null && info.ok === false) reward += config.rlRewardFail;
+
+  var clamp = config.rlRewardClamp;
+  if (clamp != null && clamp > 0) {
+    if (reward > clamp) reward = clamp;
+    if (reward < -clamp) reward = -clamp;
+  }
+  return reward;
+}
+
+function updateOnlineQTable(prevState, actionName, nextState, reward) {
+  if (!config.rlOnlineEnabled) return false;
+  if (rlQMeta == null || rlQMeta.actions == null || rlQMeta.features == null) return false;
+  if (rlQMeta.features.length == 0) return false;
+  var aIndex = qActionIndex(actionName);
+  if (aIndex < 0) return false;
+
+  var sKey = encodeStateKey(prevState, rlQMeta.features);
+  var s2Key = encodeStateKey(nextState, rlQMeta.features);
+  var qRow = ensureQRow(sKey);
+  var qNext = ensureQRow(s2Key);
+  var maxNext = maxArray(qNext);
+  var oldQ = qRow[aIndex] != null ? qRow[aIndex] : 0;
+  var alpha = config.rlAlpha != null ? config.rlAlpha : 0.1;
+  var gamma = config.rlGamma != null ? config.rlGamma : 0.9;
+  var updated = oldQ + alpha * (reward + gamma * maxNext - oldQ);
+  qRow[aIndex] = updated;
+  return true;
+}
+
+function saveQTableIfNeeded() {
+  if (!config.rlOnlineEnabled) return;
+  if (config.rlSaveInterval == null || config.rlSaveInterval <= 0) return;
+  if ((state.tick - state.lastQSaveTick) < config.rlSaveInterval) return;
+  if (isMobileSafe()) return;
+  saveQTable();
+}
+
+function saveQTable() {
+  if (rlQTable == null) return false;
+  var fi = resolveQTableFi();
+  if (fi == null) return false;
+  try {
+    var payload = {
+      q: rlQTable,
+      actions: rlQMeta.actions,
+      features: rlQMeta.features
+    };
+    var text = JSON.stringify(payload);
+    fi.parent().mkdirs();
+    fi.writeString(text, false);
+    state.lastQSaveTick = state.tick;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function getTeam() {
   var player = getLocalPlayer();
   if (player != null) return player.team();
@@ -662,6 +853,7 @@ function tileAt(x, y) {
 function canPlaceBlock(block, x, y, rotation, team) {
   if (block == null) return false;
   if (!blockUnlocked(block)) return false;
+  if (!coreHasItemsFor(block, team)) return false;
   var tile = tileAt(x, y);
   if (tile == null) return false;
   var t = team != null ? team : getTeam();
@@ -680,6 +872,67 @@ function blockUnlocked(block) {
   } catch (e) {
     return true;
   }
+}
+
+function reserveFor(item) {
+  if (config.resourceReserve == null || item == null) return 0;
+  var key = null;
+  try {
+    key = item.name;
+  } catch (e) {
+    key = null;
+  }
+  if (key == null) return 0;
+  var val = config.resourceReserve[key];
+  if (val == null) return 0;
+  return Math.max(0, val);
+}
+
+function availableCoreItems(core, item) {
+  if (core == null || core.items == null || item == null) return 0;
+  var total = core.items.get(item);
+  var reserve = reserveFor(item);
+  var avail = total - reserve;
+  return avail < 0 ? 0 : avail;
+}
+
+function coreHasItemsFor(block, team) {
+  if (block == null) return false;
+  if (Vars.state != null && Vars.state.rules != null && Vars.state.rules.infiniteResources) return true;
+  var t = team != null ? team : getTeam();
+  var core = getCore(t);
+  if (core == null || core.items == null) return false;
+  var reqs = block.requirements;
+  if (reqs == null || reqs.length == 0) return true;
+  var mult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
+  for (var i = 0; i < reqs.length; i++) {
+    var stack = reqs[i];
+    var need = Math.ceil(stack.amount * mult);
+    if (availableCoreItems(core, stack.item) < need) return false;
+  }
+  return true;
+}
+
+function consumeCoreItems(block, team) {
+  if (block == null) return false;
+  if (Vars.state != null && Vars.state.rules != null && Vars.state.rules.infiniteResources) return true;
+  var t = team != null ? team : getTeam();
+  var core = getCore(t);
+  if (core == null || core.items == null) return false;
+  var reqs = block.requirements;
+  if (reqs == null || reqs.length == 0) return true;
+  var mult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
+  for (var i = 0; i < reqs.length; i++) {
+    var stack = reqs[i];
+    var need = Math.ceil(stack.amount * mult);
+    if (availableCoreItems(core, stack.item) < need) return false;
+  }
+  for (var i2 = 0; i2 < reqs.length; i2++) {
+    var stack2 = reqs[i2];
+    var need2 = Math.ceil(stack2.amount * mult);
+    core.items.remove(stack2.item, need2);
+  }
+  return true;
 }
 
 function findPlaceForBlock(block, cx, cy, radius, team) {
@@ -723,6 +976,11 @@ function placeBlock(block, x, y, rotation, team) {
     warnBuildFail("Bloqueado: " + block.localizedName);
     return false;
   }
+  if (!coreHasItemsFor(block, team)) {
+    if (config.aiDebugHud) state.lastPlaceFail = "no-items:" + block.name;
+    warnBuildFail("Sem recursos: " + block.localizedName);
+    return false;
+  }
   if (!canPlaceBlock(block, x, y, rotation || 0, team)) {
     if (config.aiDebugHud) state.lastPlaceFail = "invalid:" + block.name;
     warnBuildFail("Nao foi possivel construir: " + block.localizedName);
@@ -732,6 +990,11 @@ function placeBlock(block, x, y, rotation, team) {
   if (player == null) {
     if (config.aiDebugHud) state.lastPlaceFail = "no-player";
     warnBuildFail("Aguardando jogador local...");
+    return false;
+  }
+  if (!consumeCoreItems(block, team)) {
+    if (config.aiDebugHud) state.lastPlaceFail = "no-items:" + block.name;
+    warnBuildFail("Sem recursos: " + block.localizedName);
     return false;
   }
   Call.constructFinish(player, block, x, y, rotation || 0, team, false);
@@ -947,8 +1210,8 @@ function buildPlan(core) {
 
 function shouldAttack(core) {
   if (core == null || core.items == null) return false;
-  var copper = core.items.get(Items.copper);
-  var lead = core.items.get(Items.lead);
+  var copper = availableCoreItems(core, Items.copper);
+  var lead = availableCoreItems(core, Items.lead);
   return copper >= 400 && lead >= 300;
 }
 
@@ -976,8 +1239,15 @@ function findEnemyCore(team) {
 
 function collectUnitIds(team) {
   var ids = new IntSeq();
+  var playerId = -1;
+  if (config.observerMode) {
+    var player = getLocalPlayer();
+    if (player != null && player.unit() != null) playerId = player.unit().id;
+  }
   Groups.unit.each(function(u){
-    if (u.team == team) ids.add(u.id);
+    if (u.team != team) return;
+    if (playerId != -1 && u.id == playerId) return;
+    ids.add(u.id);
   });
   return ids;
 }
@@ -1011,8 +1281,14 @@ function collectUnitBuckets(team) {
     air: new IntSeq(),
     support: new IntSeq()
   };
+  var playerId = -1;
+  if (config.observerMode) {
+    var player = getLocalPlayer();
+    if (player != null && player.unit() != null) playerId = player.unit().id;
+  }
   Groups.unit.each(function(u){
     if (u.team != team) return;
+    if (playerId != -1 && u.id == playerId) return;
     if (containsType(supportTypes, u.type)) {
       buckets.support.add(u.id);
     } else if (u.type.flying) {
@@ -1054,6 +1330,183 @@ function commandUnitIds(team, ids, buildTarget, pos) {
     InputHandler.commandUnits(player, arr, buildTarget, null, pos, false, true);
   } catch (e2) {
     // ignore
+  }
+}
+
+function isLogicBlock(block) {
+  return block == Blocks.microProcessor || block == Blocks.logicProcessor || block == Blocks.hyperProcessor || block == Blocks.worldProcessor;
+}
+
+function pickLogicBlock(team) {
+  var order = [Blocks.microProcessor, Blocks.logicProcessor, Blocks.hyperProcessor];
+  for (var i = 0; i < order.length; i++) {
+    var b = order[i];
+    if (b == null) continue;
+    if (!blockUnlocked(b)) continue;
+    if (!coreHasItemsFor(b, team)) continue;
+    return b;
+  }
+  return null;
+}
+
+function unitTypeForRole(role) {
+  var name = null;
+  if (role == "ground") name = config.preferredGroundUnit;
+  if (role == "air") name = config.preferredAirUnit;
+  if (role == "naval") name = config.preferredNavalUnit;
+  if (name == null || name == "") return null;
+  var type = unitTypeByName(name);
+  if (type == null) return null;
+  try {
+    if (config.campaignSafeMode && type.unlockedNow != null && !type.unlockedNow()) return null;
+  } catch (e) {
+    // ignore
+  }
+  try {
+    if (type.logicControllable != null && !type.logicControllable) return null;
+  } catch (e2) {
+    // ignore
+  }
+  return type;
+}
+
+function buildLogicProgram(unitType, rallyX, rallyY) {
+  if (unitType == null) return null;
+  var uname = unitType.name != null ? unitType.name : String(unitType);
+  var lines = [];
+  lines.push("set rallyX " + Math.round(rallyX));
+  lines.push("set rallyY " + Math.round(rallyY));
+  lines.push("ubind @" + uname);
+  lines.push("jump __REBIND__ equal @unit null");
+  lines.push("uradar enemy any any distance 1 target");
+  lines.push("jump __RALLY__ equal target null");
+  lines.push("sensor tx target @x");
+  lines.push("sensor ty target @y");
+  lines.push("ucontrol approach tx ty " + config.logicAttackRadius);
+  lines.push("ucontrol target tx ty 1");
+  lines.push("jump 2 always");
+  var rallyIndex = lines.length;
+  lines.push("ucontrol move rallyX rallyY");
+  lines.push("jump 2 always");
+  lines[3] = "jump 2 equal @unit null";
+  lines[5] = "jump " + rallyIndex + " equal target null";
+  return lines.join("\n");
+}
+
+function validateLogicController(ctrl, team) {
+  if (ctrl == null) return null;
+  var tile = tileAt(ctrl.x, ctrl.y);
+  if (tile == null || tile.build == null) return null;
+  if (tile.build.team != team) return null;
+  if (!isLogicBlock(tile.build.block)) return null;
+  return tile.build;
+}
+
+function countLogicProcessors(team, core) {
+  var count = 0;
+  var cx = core != null ? core.tile.x : 0;
+  var cy = core != null ? core.tile.y : 0;
+  var radius = config.logicControlRadius;
+  var maxDist2 = radius * radius;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null) return;
+    if (!isLogicBlock(b.block)) return;
+    var dx = b.tile.x - cx;
+    var dy = b.tile.y - cy;
+    if (dx * dx + dy * dy > maxDist2) return;
+    count++;
+  });
+  return count;
+}
+
+function placeLogicController(team, core) {
+  var block = pickLogicBlock(team);
+  if (block == null) return null;
+  var pos = findPlaceForBlock(block, core.tile.x, core.tile.y, config.logicSearchRadius, team);
+  if (pos == null) return null;
+  if (!placeBlock(block, pos.x, pos.y, 0, team)) return null;
+  var tile = tileAt(pos.x, pos.y);
+  if (tile == null) return null;
+  return tile.build;
+}
+
+function programLogic(build, role, core) {
+  if (build == null || core == null) return false;
+  var unitType = unitTypeForRole(role);
+  if (unitType == null) return false;
+  var rallyX = core.x;
+  var rallyY = core.y;
+  var code = buildLogicProgram(unitType, rallyX, rallyY);
+  if (code == null) return false;
+  try {
+    if (build.code == null || build.code != code) {
+      build.updateCode(code);
+    }
+  } catch (e) {
+    try {
+      build.updateCode(code, true, null);
+    } catch (e2) {
+      // ignore
+    }
+  }
+  try {
+    build.enabled = state.aiEnabled;
+  } catch (e3) {
+    // ignore
+  }
+  return true;
+}
+
+function setLogicProcessorsEnabled(enabled) {
+  if (!config.logicEnabled) return;
+  var team = getTeam();
+  var core = getCore(team);
+  if (core == null) return;
+  var cx = core.tile.x;
+  var cy = core.tile.y;
+  var radius = config.logicControlRadius;
+  var maxDist2 = radius * radius;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null) return;
+    if (!isLogicBlock(b.block)) return;
+    var dx = b.tile.x - cx;
+    var dy = b.tile.y - cy;
+    if (dx * dx + dy * dy > maxDist2) return;
+    try {
+      b.enabled = enabled;
+    } catch (e) {
+      // ignore
+    }
+  });
+}
+
+function ensureLogicControllers(core, team) {
+  if (!config.logicEnabled) return;
+  if (core == null) return;
+  if ((state.tick - state.lastLogicTick) < config.logicBuildInterval) return;
+  state.lastLogicTick = state.tick;
+
+  var roles = [];
+  if (config.logicUseGround) roles.push("ground");
+  if (config.logicUseAir) roles.push("air");
+  if (config.logicUseNaval) roles.push("naval");
+
+  for (var i = 0; i < roles.length; i++) {
+    var role = roles[i];
+    var build = validateLogicController(state.logicControllers[role], team);
+    if (build == null) {
+      state.logicControllers[role] = null;
+      var total = countLogicProcessors(team, core);
+      if (total >= config.logicMaxProcessors) continue;
+      var placed = placeLogicController(team, core);
+      if (placed != null) {
+        state.logicControllers[role] = { x: placed.tile.x, y: placed.tile.y };
+        build = placed;
+      }
+    }
+    if (build != null) {
+      programLogic(build, role, core);
+    }
   }
 }
 
@@ -1204,6 +1657,7 @@ function findHeatSpot(core, team) {
 
 function actionMine(core) {
   var team = getTeam();
+  if (!coreHasItemsFor(Blocks.mechanicalDrill, team)) return false;
   var ore = findBestOreNearCore(core);
   if (ore == null) return false;
   if (!placeBlock(Blocks.mechanicalDrill, ore.x, ore.y, 0, team)) return false;
@@ -1220,6 +1674,7 @@ function actionMine(core) {
 function actionLiquid(core) {
   var team = getTeam();
   if (state.pumpCount >= config.maxPumps && state.liquidHubCount >= config.maxLiquidHubs) return false;
+  if (!coreHasItemsFor(Blocks.mechanicalPump, team)) return false;
   var cx = core.tile.x;
   var cy = core.tile.y;
 
@@ -1298,6 +1753,7 @@ function actionLiquid(core) {
 function actionDefend(core) {
   var team = getTeam();
   if (state.turretCount >= config.maxTurrets) return false;
+  if (!coreHasItemsFor(Blocks.duo, team)) return false;
   var offsets = [
     { dx: 6, dy: 0 },
     { dx: -6, dy: 0 },
@@ -1321,12 +1777,14 @@ function actionDefend(core) {
 
 function actionPower(core) {
   if (state.powerClusters >= config.maxPowerClusters) return false;
+  if (!coreHasItemsFor(Blocks.powerNode, getTeam())) return false;
   return placePowerCluster(getTeam(), core.tile.x + 4, core.tile.y + 2);
 }
 
 function actionThermal(core) {
   if (state.thermalCount >= config.maxThermals) return false;
   var team = getTeam();
+  if (!coreHasItemsFor(Blocks.thermalGenerator, team)) return false;
   var spot = findHeatSpot(core, team);
   if (spot == null) return false;
   if (!placeBlock(Blocks.thermalGenerator, spot.x, spot.y, 0, team)) return false;
@@ -1392,6 +1850,10 @@ Events.on(WorldLoadEvent, function(){
   state.lastTapX = -1;
   state.lastTapY = -1;
   state.lastWarnTick = -9999;
+  state.lastReward = 0;
+  state.lastQSaveTick = -9999;
+  state.lastLogicTick = -9999;
+  state.logicControllers = { ground: null, air: null, naval: null };
   rlSocketClose();
   rlSocket.queue = [];
   rlQTable = null;
@@ -1484,12 +1946,23 @@ function runAiLogic() {
   if (core2 == null) return;
 
   configureFactories(team2);
+  ensureLogicControllers(core2, team2);
 
   var enemyCore = findEnemyCore(team2);
   var enemies = countEnemyUnits(team2);
   var copper = core2.items.get(Items.copper);
   var lead = core2.items.get(Items.lead);
+  var availCopper = availableCoreItems(core2, Items.copper);
+  var availLead = availableCoreItems(core2, Items.lead);
   var wantsAttack = enemyCore != null && shouldAttack(core2);
+  var canDrill = coreHasItemsFor(Blocks.mechanicalDrill, team2);
+  var canDuo = coreHasItemsFor(Blocks.duo, team2);
+  var canPowerNode = coreHasItemsFor(Blocks.powerNode, team2);
+  var canThermal = coreHasItemsFor(Blocks.thermalGenerator, team2);
+  var hubBlock = pickLiquidHubBlock(core2);
+  var canPump = coreHasItemsFor(Blocks.mechanicalPump, team2);
+  var canLiquidHub = hubBlock != null && coreHasItemsFor(hubBlock, team2);
+  var canLiquid = canPump || findLiquidHub(team2) != null || canLiquidHub;
   var powerStats = computePowerStatus(team2);
   var powerNeedScore = 0;
   if (powerStats.count == 0) {
@@ -1514,7 +1987,7 @@ function runAiLogic() {
   var actions = [
     {
       name: "thermal",
-      score: (state.thermalCount < config.maxThermals ? (powerNeedScore + 35) : 0),
+      score: (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0),
       run: function(){ return actionThermal(core2); }
     },
     {
@@ -1529,22 +2002,22 @@ function runAiLogic() {
     },
     {
       name: "mine",
-      score: (copper < 200 ? 85 : copper < 400 ? 60 : 25) + (state.drillCount < config.maxDrills ? 20 : 0),
+      score: (canDrill ? (availCopper < 200 ? 85 : availCopper < 400 ? 60 : 25) + (state.drillCount < config.maxDrills ? 20 : 0) : 0),
       run: function(){ return actionMine(core2); }
     },
     {
       name: "defend",
-      score: (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0),
+      score: (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0),
       run: function(){ return actionDefend(core2); }
     },
     {
       name: "power",
-      score: (state.powerClusters < config.maxPowerClusters && copper > 200 && lead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0),
+      score: (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0),
       run: function(){ return actionPower(core2); }
     },
     {
       name: "liquid",
-      score: (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0),
+      score: (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0),
       run: function(){ return actionLiquid(core2); }
     },
     {
@@ -1608,13 +2081,18 @@ function runAiLogic() {
   var enemyCore2 = findEnemyCore(team2);
   var enemies2 = countEnemyUnits(team2);
   var afterState = snapshotState(core3, enemyCore2, enemies2, team2);
-  emitTransition(beforeState, pickedName, afterState, { ok: did });
+  var reward = computeReward(beforeState, pickedName, afterState, { ok: did });
+  state.lastReward = reward;
+  updateOnlineQTable(beforeState, pickedName, afterState, reward);
+  saveQTableIfNeeded();
+  emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
 }
 
 Events.run(Trigger.update, function(){
   state.tick++;
 
   ensureHudButton();
+  ensurePlayerControlled();
 
   if (!state.aiEnabled) return;
 
