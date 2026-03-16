@@ -95,6 +95,8 @@ var config = {
   // When true, the local player unit is excluded from AI commands and the player retains direct control.
   // Set to false so the AI can fully control the player's unit automatically.
   observerMode: false,
+  // Penalty applied (negative) when the AI reassigns controller (resets player control).
+  controllerResetPenalty: -1,
   resourceReserve: {
     "copper": 120,
     "lead": 100,
@@ -162,6 +164,7 @@ var state = {
   lastLogicTick: -9999,
   playerControlledUnitId: -1,
   playerControllerSet: false,
+  controllerResetPenalty: 0,
   nnModel: null,
   nnLastLoadTick: -9999,
   nnLastSaveTick: -9999,
@@ -539,6 +542,7 @@ function ensurePlayerControlled() {
     }
     state.playerControllerMode = "player";
     state.playerControlledUnitId = unitId;
+    state.controllerResetPenalty = config.controllerResetPenalty;
     return;
   }
 
@@ -551,6 +555,7 @@ function ensurePlayerControlled() {
   }
   state.playerControllerMode = "ai";
   state.playerControlledUnitId = unitId;
+  state.controllerResetPenalty = config.controllerResetPenalty;
 }
 
 function unitTypeByName(name) {
@@ -990,6 +995,12 @@ function computeReward(prevState, actionName, nextState, info) {
   if (prevState.enemyCore == 1 && nextState.enemyCore == 0) reward += config.rlRewardWin;
 
   if (info != null && info.ok === false) reward += config.rlRewardFail;
+
+  // Penalize controller resets (AI switching control mid-game).
+  if (state.controllerResetPenalty != null && state.controllerResetPenalty != 0) {
+    reward += state.controllerResetPenalty;
+    state.controllerResetPenalty = 0;
+  }
 
   var clamp = config.rlRewardClamp;
   if (clamp != null && clamp > 0) {
@@ -2111,6 +2122,7 @@ Events.on(WorldLoadEvent, function(){
   state.lastLogicTick = -9999;
   state.playerControlledUnitId = -1;
   state.playerControllerSet = false;
+  state.controllerResetPenalty = 0;
   state.nnModel = null;
   state.nnLastLoadTick = -9999;
   state.nnLastSaveTick = -9999;
@@ -2348,6 +2360,8 @@ function runAiLogic() {
   saveNNModelIfNeeded();
   emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
 }
+
+
 
 Events.run(Trigger.update, function(){
   state.tick++;
