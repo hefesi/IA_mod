@@ -8,6 +8,10 @@ var Vec2 = Packages.arc.math.geom.Vec2;
 var Build = Packages.mindustry.world.Build;
 var BlockGroup = Packages.mindustry.world.meta.BlockGroup;
 var BlockFlag = Packages.mindustry.world.meta.BlockFlag;
+var Table = Packages.arc.scene.ui.layout.Table;
+var Touchable = Packages.arc.scene.Touchable;
+var Styles = Packages.mindustry.ui.Styles;
+var Icon = Packages.mindustry.gen.Icon;
 var Socket = Packages.java.net.Socket;
 var InetSocketAddress = Packages.java.net.InetSocketAddress;
 var OutputStreamWriter = Packages.java.io.OutputStreamWriter;
@@ -54,6 +58,11 @@ var config = {
   aiChatToggle: true,
   aiTapToggle: true,
   tapToggleWindow: 30,
+  aiHudButton: true,
+  aiDebugHud: true,
+  debugUpdateInterval: 30,
+  campaignSafeMode: true,
+  warnInterval: 300,
   liquidSearchRadius: 10,
   maxConduitSteps: 80,
   liquidHubSearchRadius: 8,
@@ -90,7 +99,12 @@ var state = {
   lastErrorTick: -9999,
   lastTapTick: -9999,
   lastTapX: -1,
-  lastTapY: -1
+  lastTapY: -1,
+  lastAiTick: -9999,
+  lastAction: "",
+  lastActionOk: false,
+  lastPlaceFail: "",
+  lastWarnTick: -9999
 };
 
 // --- RL logging helpers (offline training via logs) ---
@@ -120,6 +134,11 @@ var rlQMeta = {
 };
 var rlQTableLastLoadTick = -9999;
 var rlQTableLastErrorTick = -9999;
+var aiHud = {
+  table: null,
+  button: null,
+  debugLabel: null
+};
 
 function rlSocketConnected() {
   return rlSocket.sock != null && rlSocket.out != null;
@@ -267,6 +286,7 @@ function setAiEnabled(enabled, player) {
   state.aiEnabled = enabled;
   var msg = enabled ? "IA ligada." : "IA desligada.";
   notify(msg, player);
+  updateHudButton();
 }
 
 function isMobileSafe() {
@@ -295,6 +315,102 @@ function notify(msg, player) {
     // ignore
   }
   Log.info("[IA] " + msg);
+}
+
+function warnBuildFail(msg) {
+  if ((state.tick - state.lastWarnTick) < config.warnInterval) return;
+  state.lastWarnTick = state.tick;
+  try {
+    if (Vars.ui != null && Vars.ui.hudfrag != null && Vars.ui.hudfrag.showToast != null) {
+      Vars.ui.hudfrag.showToast(Icon.warning, msg);
+      return;
+    }
+  } catch (e) {
+    // ignore
+  }
+  notify(msg, getLocalPlayer());
+}
+
+function buildHudButton() {
+  if (!config.aiHudButton) return;
+  if (Vars.ui == null || Vars.ui.hudGroup == null) return;
+  if (Core.scene == null) return;
+
+  var table = new Table();
+  table.setFillParent(true);
+  table.touchable = Touchable.childrenOnly;
+  table.top().left().margin(6);
+
+  var cell = table.button(Icon.pause, Styles.clearTogglei, function(){
+    setAiEnabled(!state.aiEnabled, getLocalPlayer());
+  });
+  cell.size(46, 46);
+  var btn = cell.get();
+
+  var labelCell = table.row().label("IA debug").left();
+  labelCell.style(Styles.outlineLabel);
+  labelCell.padTop(4);
+  var label = labelCell.get();
+
+  aiHud.table = table;
+  aiHud.button = btn;
+  aiHud.debugLabel = label;
+  Vars.ui.hudGroup.addChild(table);
+  updateHudButton();
+}
+
+function updateHudButton() {
+  if (aiHud.button == null) return;
+  try {
+    aiHud.button.setChecked(state.aiEnabled);
+  } catch (e) {
+    // ignore
+  }
+  try {
+    var style = aiHud.button.getStyle();
+    if (style != null && style.imageUp != null) {
+      style.imageUp = state.aiEnabled ? Icon.pause : Icon.play;
+    }
+  } catch (e2) {
+    // ignore
+  }
+}
+
+function updateHudDebug() {
+  if (!config.aiDebugHud || aiHud.debugLabel == null) return;
+  if (config.debugUpdateInterval > 1 && (state.tick % config.debugUpdateInterval) != 0) return;
+  var player = getLocalPlayer();
+  var team = getTeam();
+  var core = getCore(team);
+  var pOk = player != null ? "ok" : "null";
+  var cOk = core != null ? "ok" : "null";
+  var text = "IA " + (state.aiEnabled ? "ON" : "OFF") +
+    " | p:" + pOk +
+    " c:" + cOk +
+    " built:" + (state.built ? "1" : "0") +
+    " tick:" + state.tick +
+    " last:" + (state.lastAction == "" ? "-" : state.lastAction) +
+    (state.lastPlaceFail != "" ? (" fail:" + state.lastPlaceFail) : "");
+  try {
+    aiHud.debugLabel.setText(text);
+    aiHud.debugLabel.visible = true;
+  } catch (e) {
+    // ignore
+  }
+}
+
+function ensureHudButton() {
+  if (!config.aiHudButton) return;
+  if (aiHud.table != null) {
+    try {
+      if (aiHud.table.parent != null) return;
+    } catch (e) {
+      // ignore
+    }
+    aiHud.table = null;
+    aiHud.button = null;
+  }
+  buildHudButton();
 }
 
 function unitTypeByName(name) {
@@ -342,11 +458,11 @@ function configureFactories(team) {
   var changed = false;
   Groups.build.each(function(b){
     if (b == null || b.team != team) return;
-    if (b.block == Blocks.groundFactory && ground != null) {
+    if (b.block == Blocks.groundFactory && ground != null && (!config.campaignSafeMode || ground.unlockedNow())) {
       changed = configureBuild(b, ground) || changed;
-    } else if (b.block == Blocks.airFactory && air != null) {
+    } else if (b.block == Blocks.airFactory && air != null && (!config.campaignSafeMode || air.unlockedNow())) {
       changed = configureBuild(b, air) || changed;
-    } else if (b.block == Blocks.navalFactory && naval != null) {
+    } else if (b.block == Blocks.navalFactory && naval != null && (!config.campaignSafeMode || naval.unlockedNow())) {
       changed = configureBuild(b, naval) || changed;
     }
   });
@@ -519,6 +635,7 @@ function tileAt(x, y) {
 
 function canPlaceBlock(block, x, y, rotation, team) {
   if (block == null) return false;
+  if (!blockUnlocked(block)) return false;
   var tile = tileAt(x, y);
   if (tile == null) return false;
   var t = team != null ? team : getTeam();
@@ -526,6 +643,16 @@ function canPlaceBlock(block, x, y, rotation, team) {
     return Build.validPlace(block, t, x, y, rotation || 0);
   } catch (e) {
     return false;
+  }
+}
+
+function blockUnlocked(block) {
+  if (!config.campaignSafeMode) return true;
+  if (block == null) return false;
+  try {
+    return block.unlockedNow();
+  } catch (e) {
+    return true;
   }
 }
 
@@ -561,11 +688,28 @@ function clampToBounds(x, y) {
 
 function placeBlock(block, x, y, rotation, team) {
   var tile = tileAt(x, y);
-  if (tile == null) return false;
-  if (!canPlaceBlock(block, x, y, rotation || 0, team)) return false;
+  if (tile == null) {
+    if (config.aiDebugHud) state.lastPlaceFail = "no-tile";
+    return false;
+  }
+  if (!blockUnlocked(block)) {
+    if (config.aiDebugHud) state.lastPlaceFail = "locked:" + block.name;
+    warnBuildFail("Bloqueado: " + block.localizedName);
+    return false;
+  }
+  if (!canPlaceBlock(block, x, y, rotation || 0, team)) {
+    if (config.aiDebugHud) state.lastPlaceFail = "invalid:" + block.name;
+    warnBuildFail("Nao foi possivel construir: " + block.localizedName);
+    return false;
+  }
   var player = getLocalPlayer();
-  if (player == null) return false;
+  if (player == null) {
+    if (config.aiDebugHud) state.lastPlaceFail = "no-player";
+    warnBuildFail("Aguardando jogador local...");
+    return false;
+  }
   Call.constructFinish(player, block, x, y, rotation || 0, team, false);
+  if (config.aiDebugHud) state.lastPlaceFail = "";
   return true;
 }
 
@@ -969,13 +1113,13 @@ function findLiquidHub(team) {
 }
 
 function pickLiquidHubBlock(core) {
-  if (config.preferLiquidTank) return Blocks.liquidTank;
+  if (config.preferLiquidTank && blockUnlocked(Blocks.liquidTank)) return Blocks.liquidTank;
   if (core != null && core.items != null) {
     var titanium = core.items.get(Items.titanium);
     var metaglass = core.items.get(Items.metaglass);
-    if (titanium >= 30 && metaglass >= 40) return Blocks.liquidTank;
+    if (titanium >= 30 && metaglass >= 40 && blockUnlocked(Blocks.liquidTank)) return Blocks.liquidTank;
   }
-  return Blocks.liquidContainer;
+  return blockUnlocked(Blocks.liquidContainer) ? Blocks.liquidContainer : Blocks.liquidRouter;
 }
 
 function findCoolantTarget(team, liquid, fromX, fromY) {
@@ -1221,12 +1365,17 @@ Events.on(WorldLoadEvent, function(){
   state.lastTapTick = -9999;
   state.lastTapX = -1;
   state.lastTapY = -1;
+  state.lastWarnTick = -9999;
   rlSocketClose();
   rlSocket.queue = [];
   rlQTable = null;
   rlQTableLastLoadTick = -9999;
   rlQTableLastErrorTick = -9999;
   applyMobileSafeMode();
+  aiHud.table = null;
+  aiHud.button = null;
+  aiHud.debugLabel = null;
+  ensureHudButton();
   if (config.rlPolicyMode != "heuristic") loadQTable();
   Log.info("[IA] Mundo carregado. Preparando plano de base.");
 });
@@ -1288,6 +1437,7 @@ Events.on(TapEvent, function(e){
 });
 
 function runAiLogic() {
+  state.lastAiTick = state.tick;
   // Build once, after a small delay to ensure world is ready.
   if (!state.built && state.tick > config.buildDelay) {
     var team = getTeam();
@@ -1412,6 +1562,8 @@ function runAiLogic() {
     if (ok) {
       did = true;
       pickedName = picked.name;
+      state.lastAction = picked.name;
+      state.lastActionOk = true;
       recordAction(picked.name);
       if (picked.name != state.lastMode) {
         Log.info("[IA] Ação: " + picked.name);
@@ -1419,6 +1571,10 @@ function runAiLogic() {
       }
       break;
     }
+  }
+  if (!did) {
+    state.lastAction = "none";
+    state.lastActionOk = false;
   }
 
   var core3 = getCore(team2);
@@ -1431,7 +1587,17 @@ function runAiLogic() {
 Events.run(Trigger.update, function(){
   state.tick++;
 
+  ensureHudButton();
+
   if (!state.aiEnabled) return;
+
+  var localPlayer = getLocalPlayer();
+  var team = localPlayer != null ? localPlayer.team() : Vars.state.rules.defaultTeam;
+  var core = getCore(team);
+  if (localPlayer == null || core == null) {
+    warnBuildFail("Aguardando player/core...");
+    return;
+  }
 
   var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
   if (interval > 1 && (state.tick % interval) != 0) return;
@@ -1448,4 +1614,5 @@ Events.run(Trigger.update, function(){
   } else {
     runAiLogic();
   }
+  updateHudDebug();
 });
