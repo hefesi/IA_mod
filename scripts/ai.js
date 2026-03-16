@@ -29,6 +29,7 @@ var config = {
   waveMinGround: 6,
   waveMinAir: 4,
   waveSupportMax: 2,
+  waveEnemyScanRadius: 60,
   oreSearchRadius: 12,
   maxDrills: 5,
   maxConveyorSteps: 60,
@@ -68,10 +69,13 @@ var config = {
   rlAlpha: 0.12,
   rlGamma: 0.9,
   rlRewardClamp: 120,
-  rlRewardFail: -2,
+  rlRewardFail: -12,
+  rlRewardInvalidAction: -25,
   rlRewardCoreLost: -500,
   rlRewardWin: 500,
   rlRewardCoreDamageScale: 200,
+  rlRewardNoDamage: 15,
+  rlNoDamageBonusInterval: 180,
   rlRewardCopper: 0.02,
   rlRewardLead: 0.02,
   rlRewardDrill: 1,
@@ -99,6 +103,7 @@ var config = {
   observerMode: false,
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
   controllerResetPenalty: -1,
+  controllerResetCooldown: 300,
   resourceReserve: {
     "copper": 120,
     "lead": 100,
@@ -152,6 +157,7 @@ var state = {
   pumpCount: 0,
   liquidHubCount: 0,
   thermalCount: 0,
+  coreNoDamageTicks: 0,
   actionHistory: [],
   lastActionTicks: {},
   aiEnabled: true,
@@ -560,6 +566,10 @@ function ensurePlayerControlled() {
     return;
   }
 
+  // Prevent flip-flopping controller assignments too frequently.
+  if (state.lastControllerResetTick == null) state.lastControllerResetTick = 0;
+  if ((state.tick - state.lastControllerResetTick) < config.controllerResetCooldown) return;
+
   if (desiredMode === "player") {
     try {
       unit.controller(player);
@@ -570,6 +580,7 @@ function ensurePlayerControlled() {
     state.playerControllerMode = "player";
     state.playerControlledUnitId = unitId;
     state.controllerResetPenalty = config.controllerResetPenalty;
+    state.lastControllerResetTick = state.tick;
     return;
   }
 
@@ -583,6 +594,7 @@ function ensurePlayerControlled() {
   state.playerControllerMode = "ai";
   state.playerControlledUnitId = unitId;
   state.controllerResetPenalty = config.controllerResetPenalty;
+  state.lastControllerResetTick = state.tick;
   updateCameraToUnit(unit);
 }
 
@@ -1040,7 +1052,22 @@ function computeReward(prevState, actionName, nextState, info) {
   if (prevState.corePresent == 1 && nextState.corePresent == 0) reward += config.rlRewardCoreLost;
   if (prevState.enemyCore == 1 && nextState.enemyCore == 0) reward += config.rlRewardWin;
 
-  if (info != null && info.ok === false) reward += config.rlRewardFail;
+  // Reward staying undamaged for a while.
+  if (state.coreNoDamageTicks == null) state.coreNoDamageTicks = 0;
+  if (nextState.coreHealthFrac < prevState.coreHealthFrac) {
+    state.coreNoDamageTicks = 0;
+  } else {
+    state.coreNoDamageTicks++;
+    if (config.rlNoDamageBonusInterval > 0 && (state.coreNoDamageTicks % config.rlNoDamageBonusInterval) === 0) {
+      reward += config.rlRewardNoDamage;
+    }
+  }
+
+  // Penalize invalid/failed actions.
+  if (info != null && info.ok === false) {
+    reward += config.rlRewardFail;
+    reward += config.rlRewardInvalidAction;
+  }
 
   // Penalize controller resets (AI switching control mid-game).
   if (state.controllerResetPenalty != null && state.controllerResetPenalty != 0) {
@@ -1796,7 +1823,16 @@ function setLogicProcessorsEnabled(enabled) {
 function ensureLogicControllers(core, team) {
   if (!config.logicEnabled) return;
   if (core == null) return;
-  if ((state.tick - state.lastLogicTick) < config.logicBuildInterval) return;
+  if (state.lastLogicTick == null) state.lastLogicTick = -9999;
+  if (state.lastLogicFailureTick == null) state.lastLogicFailureTick = -9999;
+
+  // If logic processors are failing to build (e.g., no space/resources), back off.
+  var logicCooldown = config.logicBuildInterval;
+  if ((state.tick - state.lastLogicFailureTick) < config.logicBuildInterval) {
+    logicCooldown = config.logicBuildInterval * 2;
+  }
+
+  if ((state.tick - state.lastLogicTick) < logicCooldown) return;
   state.lastLogicTick = state.tick;
 
   var roles = [];
@@ -1815,6 +1851,8 @@ function ensureLogicControllers(core, team) {
       if (placed != null) {
         state.logicControllers[role] = { x: placed.tile.x, y: placed.tile.y };
         build = placed;
+      } else {
+        state.lastLogicFailureTick = state.tick;
       }
     }
     if (build != null) {
@@ -1831,7 +1869,28 @@ function waveReady(buckets) {
   return false;
 }
 
-function collectWaveIds(buckets) {
+function scanEnemyProfile(team, centerX, centerY, radius) {
+  var profile = { ground: 0, air: 0, support: 0 };
+  if (centerX == null || centerY == null || radius == null) return profile;
+  var maxDist2 = radius * radius;
+  Groups.unit.each(function(u){
+    if (u == null) return;
+    if (u.team == team) return;
+    var dx = u.x - centerX;
+    var dy = u.y - centerY;
+    if (dx * dx + dy * dy > maxDist2) return;
+    if (containsType(supportTypes, u.type)) {
+      profile.support++;
+    } else if (u.type != null && u.type.flying) {
+      profile.air++;
+    } else {
+      profile.ground++;
+    }
+  });
+  return profile;
+}
+
+function collectWaveIds(buckets, enemyProfile) {
   // Prefer stronger units when forming waves.
   var unitMap = {};
   Groups.unit.each(function(u){
@@ -1859,6 +1918,15 @@ function collectWaveIds(buckets) {
       // Prefer configured preferred unit types.
       var pref = u.type.flying ? config.preferredAirUnit : config.preferredGroundUnit;
       if (pref != null && u.type.name == pref) score += 30;
+
+      // Adjust based on observed enemy composition.
+      if (enemyProfile != null) {
+        if (u.type.flying) {
+          score += (enemyProfile.air - enemyProfile.ground) * 3;
+        } else {
+          score += (enemyProfile.ground - enemyProfile.air) * 3;
+        }
+      }
     } catch (e) {
       // ignore
     }
@@ -2164,7 +2232,11 @@ function actionAttackWave(core, enemyCore) {
   var canWave = waveReady(buckets);
   var cooled = (state.tick - state.lastWaveTick) >= config.waveCooldown;
   if (!(canWave && cooled)) return false;
-  var waveIds = collectWaveIds(buckets);
+
+  var scanCenter = enemyCore != null ? enemyCore : core;
+  var enemyProfile = scanEnemyProfile(team, scanCenter.x, scanCenter.y, config.waveEnemyScanRadius);
+
+  var waveIds = collectWaveIds(buckets, enemyProfile);
   commandUnitIds(team, waveIds, enemyCore, new Vec2(enemyCore.x, enemyCore.y));
   state.lastWaveTick = state.tick;
   state.waveIndex++;
@@ -2198,6 +2270,7 @@ Events.on(WorldLoadEvent, function(){
   state.pumpCount = 0;
   state.liquidHubCount = 0;
   state.thermalCount = 0;
+  state.coreNoDamageTicks = 0;
   state.actionHistory = [];
   state.lastActionTicks = {};
   state.aiEnabled = config.aiEnabledDefault;
