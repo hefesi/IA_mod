@@ -102,7 +102,7 @@ var config = {
   // Set to false so the AI can fully control the player's unit automatically.
   observerMode: false,
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
-  controllerResetPenalty: -1,
+  controllerResetPenalty: -50,
   controllerResetCooldown: 300,
   controllerResetCooldownEnabled: true,
   resourceReserve: {
@@ -1228,11 +1228,18 @@ function reserveFor(item) {
 }
 
 function availableCoreItems(core, item) {
+  // For decision-making (survival mode, reward), we reserve some resources.
   if (core == null || core.items == null || item == null) return 0;
   var total = core.items.get(item);
   var reserve = reserveFor(item);
   var avail = total - reserve;
   return avail < 0 ? 0 : avail;
+}
+
+function availableCoreItemsRaw(core, item) {
+  // Actual available items for building (no reserve applied).
+  if (core == null || core.items == null || item == null) return 0;
+  return core.items.get(item);
 }
 
 function coreHasItemsFor(block, team) {
@@ -1247,7 +1254,7 @@ function coreHasItemsFor(block, team) {
   for (var i = 0; i < reqs.length; i++) {
     var stack = reqs[i];
     var need = Math.ceil(stack.amount * mult);
-    if (availableCoreItems(core, stack.item) < need) return false;
+    if (availableCoreItemsRaw(core, stack.item) < need) return false;
   }
   return true;
 }
@@ -1264,7 +1271,7 @@ function consumeCoreItems(block, team) {
   for (var i = 0; i < reqs.length; i++) {
     var stack = reqs[i];
     var need = Math.ceil(stack.amount * mult);
-    if (availableCoreItems(core, stack.item) < need) return false;
+    if (availableCoreItemsRaw(core, stack.item) < need) return false;
   }
   for (var i2 = 0; i2 < reqs.length; i2++) {
     var stack2 = reqs[i2];
