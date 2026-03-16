@@ -5,6 +5,8 @@ var IntSeq = Packages.arc.struct.IntSeq;
 var InputHandler = Packages.mindustry.input.InputHandler;
 var UnitCommand = Packages.mindustry.ai.UnitCommand;
 var Vec2 = Packages.arc.math.geom.Vec2;
+var Build = Packages.mindustry.world.Build;
+var BlockGroup = Packages.mindustry.world.meta.BlockGroup;
 var Socket = Packages.java.net.Socket;
 var InetSocketAddress = Packages.java.net.InetSocketAddress;
 var OutputStreamWriter = Packages.java.io.OutputStreamWriter;
@@ -26,6 +28,8 @@ var config = {
   rallyDistance: 7,
   maxTurrets: 6,
   maxPowerClusters: 2,
+  maxPumps: 2,
+  maxLiquidHubs: 1,
   memorySize: 3,
   repeatPenalty: 25,
   actionCooldown: 180,
@@ -43,7 +47,21 @@ var config = {
   rlQTableReloadTicks: 0,
   rlQTableBlend: 0.7,
   aiEnabledDefault: true,
-  aiChatToggle: true
+  aiChatToggle: true,
+  liquidSearchRadius: 10,
+  maxConduitSteps: 80,
+  liquidHubSearchRadius: 8,
+  preferLiquidTank: false,
+  mobileSafeMode: true,
+  mobileLogicInterval: 60,
+  mobileCommandInterval: 180,
+  mobileFactoryConfigInterval: 1200,
+  mobileLiquidSearchRadius: 8,
+  safeModeLogInterval: 600,
+  factoryConfigInterval: 600,
+  preferredGroundUnit: "dagger",
+  preferredAirUnit: "mono",
+  preferredNavalUnit: "risso"
 };
 
 var state = {
@@ -55,9 +73,13 @@ var state = {
   drillCount: 0,
   turretCount: 0,
   powerClusters: 0,
+  pumpCount: 0,
+  liquidHubCount: 0,
   actionHistory: [],
   lastActionTicks: {},
-  aiEnabled: true
+  aiEnabled: true,
+  lastFactoryConfigTick: -9999,
+  lastErrorTick: -9999
 };
 
 // --- RL logging helpers (offline training via logs) ---
@@ -205,6 +227,8 @@ function snapshotState(core, enemyCore, enemies, team) {
     drills: state.drillCount,
     turrets: state.turretCount,
     power: state.powerClusters,
+    pumps: state.pumpCount,
+    liquidHubs: state.liquidHubCount,
     enemies: enemies,
     wave: state.waveIndex,
     enemyCore: enemyCore != null ? 1 : 0,
@@ -236,6 +260,98 @@ function setAiEnabled(enabled, player) {
   } catch (e) {
     // ignore
   }
+}
+
+function isMobileSafe() {
+  return config.mobileSafeMode && (Vars.mobile || Vars.android);
+}
+
+function applyMobileSafeMode() {
+  if (!isMobileSafe()) return;
+  config.rlSocketEnabled = false;
+  config.rlLogEnabled = false;
+  config.rlPolicyMode = "heuristic";
+  if (config.commandInterval < config.mobileCommandInterval) config.commandInterval = config.mobileCommandInterval;
+  if (config.factoryConfigInterval < config.mobileFactoryConfigInterval) config.factoryConfigInterval = config.mobileFactoryConfigInterval;
+  if (config.liquidSearchRadius > config.mobileLiquidSearchRadius) config.liquidSearchRadius = config.mobileLiquidSearchRadius;
+}
+
+function unitTypeByName(name) {
+  if (name == null) return null;
+  try {
+    var unit = UnitTypes[name];
+    if (unit != null) return unit;
+  } catch (e) {
+    // ignore
+  }
+  return null;
+}
+
+function configureBuild(build, value) {
+  if (build == null) return false;
+  try {
+    if (Vars.player != null) {
+      build.configure(value);
+      return true;
+    }
+  } catch (e) {
+    // ignore
+  }
+  try {
+    build.configureAny(value);
+    return true;
+  } catch (e2) {
+    // ignore
+  }
+  try {
+    Call.tileConfig(Vars.player, build, value);
+    return true;
+  } catch (e3) {
+    // ignore
+  }
+  return false;
+}
+
+function configureFactories(team) {
+  if ((state.tick - state.lastFactoryConfigTick) < config.factoryConfigInterval) return false;
+  var ground = unitTypeByName(config.preferredGroundUnit);
+  var air = unitTypeByName(config.preferredAirUnit);
+  var naval = unitTypeByName(config.preferredNavalUnit);
+  var changed = false;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team) return;
+    if (b.block == Blocks.groundFactory && ground != null) {
+      changed = configureBuild(b, ground) || changed;
+    } else if (b.block == Blocks.airFactory && air != null) {
+      changed = configureBuild(b, air) || changed;
+    } else if (b.block == Blocks.navalFactory && naval != null) {
+      changed = configureBuild(b, naval) || changed;
+    }
+  });
+  state.lastFactoryConfigTick = state.tick;
+  return changed;
+}
+
+function computePowerStatus(team) {
+  var sum = 0;
+  var count = 0;
+  var min = 1;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team) return;
+    if (b.power == null || b.block == null) return;
+    var isPowerBlock = b.block.group == BlockGroup.power || b.block.outputsPower || b.block.hasPower;
+    if (!isPowerBlock) return;
+    var st = b.power.status;
+    if (st == null) return;
+    sum += st;
+    count++;
+    if (st < min) min = st;
+  });
+  return {
+    avg: count > 0 ? sum / count : 1,
+    min: count > 0 ? min : 1,
+    count: count
+  };
 }
 
 function resolveQTableFi() {
@@ -359,6 +475,42 @@ function tileAt(x, y) {
   return Vars.world.tile(x, y);
 }
 
+function canPlaceBlock(block, x, y, rotation, team) {
+  if (block == null) return false;
+  var tile = tileAt(x, y);
+  if (tile == null) return false;
+  var t = team != null ? team : getTeam();
+  try {
+    return Build.validPlace(block, t, x, y, rotation || 0);
+  } catch (e) {
+    return false;
+  }
+}
+
+function findPlaceForBlock(block, cx, cy, radius, team) {
+  for (var dx = -radius; dx <= radius; dx++) {
+    for (var dy = -radius; dy <= radius; dy++) {
+      var x = cx + dx;
+      var y = cy + dy;
+      if (canPlaceBlock(block, x, y, 0, team)) {
+        return { x: x, y: y };
+      }
+    }
+  }
+  return null;
+}
+
+function findOpenTileAround(cx, cy, radius) {
+  for (var dx = -radius; dx <= radius; dx++) {
+    for (var dy = -radius; dy <= radius; dy++) {
+      var tile = tileAt(cx + dx, cy + dy);
+      if (tile == null) continue;
+      if (tile.block() == Blocks.air) return { x: tile.x, y: tile.y };
+    }
+  }
+  return null;
+}
+
 function clampToBounds(x, y) {
   var nx = Math.max(1, Math.min(worldWidth() - 2, x));
   var ny = Math.max(1, Math.min(worldHeight() - 2, y));
@@ -368,7 +520,7 @@ function clampToBounds(x, y) {
 function placeBlock(block, x, y, rotation, team) {
   var tile = tileAt(x, y);
   if (tile == null) return false;
-  if (tile.block() != Blocks.air) return false;
+  if (!canPlaceBlock(block, x, y, rotation || 0, team)) return false;
   if (Vars.player == null) return false;
   Call.constructFinish(Vars.player, block, x, y, rotation || 0, team, false);
   return true;
@@ -422,6 +574,28 @@ function placeConveyorPath(team, sx, sy, tx, ty, maxSteps) {
   }
 }
 
+function placeConduitPath(team, sx, sy, tx, ty, maxSteps) {
+  var x = sx;
+  var y = sy;
+  var steps = 0;
+  while ((x != tx || y != ty) && steps < maxSteps) {
+    var step = stepToward(x, y, tx, ty);
+    if (step.dx == 0 && step.dy == 0) break;
+    var nx = x + step.dx;
+    var ny = y + step.dy;
+    var ntile = tileAt(nx, ny);
+    if (ntile == null) break;
+    var rot = rotationForStep(step.dx, step.dy);
+    placeBlock(Blocks.conduit, x, y, rot, team);
+    if (ntile.block() != Blocks.air) {
+      break;
+    }
+    x = nx;
+    y = ny;
+    steps++;
+  }
+}
+
 function findOreTiles(cx, cy, radius, maxCount) {
   var found = [];
   for (var dx = -radius; dx <= radius; dx++) {
@@ -431,6 +605,23 @@ function findOreTiles(cx, cy, radius, maxCount) {
       if (tile.drop() != null) {
         var dist2 = dx * dx + dy * dy;
         found.push({ x: tile.x, y: tile.y, dist2: dist2 });
+      }
+    }
+  }
+  found.sort(function(a, b){ return a.dist2 - b.dist2; });
+  if (found.length > maxCount) found.length = maxCount;
+  return found;
+}
+
+function findLiquidTiles(cx, cy, radius, maxCount) {
+  var found = [];
+  for (var dx = -radius; dx <= radius; dx++) {
+    for (var dy = -radius; dy <= radius; dy++) {
+      var tile = tileAt(cx + dx, cy + dy);
+      if (tile == null) continue;
+      if (tile.floor() != null && tile.floor().isLiquid && tile.block() == Blocks.air) {
+        var dist2 = dx * dx + dy * dy;
+        found.push({ x: tile.x, y: tile.y, dist2: dist2, liquid: tile.floor().liquidDrop });
       }
     }
   }
@@ -710,6 +901,51 @@ function findBestOreNearCore(core) {
   return null;
 }
 
+function findLiquidHub(team) {
+  var found = null;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team) return;
+    if (b.block == Blocks.liquidContainer || b.block == Blocks.liquidTank) {
+      found = b;
+    }
+  });
+  return found;
+}
+
+function pickLiquidHubBlock(core) {
+  if (config.preferLiquidTank) return Blocks.liquidTank;
+  if (core != null && core.items != null) {
+    var titanium = core.items.get(Items.titanium);
+    var metaglass = core.items.get(Items.metaglass);
+    if (titanium >= 30 && metaglass >= 40) return Blocks.liquidTank;
+  }
+  return Blocks.liquidContainer;
+}
+
+function findCoolantTarget(team, liquid, fromX, fromY) {
+  if (liquid == null) return null;
+  var best = null;
+  var bestDist = 9999999;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null) return;
+    if (b.block.group != BlockGroup.turrets) return;
+    if (!b.block.hasLiquids || b.liquids == null) return;
+    try {
+      if (!b.block.consumesLiquid(liquid)) return;
+    } catch (e) {
+      return;
+    }
+    var dx = b.tile.x - fromX;
+    var dy = b.tile.y - fromY;
+    var dist = dx * dx + dy * dy;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = b;
+    }
+  });
+  return best;
+}
+
 function actionMine(core) {
   var team = getTeam();
   var ore = findBestOreNearCore(core);
@@ -722,6 +958,56 @@ function actionMine(core) {
   var sx = ore.x + step.dx;
   var sy = ore.y + step.dy;
   placeConveyorPath(team, sx, sy, cx, cy, config.maxConveyorSteps);
+  return true;
+}
+
+function actionLiquid(core) {
+  var team = getTeam();
+  if (state.pumpCount >= config.maxPumps && state.liquidHubCount >= config.maxLiquidHubs) return false;
+  var cx = core.tile.x;
+  var cy = core.tile.y;
+
+  var hub = findLiquidHub(team);
+  var hubPos = null;
+  if (hub != null) {
+    hubPos = { x: hub.tile.x, y: hub.tile.y };
+    if (state.liquidHubCount < 1) state.liquidHubCount = 1;
+  }
+  if (hubPos == null && state.liquidHubCount < config.maxLiquidHubs) {
+    var hubBlock = pickLiquidHubBlock(core);
+    var candidate = findPlaceForBlock(hubBlock, cx, cy, config.liquidHubSearchRadius, team);
+    if (candidate != null && placeBlock(hubBlock, candidate.x, candidate.y, 0, team)) {
+      hubPos = candidate;
+      state.liquidHubCount++;
+    }
+  }
+
+  var liquids = findLiquidTiles(cx, cy, config.liquidSearchRadius, config.maxPumps);
+  if (liquids.length == 0) return false;
+  var pump = null;
+  var pumpLiquid = null;
+  for (var i = 0; i < liquids.length; i++) {
+    if (placeBlock(Blocks.mechanicalPump, liquids[i].x, liquids[i].y, 0, team)) {
+      pump = liquids[i];
+      pumpLiquid = liquids[i].liquid;
+      state.pumpCount++;
+      break;
+    }
+  }
+  if (pump == null) return false;
+
+  var target = hubPos != null ? hubPos : { x: cx, y: cy };
+  var coolantTarget = findCoolantTarget(team, pumpLiquid, pump.x, pump.y);
+  if (coolantTarget != null) {
+    target = { x: coolantTarget.tile.x, y: coolantTarget.tile.y };
+  }
+  var step = stepToward(pump.x, pump.y, target.x, target.y);
+  var sx = pump.x + step.dx;
+  var sy = pump.y + step.dy;
+  placeConduitPath(team, sx, sy, target.x, target.y, config.maxConduitSteps);
+
+  var node = clampToBounds(pump.x + 1, pump.y);
+  placeBlock(Blocks.powerNode, node.x, node.y, 0, team);
   return true;
 }
 
@@ -800,14 +1086,19 @@ Events.on(WorldLoadEvent, function(){
   state.drillCount = 0;
   state.turretCount = 0;
   state.powerClusters = 0;
+  state.pumpCount = 0;
+  state.liquidHubCount = 0;
   state.actionHistory = [];
   state.lastActionTicks = {};
   state.aiEnabled = config.aiEnabledDefault;
+  state.lastFactoryConfigTick = -9999;
+  state.lastErrorTick = -9999;
   rlSocketClose();
   rlSocket.queue = [];
   rlQTable = null;
   rlQTableLastLoadTick = -9999;
   rlQTableLastErrorTick = -9999;
+  applyMobileSafeMode();
   if (config.rlPolicyMode != "heuristic") loadQTable();
   Log.info("[IA] Mundo carregado. Preparando plano de base.");
 });
@@ -842,11 +1133,7 @@ Events.on(PlayerChatEvent, function(e){
   e.cancelled = true;
 });
 
-Events.run(Trigger.update, function(){
-  state.tick++;
-
-  if (!state.aiEnabled) return;
-
+function runAiLogic() {
   // Build once, after a small delay to ensure world is ready.
   if (!state.built && state.tick > config.buildDelay) {
     var team = getTeam();
@@ -858,18 +1145,31 @@ Events.run(Trigger.update, function(){
     }
   }
 
-  // Decide orders every 120 ticks (~2s at 60fps).
+  // Decide orders every N ticks.
   if (state.tick % config.commandInterval != 0) return;
 
   var team2 = getTeam();
   var core2 = getCore(team2);
   if (core2 == null) return;
 
+  configureFactories(team2);
+
   var enemyCore = findEnemyCore(team2);
   var enemies = countEnemyUnits(team2);
   var copper = core2.items.get(Items.copper);
   var lead = core2.items.get(Items.lead);
   var wantsAttack = enemyCore != null && shouldAttack(core2);
+  var powerStats = computePowerStatus(team2);
+  var powerNeedScore = 0;
+  if (powerStats.count == 0) {
+    powerNeedScore = 40;
+  } else if (powerStats.avg < 0.4 || powerStats.min < 0.25) {
+    powerNeedScore = 45;
+  } else if (powerStats.avg < 0.7) {
+    powerNeedScore = 25;
+  } else if (powerStats.avg < 0.85) {
+    powerNeedScore = 10;
+  }
   var beforeState = snapshotState(core2, enemyCore, enemies, team2);
 
   if (config.rlPolicyMode != "heuristic") {
@@ -903,8 +1203,13 @@ Events.run(Trigger.update, function(){
     },
     {
       name: "power",
-      score: (state.powerClusters < config.maxPowerClusters && copper > 200 && lead > 150) ? 35 : 0,
+      score: (state.powerClusters < config.maxPowerClusters && copper > 200 && lead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0),
       run: function(){ return actionPower(core2); }
+    },
+    {
+      name: "liquid",
+      score: (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0),
+      run: function(){ return actionLiquid(core2); }
     },
     {
       name: "noop",
@@ -962,4 +1267,26 @@ Events.run(Trigger.update, function(){
   var enemies2 = countEnemyUnits(team2);
   var afterState = snapshotState(core3, enemyCore2, enemies2, team2);
   emitTransition(beforeState, pickedName, afterState, { ok: did });
+}
+
+Events.run(Trigger.update, function(){
+  state.tick++;
+
+  if (!state.aiEnabled) return;
+
+  var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
+  if (interval > 1 && (state.tick % interval) != 0) return;
+
+  if (isMobileSafe()) {
+    try {
+      runAiLogic();
+    } catch (e) {
+      if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
+        Log.info("[IA] Erro em safe mode. Continuando.");
+        state.lastErrorTick = state.tick;
+      }
+    }
+  } else {
+    runAiLogic();
+  }
 });
