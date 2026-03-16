@@ -518,26 +518,35 @@ function ensurePlayerControlled() {
   var player = getLocalPlayer();
   if (player == null || player.unit() == null) return;
   var unit = player.unit();
+  var unitId = unit.id;
 
-  // If AI is inactive (or in observer mode) return control to the player and reset the flag.
-  if (!state.aiEnabled || config.observerMode) {
+  // If the player changed unit (respawn, etc), reset stored controller state.
+  if (state.playerControlledUnitId !== unitId) {
+    state.playerControllerSet = false;
+    state.playerControllerMode = null;
+  }
+
+  var desiredMode = (!state.aiEnabled || config.observerMode) ? "player" : "ai";
+  if (state.playerControllerSet && state.playerControllerMode === desiredMode && state.playerControlledUnitId === unitId) return;
+
+  if (desiredMode === "player") {
     try {
       unit.controller(player);
     } catch (e) {
       // ignore
     }
-    state.playerControllerSet = false;
-    state.playerControlledUnitId = -1;
+    state.playerControllerSet = true;
+    state.playerControllerMode = "player";
+    state.playerControlledUnitId = unitId;
     return;
   }
 
-  // Only set CommandAI once per unit to avoid repeatedly resetting the player.
-  if (state.playerControllerSet && state.playerControlledUnitId == unit.id) return;
-
+  // desiredMode == "ai"
   try {
     unit.controller(new CommandAI());
     state.playerControllerSet = true;
-    state.playerControlledUnitId = unit.id;
+    state.playerControllerMode = "ai";
+    state.playerControlledUnitId = unitId;
   } catch (e2) {
     // ignore
   }
