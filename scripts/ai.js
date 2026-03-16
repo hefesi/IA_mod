@@ -55,6 +55,14 @@ var config = {
   rlQTablePath: "",
   rlQTableReloadTicks: 0,
   rlQTableBlend: 0.7,
+  rlNNEnabled: true,
+  rlNNFile: "nn_model.json",
+  rlNNPath: "",
+  rlNNHidden: 16,
+  rlNNReloadTicks: 0,
+  rlNNSaveInterval: 1800,
+  rlNNAlpha: 0.01,
+  rlNNGamma: 0.9,
   rlOnlineEnabled: true,
   rlAlpha: 0.12,
   rlGamma: 0.9,
@@ -152,6 +160,12 @@ var state = {
   lastReward: 0,
   lastQSaveTick: -9999,
   lastLogicTick: -9999,
+  playerControlledUnitId: -1,
+  playerControllerSet: false,
+  nnModel: null,
+  nnLastLoadTick: -9999,
+  nnLastSaveTick: -9999,
+  nnLastErrorTick: -9999,
   logicControllers: {
     ground: null,
     air: null,
@@ -504,18 +518,26 @@ function ensurePlayerControlled() {
   var player = getLocalPlayer();
   if (player == null || player.unit() == null) return;
   var unit = player.unit();
+
+  // If AI is inactive (or in observer mode) return control to the player and reset the flag.
   if (!state.aiEnabled || config.observerMode) {
     try {
       unit.controller(player);
     } catch (e) {
       // ignore
     }
+    state.playerControllerSet = false;
+    state.playerControlledUnitId = -1;
     return;
   }
+
+  // Only set CommandAI once per unit to avoid repeatedly resetting the player.
+  if (state.playerControllerSet && state.playerControlledUnitId == unit.id) return;
+
   try {
-    if (!(unit.controller() instanceof CommandAI)) {
-      unit.controller(new CommandAI());
-    }
+    unit.controller(new CommandAI());
+    state.playerControllerSet = true;
+    state.playerControlledUnitId = unit.id;
   } catch (e2) {
     // ignore
   }
@@ -652,6 +674,218 @@ function loadQTable() {
       rlQTableLastErrorTick = state.tick;
     }
     rlQTable = null;
+    return false;
+  }
+}
+
+function resolveNNFi() {
+  if (config.rlNNPath != null && config.rlNNPath != "") {
+    try {
+      return new Fi(config.rlNNPath);
+    } catch (e) {
+      return null;
+    }
+  }
+  try {
+    var mod = Vars.mods.getMod(config.modName);
+    if (mod != null && mod.root != null) {
+      return mod.root.child(config.rlNNFile);
+    }
+  } catch (e2) {
+    // ignore
+  }
+  try {
+    return new Fi(config.rlNNFile);
+  } catch (e3) {
+    return null;
+  }
+}
+
+function initializeNNModel(features, actions) {
+  var inputSize = features != null ? features.length : 0;
+  var hiddenSize = config.rlNNHidden || 16;
+  var outputSize = actions != null ? actions.length : 0;
+  var model = {
+    inputSize: inputSize,
+    hiddenSize: hiddenSize,
+    outputSize: outputSize,
+    features: features,
+    actions: actions,
+    w1: [],
+    b1: [],
+    w2: [],
+    b2: []
+  };
+  var scale = 0.1;
+  // w1: hiddenSize x inputSize
+  for (var i = 0; i < hiddenSize * inputSize; i++) {
+    model.w1.push((Math.random() * 2 - 1) * scale);
+  }
+  // b1: hiddenSize
+  for (var i = 0; i < hiddenSize; i++) {
+    model.b1.push(0);
+  }
+  // w2: outputSize x hiddenSize
+  for (var i = 0; i < outputSize * hiddenSize; i++) {
+    model.w2.push((Math.random() * 2 - 1) * scale);
+  }
+  // b2: outputSize
+  for (var i = 0; i < outputSize; i++) {
+    model.b2.push(0);
+  }
+  return model;
+}
+
+function loadNNModel() {
+  if (!config.rlNNEnabled) return false;
+  if (config.rlPolicyMode != "nn") return false;
+  if (state.nnModel != null && config.rlNNReloadTicks > 0 && (state.tick - state.nnLastLoadTick) < config.rlNNReloadTicks) return true;
+  var fi = resolveNNFi();
+  if (fi == null || !fi.exists()) {
+    if ((state.tick - state.nnLastErrorTick) > 600) {
+      Log.info("[RL] NN model nao encontrado: " + config.rlNNFile);
+      state.nnLastErrorTick = state.tick;
+    }
+    // Initialize a new model if we have features/actions.
+    if (rlQMeta && rlQMeta.features && rlQMeta.actions) {
+      state.nnModel = initializeNNModel(rlQMeta.features, rlQMeta.actions);
+      state.nnLastLoadTick = state.tick;
+      return true;
+    }
+    state.nnModel = null;
+    return false;
+  }
+  try {
+    var text = fi.readString();
+    var data = JSON.parse(String(text));
+    if (data == null) throw "invalid";
+    if (data.features != null) rlQMeta.features = data.features;
+    if (data.actions != null) rlQMeta.actions = data.actions;
+    state.nnModel = data;
+    state.nnLastLoadTick = state.tick;
+    Log.info("[RL] NN model carregado: " + fi.absolutePath());
+    return true;
+  } catch (e) {
+    if ((state.tick - state.nnLastErrorTick) > 600) {
+      Log.info("[RL] Erro ao carregar NN model.");
+      state.nnLastErrorTick = state.tick;
+    }
+    state.nnModel = null;
+    return false;
+  }
+}
+
+function nnForward(stateObj) {
+  if (state.nnModel == null) return null;
+  var model = state.nnModel;
+  if (model.features == null || model.actions == null) return null;
+  var input = [];
+  for (var i = 0; i < model.features.length; i++) {
+    var name = model.features[i].name;
+    var val = stateObj[name];
+    if (val == null) val = 0;
+    input.push(val);
+  }
+  // hidden = tanh(W1 * input + b1)
+  var hidden = [];
+  for (var h = 0; h < model.hiddenSize; h++) {
+    var sum = model.b1[h] || 0;
+    for (var j = 0; j < model.inputSize; j++) {
+      sum += (model.w1[h * model.inputSize + j] || 0) * input[j];
+    }
+    hidden.push(Math.tanh(sum));
+  }
+  // output = W2 * hidden + b2
+  var out = [];
+  for (var o = 0; o < model.outputSize; o++) {
+    var sum = model.b2[o] || 0;
+    for (var h = 0; h < model.hiddenSize; h++) {
+      sum += (model.w2[o * model.hiddenSize + h] || 0) * hidden[h];
+    }
+    out.push(sum);
+  }
+  return { input: input, hidden: hidden, output: out };
+}
+
+function nnScoresForState(stateObj) {
+  if (state.nnModel == null) return null;
+  var fwd = nnForward(stateObj);
+  if (fwd == null) return null;
+  var scores = {};
+  for (var i = 0; i < state.nnModel.actions.length; i++) {
+    scores[state.nnModel.actions[i]] = fwd.output[i];
+  }
+  return scores;
+}
+
+function updateNNModel(prevState, actionName, nextState, reward) {
+  if (!config.rlNNEnabled) return false;
+  if (state.nnModel == null) return false;
+  if (state.nnModel.actions == null || state.nnModel.features == null) return false;
+  var model = state.nnModel;
+  var actionIndex = -1;
+  for (var i = 0; i < model.actions.length; i++) {
+    if (model.actions[i] == actionName) { actionIndex = i; break; }
+  }
+  if (actionIndex < 0) return false;
+
+  var fwd1 = nnForward(prevState);
+  var fwd2 = nnForward(nextState);
+  if (fwd1 == null || fwd2 == null) return false;
+
+  var maxNext = -999999;
+  for (var i = 0; i < fwd2.output.length; i++) {
+    if (fwd2.output[i] > maxNext) maxNext = fwd2.output[i];
+  }
+  var gamma = config.rlNNGamma != null ? config.rlNNGamma : 0.9;
+  var target = reward + gamma * maxNext;
+
+  var pred = fwd1.output[actionIndex];
+  var delta = pred - target;
+  var alpha = config.rlNNAlpha != null ? config.rlNNAlpha : 0.01;
+
+  // Update w2, b2 for the chosen output only.
+  for (var h = 0; h < model.hiddenSize; h++) {
+    var idx = actionIndex * model.hiddenSize + h;
+    var grad = delta * fwd1.hidden[h];
+    model.w2[idx] = (model.w2[idx] || 0) - alpha * grad;
+  }
+  model.b2[actionIndex] = (model.b2[actionIndex] || 0) - alpha * delta;
+
+  // Backprop into hidden layer
+  for (var h = 0; h < model.hiddenSize; h++) {
+    var w2val = model.w2[actionIndex * model.hiddenSize + h] || 0;
+    var dh = (1 - fwd1.hidden[h] * fwd1.hidden[h]) * (delta * w2val);
+    var b1idx = h;
+    model.b1[b1idx] = (model.b1[b1idx] || 0) - alpha * dh;
+    for (var j = 0; j < model.inputSize; j++) {
+      var w1idx = h * model.inputSize + j;
+      model.w1[w1idx] = (model.w1[w1idx] || 0) - alpha * dh * fwd1.input[j];
+    }
+  }
+
+  return true;
+}
+
+function saveNNModelIfNeeded() {
+  if (!config.rlNNEnabled) return;
+  if (config.rlNNSaveInterval == null || config.rlNNSaveInterval <= 0) return;
+  if ((state.tick - state.nnLastSaveTick) < config.rlNNSaveInterval) return;
+  if (isMobileSafe()) return;
+  saveNNModel();
+}
+
+function saveNNModel() {
+  if (state.nnModel == null) return false;
+  var fi = resolveNNFi();
+  if (fi == null) return false;
+  try {
+    var text = JSON.stringify(state.nnModel);
+    fi.parent().mkdirs();
+    fi.writeString(text, false);
+    state.nnLastSaveTick = state.tick;
+    return true;
+  } catch (e) {
     return false;
   }
 }
@@ -1865,6 +2099,12 @@ Events.on(WorldLoadEvent, function(){
   state.lastReward = 0;
   state.lastQSaveTick = -9999;
   state.lastLogicTick = -9999;
+  state.playerControlledUnitId = -1;
+  state.playerControllerSet = false;
+  state.nnModel = null;
+  state.nnLastLoadTick = -9999;
+  state.nnLastSaveTick = -9999;
+  state.nnLastErrorTick = -9999;
   state.logicControllers = { ground: null, air: null, naval: null };
   rlSocketClose();
   rlSocket.queue = [];
@@ -1989,10 +2229,16 @@ function runAiLogic() {
     powerStats.avg < 0.85 ? 10 : 0;
   var beforeState = snapshotState(core2, enemyCore, enemies, team2);
 
-  if (config.rlPolicyMode != "heuristic" &&
-      (rlQTable == null ||
-      (config.rlQTableReloadTicks > 0 && (state.tick - rlQTableLastLoadTick) >= config.rlQTableReloadTicks))) {
-    loadQTable();
+  if (config.rlPolicyMode != "heuristic") {
+    if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
+      if (rlQTable == null ||
+          (config.rlQTableReloadTicks > 0 && (state.tick - rlQTableLastLoadTick) >= config.rlQTableReloadTicks)) {
+        loadQTable();
+      }
+    }
+    if (config.rlPolicyMode == "nn") {
+      loadNNModel();
+    }
   }
 
   var runCore = function(fn){ return function(){ return fn(core2); }; };
@@ -2020,20 +2266,38 @@ function runAiLogic() {
   addAction("liquid", (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0), runCore(actionLiquid));
   addAction("noop", 0, actionHandlers.noop);
 
-  if (config.rlPolicyMode != "heuristic" && rlQTable != null) {
-    var qScores = qScoresForState(beforeState);
-    var isQTable = config.rlPolicyMode == "qtable";
-    var isHybrid = config.rlPolicyMode == "hybrid";
-    var blend = config.rlQTableBlend;
-    for (var qi = 0; qi < actions.length; qi++) {
-      var act = actions[qi];
-      var qv = qScores != null ? qScores[act.name] : null;
-      if (qv == null) {
-        if (isQTable) act.score = 0;
-        continue;
+  // Policy selection: heuristic, Q-table or NN.
+  if (config.rlPolicyMode != "heuristic") {
+    if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
+      var qScores = qScoresForState(beforeState);
+      var isQTable = config.rlPolicyMode == "qtable";
+      var isHybrid = config.rlPolicyMode == "hybrid";
+      var blend = config.rlQTableBlend;
+      for (var qi = 0; qi < actions.length; qi++) {
+        var act = actions[qi];
+        var qv = qScores != null ? qScores[act.name] : null;
+        if (qv == null) {
+          if (isQTable) act.score = 0;
+          continue;
+        }
+        if (isQTable) act.score = qv;
+        else if (isHybrid) act.score = act.score * (1 - blend) + qv * blend;
       }
-      if (isQTable) act.score = qv;
-      else if (isHybrid) act.score = act.score * (1 - blend) + qv * blend;
+    }
+
+    if (config.rlPolicyMode == "nn" && state.nnModel != null) {
+      var nnScores = nnScoresForState(beforeState);
+      if (nnScores != null) {
+        for (var qi2 = 0; qi2 < actions.length; qi2++) {
+          var act2 = actions[qi2];
+          var nnv = nnScores[act2.name];
+          if (nnv == null) {
+            act2.score = 0;
+            continue;
+          }
+          act2.score = nnv;
+        }
+      }
     }
   }
 
