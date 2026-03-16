@@ -1948,10 +1948,9 @@ function runAiLogic() {
   configureFactories(team2);
   ensureLogicControllers(core2, team2);
 
+  // Loop principal: snapshot -> escolhe acao -> executa -> recompensa -> Q-table -> salvar.
   var enemyCore = findEnemyCore(team2);
   var enemies = countEnemyUnits(team2);
-  var copper = core2.items.get(Items.copper);
-  var lead = core2.items.get(Items.lead);
   var availCopper = availableCoreItems(core2, Items.copper);
   var availLead = availableCoreItems(core2, Items.lead);
   var wantsAttack = enemyCore != null && shouldAttack(core2);
@@ -1964,93 +1963,65 @@ function runAiLogic() {
   var canLiquidHub = hubBlock != null && coreHasItemsFor(hubBlock, team2);
   var canLiquid = canPump || findLiquidHub(team2) != null || canLiquidHub;
   var powerStats = computePowerStatus(team2);
-  var powerNeedScore = 0;
-  if (powerStats.count == 0) {
-    powerNeedScore = 40;
-  } else if (powerStats.avg < 0.4 || powerStats.min < 0.25) {
-    powerNeedScore = 45;
-  } else if (powerStats.avg < 0.7) {
-    powerNeedScore = 25;
-  } else if (powerStats.avg < 0.85) {
-    powerNeedScore = 10;
-  }
+  var powerNeedScore =
+    powerStats.count == 0 ? 40 :
+    (powerStats.avg < 0.4 || powerStats.min < 0.25) ? 45 :
+    powerStats.avg < 0.7 ? 25 :
+    powerStats.avg < 0.85 ? 10 : 0;
   var beforeState = snapshotState(core2, enemyCore, enemies, team2);
 
-  if (config.rlPolicyMode != "heuristic") {
-    if (config.rlQTableReloadTicks > 0 && (state.tick - rlQTableLastLoadTick) >= config.rlQTableReloadTicks) {
-      loadQTable();
-    } else if (rlQTable == null) {
-      loadQTable();
-    }
+  if (config.rlPolicyMode != "heuristic" &&
+      (rlQTable == null ||
+      (config.rlQTableReloadTicks > 0 && (state.tick - rlQTableLastLoadTick) >= config.rlQTableReloadTicks))) {
+    loadQTable();
   }
 
-  var actions = [
-    {
-      name: "thermal",
-      score: (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0),
-      run: function(){ return actionThermal(core2); }
-    },
-    {
-      name: "attackWave",
-      score: wantsAttack ? 100 : 0,
-      run: function(){ return enemyCore != null && actionAttackWave(core2, enemyCore); }
-    },
-    {
-      name: "rally",
-      score: wantsAttack ? 55 : 0,
-      run: function(){ return enemyCore != null && actionRally(core2, enemyCore); }
-    },
-    {
-      name: "mine",
-      score: (canDrill ? (availCopper < 200 ? 85 : availCopper < 400 ? 60 : 25) + (state.drillCount < config.maxDrills ? 20 : 0) : 0),
-      run: function(){ return actionMine(core2); }
-    },
-    {
-      name: "defend",
-      score: (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0),
-      run: function(){ return actionDefend(core2); }
-    },
-    {
-      name: "power",
-      score: (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0),
-      run: function(){ return actionPower(core2); }
-    },
-    {
-      name: "liquid",
-      score: (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0),
-      run: function(){ return actionLiquid(core2); }
-    },
-    {
-      name: "noop",
-      score: 0,
-      run: function(){ return true; }
-    }
-  ];
+  var runCore = function(fn){ return function(){ return fn(core2); }; };
+  var runEnemy = function(fn){ return function(){ return enemyCore != null && fn(core2, enemyCore); }; };
+
+  // Connect the RL action names to concrete runner functions.
+  // This ensures that every action in rlQMeta.actions has a runnable implementation.
+  var actionHandlers = {
+    attackWave: runEnemy(actionAttackWave),
+    rally: runEnemy(actionRally),
+    mine: runCore(actionMine),
+    defend: runCore(actionDefend),
+    power: runCore(actionPower),
+    noop: function(){ return true; }
+  };
+
+  var actions = [];
+  var addAction = function(name, score, run){ actions.push({ name: name, score: score, run: run }); };
+  addAction("thermal", (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0), runCore(actionThermal));
+  addAction("attackWave", wantsAttack ? 100 : 0, actionHandlers.attackWave);
+  addAction("rally", wantsAttack ? 55 : 0, actionHandlers.rally);
+  addAction("mine", (canDrill ? (availCopper < 200 ? 85 : availCopper < 400 ? 60 : 25) + (state.drillCount < config.maxDrills ? 20 : 0) : 0), actionHandlers.mine);
+  addAction("defend", (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0), actionHandlers.defend);
+  addAction("power", (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0), actionHandlers.power);
+  addAction("liquid", (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0), runCore(actionLiquid));
+  addAction("noop", 0, actionHandlers.noop);
 
   if (config.rlPolicyMode != "heuristic" && rlQTable != null) {
     var qScores = qScoresForState(beforeState);
-    if (qScores != null) {
-      for (var qi = 0; qi < actions.length; qi++) {
-        var act = actions[qi];
-        var qv = qScores[act.name];
-        if (qv == null) {
-          if (config.rlPolicyMode == "qtable") act.score = 0;
-          continue;
-        }
-        if (config.rlPolicyMode == "qtable") {
-          act.score = qv;
-        } else if (config.rlPolicyMode == "hybrid") {
-          act.score = act.score * (1 - config.rlQTableBlend) + qv * config.rlQTableBlend;
-        }
+    var isQTable = config.rlPolicyMode == "qtable";
+    var isHybrid = config.rlPolicyMode == "hybrid";
+    var blend = config.rlQTableBlend;
+    for (var qi = 0; qi < actions.length; qi++) {
+      var act = actions[qi];
+      var qv = qScores != null ? qScores[act.name] : null;
+      if (qv == null) {
+        if (isQTable) act.score = 0;
+        continue;
       }
-    } else if (config.rlPolicyMode == "qtable") {
-      for (var qi2 = 0; qi2 < actions.length; qi2++) actions[qi2].score = 0;
+      if (isQTable) act.score = qv;
+      else if (isHybrid) act.score = act.score * (1 - blend) + qv * blend;
     }
   }
 
   var ranked = rankActions(actions);
-  var did = false;
   var pickedName = "noop";
+  state.lastAction = "none";
+  state.lastActionOk = false;
   for (var r = 0; r < ranked.length; r++) {
     var picked = ranked[r];
     var ok = false;
@@ -2059,23 +2030,18 @@ function runAiLogic() {
     } catch (e) {
       ok = false;
     }
-    if (ok) {
-      did = true;
-      pickedName = picked.name;
-      state.lastAction = picked.name;
-      state.lastActionOk = true;
-      recordAction(picked.name);
-      if (picked.name != state.lastMode) {
-        Log.info("[IA] Ação: " + picked.name);
-        state.lastMode = picked.name;
-      }
-      break;
+    if (!ok) continue;
+    pickedName = picked.name;
+    state.lastAction = picked.name;
+    state.lastActionOk = true;
+    recordAction(picked.name);
+    if (picked.name != state.lastMode) {
+      Log.info("[IA] Ação: " + picked.name);
+      state.lastMode = picked.name;
     }
+    break;
   }
-  if (!did) {
-    state.lastAction = "none";
-    state.lastActionOk = false;
-  }
+  var did = state.lastActionOk === true;
 
   var core3 = getCore(team2);
   var enemyCore2 = findEnemyCore(team2);
