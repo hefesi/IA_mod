@@ -1,0 +1,8 @@
+{
+  "displayName": "IA Base & Ataque",
+  "name": "ia-base-ataque",
+  "author": "Henrique + Codex",
+  "description": "IA de exemplo que monta base, controla unidades e adapta layout ao mapa.",
+  "minGameVersion": "154",
+  "version": "0.1.0"
+}
