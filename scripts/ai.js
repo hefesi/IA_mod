@@ -121,7 +121,7 @@ var config = {
   liquidHubSearchRadius: 8,
   preferLiquidTank: false,
   preferCryofluid: true,
-  mobileSafeMode: true,
+  mobileSafeMode: false,
   mobileLogicInterval: 60,
   mobileCommandInterval: 180,
   mobileFactoryConfigInterval: 1200,
