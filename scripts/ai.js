@@ -2333,7 +2333,9 @@ function runAiLogic() {
   var reward = computeReward(beforeState, pickedName, afterState, { ok: did });
   state.lastReward = reward;
   updateOnlineQTable(beforeState, pickedName, afterState, reward);
+  updateNNModel(beforeState, pickedName, afterState, reward);
   saveQTableIfNeeded();
+  saveNNModelIfNeeded();
   emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
 }
 
