@@ -2606,35 +2606,42 @@ function runAiStep(core, team) {
 
 
 Events.run(Trigger.update, function(){
-  state.tick++;
+  try {
+    state.tick++;
 
-  ensureHudButton();
-  ensurePlayerControlled();
+    ensureHudButton();
+    ensurePlayerControlled();
 
-  if (!state.aiEnabled) return;
+    if (!state.aiEnabled) return;
 
-  var localPlayer = getLocalPlayer();
-  var team = localPlayer != null ? localPlayer.team() : Vars.state.rules.defaultTeam;
-  var core = getCore(team);
-  if (localPlayer == null || core == null) {
-    warnBuildFail("Aguardando player/core...");
-    return;
-  }
-
-  var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
-  if (interval > 1 && (state.tick % interval) != 0) return;
-
-  if (isMobileSafe()) {
-    try {
-      runAiLogic();
-    } catch (e) {
-      if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
-        Log.info("[IA] Erro em safe mode. Continuando.");
-        state.lastErrorTick = state.tick;
-      }
+    var localPlayer = getLocalPlayer();
+    var team = localPlayer != null ? localPlayer.team() : (Vars.state != null && Vars.state.rules != null ? Vars.state.rules.defaultTeam : null);
+    var core = getCore(team);
+    if (localPlayer == null || core == null) {
+      warnBuildFail("Aguardando player/core...");
+      return;
     }
-  } else {
-    runAiLogic();
+
+    var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
+    if (interval > 1 && (state.tick % interval) != 0) return;
+
+    if (isMobileSafe()) {
+      try {
+        runAiLogic();
+      } catch (e) {
+        if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
+          Log.info("[IA] Erro em safe mode. Continuando: " + e);
+          state.lastErrorTick = state.tick;
+        }
+      }
+    } else {
+      runAiLogic();
+    }
+    updateHudDebug();
+  } catch (e) {
+    if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
+      Log.info("[IA] Erro inesperado no update: " + e);
+      state.lastErrorTick = state.tick;
+    }
   }
-  updateHudDebug();
 });
