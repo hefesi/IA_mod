@@ -258,6 +258,7 @@ function rlSocketConnect() {
     return true;
   } catch (e) {
     rlSocketClose();
+    Log.info("[RL] Falha ao conectar socket: " + e + " (" + config.rlSocketHost + ":" + config.rlSocketPort + ")");
     return false;
   }
 }
@@ -279,6 +280,7 @@ function rlSocketFlush() {
     return true;
   } catch (e) {
     rlSocketClose();
+    Log.info("[RL] Falha ao enviar dados pelo socket: " + e);
     return false;
   }
 }

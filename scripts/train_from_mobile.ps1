@@ -42,6 +42,28 @@ $logFile = "rl_socket.log"
 $epochs = 5
 $outQTable = "q_table.json"
 
+# Detecta o IP local para instruir o celular sobre para onde enviar os logs.
+function Get-LocalIPv4 {
+    try {
+        $addr = Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notmatch "^127\." -and $_.IPAddress -notmatch "^169\.254\." } |
+            Select-Object -First 1 -ExpandProperty IPAddress
+        if ($addr) { return $addr }
+    } catch {
+        # Fallback em sistemas que não têm Get-NetIPAddress
+    }
+    try {
+        $host = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME)
+        $ip = $host.AddressList | Where-Object { $_.AddressFamily -eq 'InterNetwork' -and $_.ToString() -notmatch '^127\.' } | Select-Object -First 1
+        if ($ip) { return $ip.ToString() }
+    } catch {
+        # ignore
+    }
+    return $null
+}
+
+$localIP = Get-LocalIPv4
+
 Write-Host "Usando Python: $python"
 Write-Host "Iniciando socket server (porta $port)." -ForegroundColor Cyan
 
