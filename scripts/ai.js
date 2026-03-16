@@ -520,22 +520,23 @@ function ensurePlayerControlled() {
   var unit = player.unit();
   var unitId = unit.id;
 
-  // If the player changed unit (respawn, etc), reset stored controller state.
+  // If the player switched unit (respawn, etc), force reassignment.
   if (state.playerControlledUnitId !== unitId) {
-    state.playerControllerSet = false;
     state.playerControllerMode = null;
   }
 
   var desiredMode = (!state.aiEnabled || config.observerMode) ? "player" : "ai";
-  if (state.playerControllerSet && state.playerControllerMode === desiredMode && state.playerControlledUnitId === unitId) return;
+
+  // Avoid repeatedly reassigning controller every tick.
+  if (state.playerControllerMode === desiredMode && state.playerControlledUnitId === unitId) return;
 
   if (desiredMode === "player") {
     try {
       unit.controller(player);
+      Log.info("[IA] player control restored");
     } catch (e) {
       // ignore
     }
-    state.playerControllerSet = true;
     state.playerControllerMode = "player";
     state.playerControlledUnitId = unitId;
     return;
@@ -544,12 +545,12 @@ function ensurePlayerControlled() {
   // desiredMode == "ai"
   try {
     unit.controller(new CommandAI());
-    state.playerControllerSet = true;
-    state.playerControllerMode = "ai";
-    state.playerControlledUnitId = unitId;
+    Log.info("[IA] ai control assigned");
   } catch (e2) {
     // ignore
   }
+  state.playerControllerMode = "ai";
+  state.playerControlledUnitId = unitId;
 }
 
 function unitTypeByName(name) {
