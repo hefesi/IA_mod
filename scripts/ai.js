@@ -2557,6 +2557,12 @@ function runAiStep(core, team) {
     }
   }
 
+  // Penalize repeated actions to avoid getting stuck in loops.
+  for (var ai = 0; ai < actions.length; ai++) {
+    var a = actions[ai];
+    a.score -= recentPenalty(a.name);
+  }
+
   var ranked = rankActions(actions);
   var pickedName = "noop";
   state.lastAction = "none";
