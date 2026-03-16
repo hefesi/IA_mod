@@ -84,7 +84,9 @@ var config = {
   campaignSafeMode: true,
   warnInterval: 300,
   aiControlPlayerUnit: true,
-  observerMode: true,
+  // When true, the local player unit is excluded from AI commands and the player retains direct control.
+  // Set to false so the AI can fully control the player's unit automatically.
+  observerMode: false,
   resourceReserve: {
     "copper": 120,
     "lead": 100,
@@ -1260,6 +1262,16 @@ function countEnemyUnits(team) {
   return count;
 }
 
+function countBlocks(team, block) {
+  if (team == null || block == null) return 0;
+  var count = 0;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team) return;
+    if (b.block == block) count++;
+  });
+  return count;
+}
+
 function containsType(list, type) {
   for (var i = 0; i < list.length; i++) {
     if (list[i] == type) return true;
@@ -1945,6 +1957,13 @@ function runAiLogic() {
   var core2 = getCore(team2);
   if (core2 == null) return;
 
+  // Keep counts in sync with the current world state (e.g., in case buildings were lost).
+  state.drillCount = countBlocks(team2, Blocks.mechanicalDrill);
+  state.turretCount = countBlocks(team2, Blocks.duo);
+  state.powerClusters = countBlocks(team2, Blocks.powerNode);
+  state.pumpCount = countBlocks(team2, Blocks.mechanicalPump);
+  state.thermalCount = countBlocks(team2, Blocks.thermalGenerator);
+
   configureFactories(team2);
   ensureLogicControllers(core2, team2);
 
@@ -1995,7 +2014,7 @@ function runAiLogic() {
   addAction("thermal", (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0), runCore(actionThermal));
   addAction("attackWave", wantsAttack ? 100 : 0, actionHandlers.attackWave);
   addAction("rally", wantsAttack ? 55 : 0, actionHandlers.rally);
-  addAction("mine", (canDrill ? (availCopper < 200 ? 85 : availCopper < 400 ? 60 : 25) + (state.drillCount < config.maxDrills ? 20 : 0) : 0), actionHandlers.mine);
+  addAction("mine", (canDrill ? (availCopper < 200 ? 120 : availCopper < 400 ? 90 : 50) + (state.drillCount < config.maxDrills ? 30 : 0) : 0), actionHandlers.mine);
   addAction("defend", (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0), actionHandlers.defend);
   addAction("power", (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0), actionHandlers.power);
   addAction("liquid", (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0), runCore(actionLiquid));

@@ -1,8 +1,8 @@
 {
   "displayName": "IA Base & Ataque",
-  "name": "ia-base-ataque",
+  "name": "auto game",
   "author": "Henrique + Codex",
-  "description": "IA de que monta base, controla unidades e adapta layout ao mapa.",
+  "description": "IA de que joga mindustry para quem so que ver ",
   "minGameVersion": "154",
-  "version": "0.3.32"
+  "version": "0.3.40"
 }
