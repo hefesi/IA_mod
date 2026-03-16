@@ -47,7 +47,7 @@ var config = {
   modName: "ia-base-ataque",
   rlLogEnabled: true,
   rlSocketEnabled: true,
-  rlSocketHost: "127.0.0.1",
+  rlSocketHost: "192.168.15.8", // exemplo do IP do PC
   rlSocketPort: 4567,
   rlSocketReconnectTicks: 300,
   rlSocketTimeoutMs: 200,
@@ -381,7 +381,7 @@ function isMobileSafe() {
 
 function applyMobileSafeMode() {
   if (!isMobileSafe()) return;
-  config.rlSocketEnabled = false;
+  config.rlSocketEnabled = true;
   config.rlLogEnabled = false;
   config.rlPolicyMode = "heuristic";
   config.rlSaveInterval = 0;
@@ -2604,46 +2604,3 @@ function runAiStep(core, team) {
   emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
   state.lastPlaceFail = "";
 }
-
-
-
-Events.run(Trigger.update, function(){
-  try {
-    state.tick++;
-
-    ensureHudButton();
-    ensurePlayerControlled();
-
-    if (!state.aiEnabled) return;
-
-    var localPlayer = getLocalPlayer();
-    var team = localPlayer != null ? localPlayer.team() : (Vars.state != null && Vars.state.rules != null ? Vars.state.rules.defaultTeam : null);
-    var core = getCore(team);
-    if (localPlayer == null || core == null) {
-      warnBuildFail("Aguardando player/core...");
-      return;
-    }
-
-    var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
-    if (interval > 1 && (state.tick % interval) != 0) return;
-
-    if (isMobileSafe()) {
-      try {
-        runAiLogic();
-      } catch (e) {
-        if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
-          Log.info("[IA] Erro em safe mode. Continuando: " + e);
-          state.lastErrorTick = state.tick;
-        }
-      }
-    } else {
-      runAiLogic();
-    }
-    updateHudDebug();
-  } catch (e) {
-    if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
-      Log.info("[IA] Erro inesperado no update: " + e);
-      state.lastErrorTick = state.tick;
-    }
-  }
-});

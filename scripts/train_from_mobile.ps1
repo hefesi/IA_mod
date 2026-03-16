@@ -42,27 +42,28 @@ $logFile = "rl_socket.log"
 $epochs = 5
 $outQTable = "q_table.json"
 
-# Detecta o IP local para instruir o celular sobre para onde enviar os logs.
-function Get-LocalIPv4 {
+# Detecta os IPs locais para instruir o celular sobre para onde enviar os logs.
+function Get-LocalIPv4s {
+    $ips = @()
     try {
-        $addr = Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp -ErrorAction SilentlyContinue |
+        $ips += Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp -ErrorAction SilentlyContinue |
             Where-Object { $_.IPAddress -notmatch "^127\." -and $_.IPAddress -notmatch "^169\.254\." } |
-            Select-Object -First 1 -ExpandProperty IPAddress
-        if ($addr) { return $addr }
+            Select-Object -ExpandProperty IPAddress
     } catch {
         # Fallback em sistemas que não têm Get-NetIPAddress
     }
     try {
         $host = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME)
-        $ip = $host.AddressList | Where-Object { $_.AddressFamily -eq 'InterNetwork' -and $_.ToString() -notmatch '^127\.' } | Select-Object -First 1
-        if ($ip) { return $ip.ToString() }
+        $ips += $host.AddressList |
+            Where-Object { $_.AddressFamily -eq 'InterNetwork' -and $_.ToString() -notmatch '^127\.' } |
+            ForEach-Object { $_.ToString() }
     } catch {
         # ignore
     }
-    return $null
+    return $ips | Select-Object -Unique
 }
 
-$localIP = Get-LocalIPv4
+$localIPs = Get-LocalIPv4s
 
 Write-Host "Usando Python: $python"
 Write-Host "Iniciando socket server (porta $port)." -ForegroundColor Cyan
@@ -74,12 +75,14 @@ $job = Start-Job -Name "RL-Socket" -ScriptBlock {
 
 Write-Host "Socket server em execução como job 'RL-Socket'." -ForegroundColor Green
 
-$ipHint = if ($localIP) { $localIP } else { "<IP-do-PC>" }
+$ipHint = if ($localIPs -and $localIPs.Count -gt 0) { $localIPs -join ", " } else { "<IP-do-PC>" }
 Write-Host "
 Ação necessária:
  1) No celular, configure ai.js com:
     config.rlSocketEnabled = true
-    config.rlSocketHost = '$ipHint'
+    config.rlSocketHost = '<IP-do-PC>'
+
+    (Use um dos IPs deste PC: $ipHint)
 2) Rode Mindustry e deixe a IA rodar para gerar transições.
 
 Pressione ENTER quando quiser encerrar a coleta e treinar." -ForegroundColor Yellow
