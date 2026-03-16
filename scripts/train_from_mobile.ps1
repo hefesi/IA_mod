@@ -73,9 +73,14 @@ $job = Start-Job -Name "RL-Socket" -ScriptBlock {
 } -ArgumentList $python, $port, $logFile
 
 Write-Host "Socket server em execução como job 'RL-Socket'." -ForegroundColor Green
+
+$ipHint = if ($localIP) { $localIP } else { "<IP-do-PC>" }
 Write-Host "
 Ação necessária:
- 1) No celular, configure ai.js com:\n    config.rlSocketEnabled = true\n    config.rlSocketHost = '<IP-do-PC>'\n2) Rode Mindustry e deixe a IA rodar para gerar transições.
+ 1) No celular, configure ai.js com:
+    config.rlSocketEnabled = true
+    config.rlSocketHost = '$ipHint'
+2) Rode Mindustry e deixe a IA rodar para gerar transições.
 
 Pressione ENTER quando quiser encerrar a coleta e treinar." -ForegroundColor Yellow
 
