@@ -9,11 +9,13 @@ Status: **aprovado** nos checks automatizados locais.
   - ações base RL;
   - features/estado RL.
 - Execução real do treinamento offline (`scripts/rl_qlearn.py`) com log sintético.
-- Adaptabilidade para mods/variáveis: uma ação custom (`customModAction`) foi incorporada automaticamente à policy gerada.
+- Adaptabilidade para mods/variáveis: ação custom (`customModAction`) incorporada automaticamente à policy.
+- Leitura de log RL real (quando existir), com contagem de transições parseáveis e ações detectadas.
 
 ## Como reproduzir
 ```bash
 python3 scripts/evaluate_ai.py
+python3 scripts/evaluate_ai.py --log rl_socket.log
 python3 -m py_compile scripts/rl_qlearn.py scripts/rl_dqn.py scripts/rl_socket_server.py scripts/evaluate_ai.py
 ```
 
