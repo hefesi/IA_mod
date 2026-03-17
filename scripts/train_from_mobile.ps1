@@ -17,6 +17,12 @@ Requirements:
  - In ai.js, set config.rlSocketEnabled=true and config.rlSocketHost=<PC_IP>.
 #>
 
+param(
+    [int]$Timeout = 0,
+    [int]$MaxTransitions = 0,
+    [switch]$NoWait
+)
+
 function Get-PythonCommand {
     foreach ($cmd in @("python", "py", "python3", "python3.13")) {
         try {
@@ -69,9 +75,12 @@ Write-Host "Usando Python: $python"
 Write-Host "Iniciando socket server (porta $port)." -ForegroundColor Cyan
 
 $job = Start-Job -Name "RL-Socket" -ScriptBlock {
-    param($python, $port, $logFile)
-    & $python scripts/rl_socket_server.py --host 0.0.0.0 --port $port --out $logFile --verbose
-} -ArgumentList $python, $port, $logFile
+    param($python, $port, $logFile, $timeout, $maxTrans)
+    $args = @("--host", "0.0.0.0", "--port", $port, "--out", $logFile, "--verbose")
+    if ($timeout -gt 0) { $args += @("--timeout", $timeout) }
+    if ($maxTrans -gt 0) { $args += @("--max-transitions", $maxTrans) }
+    & $python scripts/rl_socket_server.py @args
+} -ArgumentList $python, $port, $logFile, $Timeout, $MaxTransitions
 
 Write-Host "Socket server em execução como job 'RL-Socket'." -ForegroundColor Green
 
@@ -84,10 +93,19 @@ Ação necessária:
 
     (Use um dos IPs deste PC: $ipHint)
 2) Rode Mindustry e deixe a IA rodar para gerar transições.
+" -ForegroundColor Yellow
 
-Pressione ENTER quando quiser encerrar a coleta e treinar." -ForegroundColor Yellow
-
-Read-Host | Out-Null
+if (-not $NoWait -and $Timeout -eq 0 -and $MaxTransitions -eq 0) {
+    Write-Host "Pressione ENTER quando quiser encerrar a coleta e treinar." -ForegroundColor Yellow
+    Read-Host | Out-Null
+} else {
+    if ($Timeout -gt 0) {
+        Write-Host "Servidor irá parar automaticamente após $Timeout segundos de inatividade." -ForegroundColor Yellow
+    }
+    if ($MaxTransitions -gt 0) {
+        Write-Host "Servidor irá parar automaticamente após $MaxTransitions transições." -ForegroundColor Yellow
+    }
+}
 
 Write-Host "Parando socket server..." -ForegroundColor Cyan
 Stop-Job -Name "RL-Socket" -ErrorAction SilentlyContinue

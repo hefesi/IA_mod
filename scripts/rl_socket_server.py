@@ -28,7 +28,7 @@ def reward(s, s2):
     return r
 
 
-def handle_connection(conn, addr, out_path, verbose):
+def handle_connection(conn, addr, out_path, verbose, max_transitions=0):
     buf = ""
     count = 0
     total = 0.0
@@ -56,9 +56,12 @@ def handle_connection(conn, addr, out_path, verbose):
                 total += r
                 if verbose:
                     print("t={t} a={a} r={r:.2f}".format(t=tr.get("t"), a=tr.get("a"), r=r))
+                if max_transitions and count >= max_transitions:
+                    return count
     if verbose and count:
         avg = total / count
         print("client_done transitions={} avg_reward={:.3f}".format(count, avg))
+    return count
 
 
 def main():
@@ -67,17 +70,29 @@ def main():
     parser.add_argument("--port", type=int, default=4567, help="Bind port.")
     parser.add_argument("--out", default="rl_socket.log", help="Output log file.")
     parser.add_argument("--verbose", action="store_true", help="Print per-transition rewards.")
+    parser.add_argument("--max-transitions", type=int, default=0, help="Stop server after this many transitions (0 = unlimited).")
+    parser.add_argument("--timeout", type=float, default=0.0, help="Stop server after this many seconds of no connection (0 = unlimited).")
     args = parser.parse_args()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((args.host, args.port))
         s.listen(1)
+        if args.timeout and args.timeout > 0:
+            s.settimeout(args.timeout)
         print("listening_on={}:{}".format(args.host, args.port))
-        while True:
-            conn, addr = s.accept()
+        stop = False
+        while not stop:
             try:
-                handle_connection(conn, addr, args.out, args.verbose)
+                conn, addr = s.accept()
+            except socket.timeout:
+                print("timeout_reached, stopping server")
+                break
+            try:
+                count = handle_connection(conn, addr, args.out, args.verbose, max_transitions=args.max_transitions)
+                if args.max_transitions and count >= args.max_transitions:
+                    print("max_transitions reached ({}), stopping server".format(count))
+                    break
             except Exception as exc:
                 print("client_error={}".format(exc))
                 time.sleep(0.2)
