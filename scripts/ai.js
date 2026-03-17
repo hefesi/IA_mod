@@ -29,7 +29,6 @@ var config = {
   waveMinGround: 6,
   waveMinAir: 4,
   waveSupportMax: 2,
-  waveEnemyScanRadius: 60,
   oreSearchRadius: 12,
   maxDrills: 5,
   maxConveyorSteps: 60,
@@ -47,7 +46,7 @@ var config = {
   modName: "ia-base-ataque",
   rlLogEnabled: true,
   rlSocketEnabled: true,
-  rlSocketHost: "192.168.15.8", // exemplo do IP do PC
+  rlSocketHost: "192.168.25.8",
   rlSocketPort: 4567,
   rlSocketReconnectTicks: 300,
   rlSocketTimeoutMs: 200,
@@ -69,22 +68,18 @@ var config = {
   rlAlpha: 0.12,
   rlGamma: 0.9,
   rlRewardClamp: 120,
-  rlRewardFail: -12,
-  rlRewardInvalidAction: -25,
+  rlRewardFail: -2,
   rlRewardCoreLost: -500,
   rlRewardWin: 500,
   rlRewardCoreDamageScale: 200,
-  rlRewardNoDamage: 15,
-  rlNoDamageBonusInterval: 180,
   rlRewardCopper: 0.02,
   rlRewardLead: 0.02,
-  rlRewardDrill: 1,
-  rlRewardTurret: 2,
+  rlRewardDrill: 4,
+  rlRewardTurret: 6,
   rlRewardPower: 3,
   rlRewardPump: 2,
   rlRewardLiquidHub: 3,
   rlRewardThermal: 5,
-  rlRewardEnemyKill: 20,
   rlRewardUnit: 0.2,
   rlSaveInterval: 1800,
   aiEnabledDefault: true,
@@ -102,9 +97,7 @@ var config = {
   // Set to false so the AI can fully control the player's unit automatically.
   observerMode: false,
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
-  controllerResetPenalty: -50,
-  controllerResetCooldown: 300,
-  controllerResetCooldownEnabled: true,
+  controllerResetPenalty: -1,
   resourceReserve: {
     "copper": 120,
     "lead": 100,
@@ -121,7 +114,7 @@ var config = {
   liquidHubSearchRadius: 8,
   preferLiquidTank: false,
   preferCryofluid: true,
-  mobileSafeMode: false,
+  mobileSafeMode: true,
   mobileLogicInterval: 60,
   mobileCommandInterval: 180,
   mobileFactoryConfigInterval: 1200,
@@ -158,7 +151,6 @@ var state = {
   pumpCount: 0,
   liquidHubCount: 0,
   thermalCount: 0,
-  coreNoDamageTicks: 0,
   actionHistory: [],
   lastActionTicks: {},
   aiEnabled: true,
@@ -199,7 +191,7 @@ var rlSocket = {
 
 var rlQTable = null;
 var rlQMeta = {
-  actions: ["attackWave", "rally", "mine", "defend", "power", "thermal", "liquid", "noop"],
+  actions: ["attackWave", "rally", "mine", "defend", "power", "noop"],
   features: [
     { name: "copper", bins: [0, 50, 100, 200, 400, 800] },
     { name: "lead", bins: [0, 50, 100, 200, 400, 800] },
@@ -258,7 +250,6 @@ function rlSocketConnect() {
     return true;
   } catch (e) {
     rlSocketClose();
-    Log.info("[RL] Falha ao conectar socket: " + e + " (" + config.rlSocketHost + ":" + config.rlSocketPort + ")");
     return false;
   }
 }
@@ -280,7 +271,6 @@ function rlSocketFlush() {
     return true;
   } catch (e) {
     rlSocketClose();
-    Log.info("[RL] Falha ao enviar dados pelo socket: " + e);
     return false;
   }
 }
@@ -381,7 +371,7 @@ function isMobileSafe() {
 
 function applyMobileSafeMode() {
   if (!isMobileSafe()) return;
-  config.rlSocketEnabled = true;
+  config.rlSocketEnabled = false;
   config.rlLogEnabled = false;
   config.rlPolicyMode = "heuristic";
   config.rlSaveInterval = 0;
@@ -498,19 +488,14 @@ function updateHudDebug() {
   var core = getCore(team);
   var pOk = player != null ? "ok" : "null";
   var cOk = core != null ? "ok" : "null";
-  var resourceLow = core != null ? isResourceLow(core) : false;
-  var enemiesNearby = core != null ? enemyNearby(team, core, config.waveEnemyScanRadius) : false;
-  var survivalMode = resourceLow || !enemiesNearby;
-  var lastResetAgo = state.lastControllerResetTick != null ? (state.tick - state.lastControllerResetTick) : -1;
-
   var text = "IA " + (state.aiEnabled ? "ON" : "OFF") +
     " | p:" + pOk +
     " c:" + cOk +
-    " surv:" + (survivalMode ? "1" : "0") +
+    " obs:" + (config.observerMode ? "1" : "0") +
+    " built:" + (state.built ? "1" : "0") +
     " r:" + Math.round(state.lastReward * 100) / 100 +
     " tick:" + state.tick +
     " last:" + (state.lastAction == "" ? "-" : state.lastAction) +
-    " reset:" + lastResetAgo +
     (state.lastPlaceFail != "" ? (" fail:" + state.lastPlaceFail) : "");
   try {
     aiHud.debugLabel.setText(text);
@@ -574,10 +559,6 @@ function ensurePlayerControlled() {
     return;
   }
 
-  // Prevent flip-flopping controller assignments too frequently.
-  if (state.lastControllerResetTick == null) state.lastControllerResetTick = -9999;
-  if (state.playerControllerMode != null && (state.tick - state.lastControllerResetTick) < config.controllerResetCooldown) return;
-
   if (desiredMode === "player") {
     try {
       unit.controller(player);
@@ -588,7 +569,6 @@ function ensurePlayerControlled() {
     state.playerControllerMode = "player";
     state.playerControlledUnitId = unitId;
     state.controllerResetPenalty = config.controllerResetPenalty;
-    state.lastControllerResetTick = state.tick;
     return;
   }
 
@@ -602,7 +582,6 @@ function ensurePlayerControlled() {
   state.playerControllerMode = "ai";
   state.playerControlledUnitId = unitId;
   state.controllerResetPenalty = config.controllerResetPenalty;
-  state.lastControllerResetTick = state.tick;
   updateCameraToUnit(unit);
 }
 
@@ -722,15 +701,7 @@ function loadQTable() {
     var text = fi.readString();
     var data = JSON.parse(String(text));
     rlQTable = data.q != null ? data.q : null;
-    if (data.actions != null && data.actions.length != null) {
-      // Preserve the file's action ordering (so Q columns stay aligned) and add any new actions.
-      var merged = [];
-      for (var i = 0; i < data.actions.length; i++) merged.push(data.actions[i]);
-      for (var i = 0; i < rlQMeta.actions.length; i++) {
-        if (merged.indexOf(rlQMeta.actions[i]) < 0) merged.push(rlQMeta.actions[i]);
-      }
-      rlQMeta.actions = merged;
-    }
+    if (data.actions != null && data.actions.length != null) rlQMeta.actions = data.actions;
     if (data.features != null && data.features.length != null) rlQMeta.features = data.features;
     if (rlQTable == null) {
       Log.info("[RL] Q-table invalida (sem chave 'q').");
@@ -832,16 +803,7 @@ function loadNNModel() {
     if (data == null) throw "invalid";
     if (data.features != null) rlQMeta.features = data.features;
     if (data.actions != null) rlQMeta.actions = data.actions;
-
-    // If the loaded model doesn't match our current action set, reinitialize so it can learn new actions.
-    var model = data;
-    var actionsMatch = model.actions != null && rlQMeta.actions != null && model.actions.length == rlQMeta.actions.length;
-    if (!actionsMatch) {
-      model = initializeNNModel(rlQMeta.features, rlQMeta.actions);
-      Log.info("[RL] NN model reinitialized due to action mismatch.");
-    }
-
-    state.nnModel = model;
+    state.nnModel = data;
     state.nnLastLoadTick = state.tick;
     Log.info("[RL] NN model carregado: " + fi.absolutePath());
     return true;
@@ -1052,7 +1014,6 @@ function computeReward(prevState, actionName, nextState, info) {
   reward += (nextState.liquidHubs - prevState.liquidHubs) * config.rlRewardLiquidHub;
   reward += (nextState.thermals - prevState.thermals) * config.rlRewardThermal;
   reward += (nextState.unitsTotal - prevState.unitsTotal) * config.rlRewardUnit;
-  reward += (prevState.enemies - nextState.enemies) * config.rlRewardEnemyKill;
 
   var dCore = nextState.coreHealthFrac - prevState.coreHealthFrac;
   reward += dCore * config.rlRewardCoreDamageScale;
@@ -1060,25 +1021,7 @@ function computeReward(prevState, actionName, nextState, info) {
   if (prevState.corePresent == 1 && nextState.corePresent == 0) reward += config.rlRewardCoreLost;
   if (prevState.enemyCore == 1 && nextState.enemyCore == 0) reward += config.rlRewardWin;
 
-  // Reward staying undamaged for a while.
-  if (state.coreNoDamageTicks == null) state.coreNoDamageTicks = 0;
-  if (nextState.coreHealthFrac < prevState.coreHealthFrac) {
-    state.coreNoDamageTicks = 0;
-  } else {
-    state.coreNoDamageTicks++;
-    if (config.rlNoDamageBonusInterval > 0 && (state.coreNoDamageTicks % config.rlNoDamageBonusInterval) === 0) {
-      reward += config.rlRewardNoDamage;
-    }
-  }
-
-  // Penalize invalid/failed actions, but only when it is a true resource failure.
-  if (info != null && info.ok === false) {
-    reward += config.rlRewardFail;
-    var reason = info.failReason != null ? String(info.failReason) : "";
-    if (reason.startsWith("no-items") || reason.startsWith("locked")) {
-      reward += config.rlRewardInvalidAction;
-    }
-  }
+  if (info != null && info.ok === false) reward += config.rlRewardFail;
 
   // Penalize controller resets (AI switching control mid-game).
   if (state.controllerResetPenalty != null && state.controllerResetPenalty != 0) {
@@ -1230,18 +1173,11 @@ function reserveFor(item) {
 }
 
 function availableCoreItems(core, item) {
-  // For decision-making (survival mode, reward), we reserve some resources.
   if (core == null || core.items == null || item == null) return 0;
   var total = core.items.get(item);
   var reserve = reserveFor(item);
   var avail = total - reserve;
   return avail < 0 ? 0 : avail;
-}
-
-function availableCoreItemsRaw(core, item) {
-  // Actual available items for building (no reserve applied).
-  if (core == null || core.items == null || item == null) return 0;
-  return core.items.get(item);
 }
 
 function coreHasItemsFor(block, team) {
@@ -1256,7 +1192,7 @@ function coreHasItemsFor(block, team) {
   for (var i = 0; i < reqs.length; i++) {
     var stack = reqs[i];
     var need = Math.ceil(stack.amount * mult);
-    if (availableCoreItemsRaw(core, stack.item) < need) return false;
+    if (availableCoreItems(core, stack.item) < need) return false;
   }
   return true;
 }
@@ -1273,7 +1209,7 @@ function consumeCoreItems(block, team) {
   for (var i = 0; i < reqs.length; i++) {
     var stack = reqs[i];
     var need = Math.ceil(stack.amount * mult);
-    if (availableCoreItemsRaw(core, stack.item) < need) return false;
+    if (availableCoreItems(core, stack.item) < need) return false;
   }
   for (var i2 = 0; i2 < reqs.length; i2++) {
     var stack2 = reqs[i2];
@@ -1585,30 +1521,6 @@ function findEnemyCore(team) {
   return found;
 }
 
-function isResourceLow(core) {
-  if (core == null || core.items == null) return false;
-  var copper = availableCoreItems(core, Items.copper);
-  var lead = availableCoreItems(core, Items.lead);
-  var reserve = config.resourceReserve != null ? config.resourceReserve : {};
-  var reqCopper = reserve.copper != null ? reserve.copper : 0;
-  var reqLead = reserve.lead != null ? reserve.lead : 0;
-  return copper < reqCopper || lead < reqLead;
-}
-
-function enemyNearby(team, core, radius) {
-  if (core == null || radius == null || radius <= 0) return false;
-  var found = false;
-  var maxDist2 = radius * radius;
-  Groups.unit.each(function(u){
-    if (found) return;
-    if (u == null || u.team == team) return;
-    var dx = u.x - core.x;
-    var dy = u.y - core.y;
-    if (dx * dx + dy * dy <= maxDist2) found = true;
-  });
-  return found;
-}
-
 function collectUnitIds(team) {
   var ids = new IntSeq();
   var playerId = -1;
@@ -1865,16 +1777,7 @@ function setLogicProcessorsEnabled(enabled) {
 function ensureLogicControllers(core, team) {
   if (!config.logicEnabled) return;
   if (core == null) return;
-  if (state.lastLogicTick == null) state.lastLogicTick = -9999;
-  if (state.lastLogicFailureTick == null) state.lastLogicFailureTick = -9999;
-
-  // If logic processors are failing to build (e.g., no space/resources), back off.
-  var logicCooldown = config.logicBuildInterval;
-  if ((state.tick - state.lastLogicFailureTick) < config.logicBuildInterval) {
-    logicCooldown = config.logicBuildInterval * 2;
-  }
-
-  if ((state.tick - state.lastLogicTick) < logicCooldown) return;
+  if ((state.tick - state.lastLogicTick) < config.logicBuildInterval) return;
   state.lastLogicTick = state.tick;
 
   var roles = [];
@@ -1893,8 +1796,6 @@ function ensureLogicControllers(core, team) {
       if (placed != null) {
         state.logicControllers[role] = { x: placed.tile.x, y: placed.tile.y };
         build = placed;
-      } else {
-        state.lastLogicFailureTick = state.tick;
       }
     }
     if (build != null) {
@@ -1911,85 +1812,11 @@ function waveReady(buckets) {
   return false;
 }
 
-function scanEnemyProfile(team, centerX, centerY, radius) {
-  var profile = { ground: 0, air: 0, support: 0 };
-  if (centerX == null || centerY == null || radius == null) return profile;
-  var maxDist2 = radius * radius;
-  Groups.unit.each(function(u){
-    if (u == null) return;
-    if (u.team == team) return;
-    var dx = u.x - centerX;
-    var dy = u.y - centerY;
-    if (dx * dx + dy * dy > maxDist2) return;
-    if (containsType(supportTypes, u.type)) {
-      profile.support++;
-    } else if (u.type != null && u.type.flying) {
-      profile.air++;
-    } else {
-      profile.ground++;
-    }
-  });
-  return profile;
-}
-
-function collectWaveIds(buckets, enemyProfile) {
-  // Prefer stronger units when forming waves.
-  var unitMap = {};
-  Groups.unit.each(function(u){
-    if (u == null) return;
-    unitMap[u.id] = u;
-  });
-
-  var units = [];
-  var addIds = function(seq){
-    for (var i = 0; i < seq.size; i++) units.push(seq.get(i));
-  };
-  addIds(buckets.ground);
-  addIds(buckets.air);
-  addIds(buckets.support);
-
-  var getScore = function(unitId) {
-    var u = unitMap[unitId];
-    if (u == null || u.type == null) return 0;
-    var t = u.type;
-    var score = 0;
-    try {
-      if (t.health != null) score += t.health;
-      if (t.speed != null) score += t.speed * 5;
-      if (t.hitSize != null) score += t.hitSize * 2;
-      // Prefer configured preferred unit types.
-      var pref = u.type.flying ? config.preferredAirUnit : config.preferredGroundUnit;
-      if (pref != null && u.type.name == pref) score += 30;
-
-      // Adjust based on observed enemy composition.
-      if (enemyProfile != null) {
-        if (u.type.flying) {
-          score += (enemyProfile.air - enemyProfile.ground) * 3;
-        } else {
-          score += (enemyProfile.ground - enemyProfile.air) * 3;
-        }
-      }
-    } catch (e) {
-      // ignore
-    }
-    return score;
-  };
-
-  units.sort(function(a, b){
-    return getScore(b) - getScore(a);
-  });
-
+function collectWaveIds(buckets) {
   var ids = new IntSeq();
-  var supportCount = 0;
-  for (var i = 0; i < units.length; i++) {
-    var id = units[i];
-    var u = unitMap[id];
-    if (u != null && containsType(supportTypes, u.type)) {
-      if (supportCount >= config.waveSupportMax) continue;
-      supportCount++;
-    }
-    ids.add(id);
-  }
+  appendSeq(ids, buckets.ground);
+  appendSeq(ids, buckets.air);
+  appendSeq(ids, buckets.support, config.waveSupportMax);
   return ids;
 }
 
@@ -2001,21 +1828,13 @@ function collectRallyIds(buckets) {
 }
 
 function getRallyPoint(core, enemyCore, dist) {
-  if (core == null) return new Vec2(0, 0);
-  if (enemyCore != null) {
-    var dx = enemyCore.x - core.x;
-    var dy = enemyCore.y - core.y;
-    var len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-    var rx = Math.round(core.x + (dx / len) * dist);
-    var ry = Math.round(core.y + (dy / len) * dist);
-    var clamped = clampToBounds(rx, ry);
-    return new Vec2(clamped.x, clamped.y);
-  }
-  // If we don't know enemy position, just rally in a fixed direction (east) so units still move.
-  var rx2 = Math.round(core.x + dist);
-  var ry2 = core.y;
-  var clamped2 = clampToBounds(rx2, ry2);
-  return new Vec2(clamped2.x, clamped2.y);
+  var dx = enemyCore.x - core.x;
+  var dy = enemyCore.y - core.y;
+  var len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+  var rx = Math.round(core.x + (dx / len) * dist);
+  var ry = Math.round(core.y + (dy / len) * dist);
+  var clamped = clampToBounds(rx, ry);
+  return new Vec2(clamped.x, clamped.y);
 }
 
 function pushHistory(name) {
@@ -2273,8 +2092,7 @@ function actionRally(core, enemyCore) {
   var rally = getRallyPoint(core, enemyCore, config.rallyDistance);
   var rallyIds = collectRallyIds(buckets);
   commandUnitIds(team, rallyIds, null, rally);
-  // Always return true if we issued a command (even if no units were found) to avoid penalizing the policy.
-  return true;
+  return rallyIds.size > 0;
 }
 
 function actionAttackWave(core, enemyCore) {
@@ -2283,11 +2101,7 @@ function actionAttackWave(core, enemyCore) {
   var canWave = waveReady(buckets);
   var cooled = (state.tick - state.lastWaveTick) >= config.waveCooldown;
   if (!(canWave && cooled)) return false;
-
-  var scanCenter = enemyCore != null ? enemyCore : core;
-  var enemyProfile = scanEnemyProfile(team, scanCenter.x, scanCenter.y, config.waveEnemyScanRadius);
-
-  var waveIds = collectWaveIds(buckets, enemyProfile);
+  var waveIds = collectWaveIds(buckets);
   commandUnitIds(team, waveIds, enemyCore, new Vec2(enemyCore.x, enemyCore.y));
   state.lastWaveTick = state.tick;
   state.waveIndex++;
@@ -2321,7 +2135,6 @@ Events.on(WorldLoadEvent, function(){
   state.pumpCount = 0;
   state.liquidHubCount = 0;
   state.thermalCount = 0;
-  state.coreNoDamageTicks = 0;
   state.actionHistory = [];
   state.lastActionTicks = {};
   state.aiEnabled = config.aiEnabledDefault;
@@ -2337,7 +2150,6 @@ Events.on(WorldLoadEvent, function(){
   state.playerControlledUnitId = -1;
   state.playerControllerSet = false;
   state.controllerResetPenalty = 0;
-  state.lastControllerResetTick = -9999;
   state.nnModel = null;
   state.nnLastLoadTick = -9999;
   state.nnLastSaveTick = -9999;
@@ -2453,10 +2265,7 @@ function runAiStep(core, team) {
   var enemies = countEnemyUnits(team);
   var availCopper = availableCoreItems(core, Items.copper);
   var availLead = availableCoreItems(core, Items.lead);
-  var resourceLow = isResourceLow(core);
-  var noEnemiesNearby = (enemies == 0) || !enemyNearby(team, core, config.waveEnemyScanRadius);
-  var survivalMode = resourceLow || noEnemiesNearby;
-  var wantsAttack = !survivalMode && enemyCore != null && shouldAttack(core);
+  var wantsAttack = enemyCore != null && shouldAttack(core);
   var canDrill = coreHasItemsFor(Blocks.mechanicalDrill, team);
   var canDuo = coreHasItemsFor(Blocks.duo, team);
   var canPowerNode = coreHasItemsFor(Blocks.powerNode, team);
@@ -2508,23 +2317,6 @@ function runAiStep(core, team) {
   addAction("liquid", (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0), runCore(actionLiquid));
   addAction("noop", 0, actionHandlers.noop);
 
-  // Survival mode: quando recursos estão baixos ou não há inimigos próximos,
-  // priorizar defesa/retirada (rally + torres) e reduzir a agressividade.
-  if (survivalMode) {
-    for (var ai = 0; ai < actions.length; ai++) {
-      var a = actions[ai];
-      if (a.name === "attackWave") {
-        a.score *= 0.2;
-      }
-      if (a.name === "rally") {
-        a.score += 40;
-      }
-      if (a.name === "defend") {
-        a.score += 40;
-      }
-    }
-  }
-
   if (config.rlPolicyMode != "heuristic") {
     if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
       var qScores = qScoresForState(beforeState);
@@ -2559,12 +2351,6 @@ function runAiStep(core, team) {
     }
   }
 
-  // Penalize repeated actions to avoid getting stuck in loops.
-  for (var ai = 0; ai < actions.length; ai++) {
-    var a = actions[ai];
-    a.score -= recentPenalty(a.name);
-  }
-
   var ranked = rankActions(actions);
   var pickedName = "noop";
   state.lastAction = "none";
@@ -2589,18 +2375,52 @@ function runAiStep(core, team) {
     break;
   }
   var did = state.lastActionOk === true;
-  var failReason = state.lastPlaceFail;
 
   var core2 = getCore(team);
   var enemyCore2 = findEnemyCore(team);
   var enemies2 = countEnemyUnits(team);
   var afterState = snapshotState(core2, enemyCore2, enemies2, team);
-  var reward = computeReward(beforeState, pickedName, afterState, { ok: did, failReason: failReason });
+  var reward = computeReward(beforeState, pickedName, afterState, { ok: did });
   state.lastReward = reward;
   updateOnlineQTable(beforeState, pickedName, afterState, reward);
   updateNNModel(beforeState, pickedName, afterState, reward);
   saveQTableIfNeeded();
   saveNNModelIfNeeded();
   emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
-  state.lastPlaceFail = "";
 }
+
+
+
+Events.run(Trigger.update, function(){
+  state.tick++;
+
+  ensureHudButton();
+  ensurePlayerControlled();
+
+  if (!state.aiEnabled) return;
+
+  var localPlayer = getLocalPlayer();
+  var team = localPlayer != null ? localPlayer.team() : Vars.state.rules.defaultTeam;
+  var core = getCore(team);
+  if (localPlayer == null || core == null) {
+    warnBuildFail("Aguardando player/core...");
+    return;
+  }
+
+  var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
+  if (interval > 1 && (state.tick % interval) != 0) return;
+
+  if (isMobileSafe()) {
+    try {
+      runAiLogic();
+    } catch (e) {
+      if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
+        Log.info("[IA] Erro em safe mode. Continuando.");
+        state.lastErrorTick = state.tick;
+      }
+    }
+  } else {
+    runAiLogic();
+  }
+  updateHudDebug();
+});

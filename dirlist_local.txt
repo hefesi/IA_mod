@@ -1,0 +1,28 @@
+﻿
+Name                      FullName                                             
+----                      --------                                             
+Apps                      C:\Users\Asus\AppData\Local\Apps                     
+Backup                    C:\Users\Asus\AppData\Local\Backup                   
+cloud-code                C:\Users\Asus\AppData\Local\cloud-code               
+Comms                     C:\Users\Asus\AppData\Local\Comms                    
+ConnectedDevicesPlatform  C:\Users\Asus\AppData\Local\ConnectedDevicesPlatform 
+Deployment                C:\Users\Asus\AppData\Local\Deployment               
+Docker                    C:\Users\Asus\AppData\Local\Docker                   
+docker-secrets-engine     C:\Users\Asus\AppData\Local\docker-secrets-engine    
+GitKrakenCLI              C:\Users\Asus\AppData\Local\GitKrakenCLI             
+gk                        C:\Users\Asus\AppData\Local\gk                       
+Google                    C:\Users\Asus\AppData\Local\Google                   
+google-vscode-extension   C:\Users\Asus\AppData\Local\google-vscode-extension  
+Microsoft                 C:\Users\Asus\AppData\Local\Microsoft                
+npm-cache                 C:\Users\Asus\AppData\Local\npm-cache                
+Packages                  C:\Users\Asus\AppData\Local\Packages                 
+PeerDistRepub             C:\Users\Asus\AppData\Local\PeerDistRepub            
+PlaceholderTileLogoFolder C:\Users\Asus\AppData\Local\PlaceholderTileLogoFolder
+Programs                  C:\Users\Asus\AppData\Local\Programs                 
+Publishers                C:\Users\Asus\AppData\Local\Publishers               
+speech                    C:\Users\Asus\AppData\Local\speech                   
+Temp                      C:\Users\Asus\AppData\Local\Temp                     
+VirtualStore              C:\Users\Asus\AppData\Local\VirtualStore             
+wsl                       C:\Users\Asus\AppData\Local\wsl                      
+
+
