@@ -17,7 +17,7 @@ No `scripts/ai.js` do mod:
 No PowerShell, dentro do repositório:
 
 ```powershell
-.\scripts\train_on_pc.ps1 -Exe "C:\caminho\Mindustry.exe" -MindustryArgs "-map maze -mode survival -autoplay" -Timeout 1800 -Epochs 8
+.\scripts\train_on_pc.ps1 -Exe "C:\Users\Asus\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Google Play Games\Mindustry.exe" -MindustryArgs "-map maze -mode survival -autoplay" -Timeout 1800 -Epochs 8
 ```
 
 Parâmetros úteis:
@@ -31,3 +31,15 @@ Parâmetros úteis:
 - Modelo Q-table: `q_table.json`
 
 Depois, aponte `config.rlQTableFile` / `config.rlQTablePath` para a Q-table gerada.
+
+## Exportando modelo DQN para o mod (PyTorch -> JSON)
+
+Se você treinou com `scripts/rl_dqn.py` (saídas: `dqn_model.pt` e `dqn_meta.json`), converta para o formato lido pelo mod:
+
+```powershell
+python .\\scripts\\rl_export_nn_json.py --model dqn_model.pt --meta dqn_meta.json --out nn_model.json
+```
+
+Depois, no `scripts/ai.js` do mod:
+- `rlPolicyMode: "nn"`
+- `rlNNFile: "nn_model.json"` (ou `rlNNPath` apontando para o arquivo exportado)

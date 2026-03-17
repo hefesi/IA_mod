@@ -9,6 +9,13 @@ var Core = Packages.arc.Core;
 var Build = Packages.mindustry.world.Build;
 var BlockGroup = Packages.mindustry.world.meta.BlockGroup;
 var BlockFlag = Packages.mindustry.world.meta.BlockFlag;
+var Conveyor = Packages.mindustry.world.blocks.distribution.Conveyor;
+var Duct = Packages.mindustry.world.blocks.distribution.Duct;
+var Conduit = Packages.mindustry.world.blocks.liquid.Conduit;
+var PumpBlock = Packages.mindustry.world.blocks.production.Pump;
+var PowerNodeBlock = Packages.mindustry.world.blocks.power.PowerNode;
+var SolarGeneratorBlock = Packages.mindustry.world.blocks.power.SolarGenerator;
+var ThermalGeneratorBlock = Packages.mindustry.world.blocks.power.ThermalGenerator;
 var Table = Packages.arc.scene.ui.layout.Table;
 var Touchable = Packages.arc.scene.Touchable;
 var Styles = Packages.mindustry.ui.Styles;
@@ -62,8 +69,14 @@ var config = {
   rlNNHidden: 16,
   rlNNReloadTicks: 0,
   rlNNSaveInterval: 1800,
+  rlNNSaveExternal: false,
   rlNNAlpha: 0.01,
   rlNNGamma: 0.9,
+  rlEpsilonEnabled: true,
+  rlEpsilon: 0.08,
+  rlEpsilonMin: 0.02,
+  rlEpsilonDecay: 0.999,
+  rlEpsilonOnlyWhenRL: true,
   rlOnlineEnabled: true,
   rlAlpha: 0.12,
   rlGamma: 0.9,
@@ -109,6 +122,77 @@ var config = {
     "phase-fabric": 10,
     "surge-alloy": 10
   },
+  resourceReserveSoftMargin: 0.5,
+  resourceReservePenalty: 0.6,
+  resourceReserveBoost: 0.8,
+  strategyMode: "auto",
+  strategySwitchCooldown: 600,
+  strategyAffectsRL: false,
+  strategyAuto: {
+    defensiveCoreHealthFrac: 0.5,
+    defensiveEnemyCount: 6,
+    defensiveWaveMin: 8,
+    economicReservePressure: 0.6,
+    economicPowerAvg: 0.4,
+    economicWaveMax: 3,
+    aggressiveUnitsMin: 10,
+    aggressiveEnemyMax: 3
+  },
+  autoBlockSelection: true,
+  liquidHubMinCapacity: 100,
+  blockPrefs: {
+    drills: ["mechanical-drill", "pneumatic-drill", "laser-drill"],
+    turrets: ["duo", "scatter", "salvo", "arc"],
+    conveyors: ["conveyor", "titanium-conveyor", "plastanium-conveyor", "duct"],
+    conduits: ["conduit", "pulse-conduit", "plated-conduit"],
+    pumps: ["mechanical-pump", "rotary-pump"],
+    liquidHubs: ["liquid-container", "liquid-tank", "liquid-router"],
+    powerNodes: ["power-node", "power-node-large"],
+    solarPanels: ["solar-panel", "large-solar-panel"],
+    thermals: ["thermal-generator"]
+  },
+  strategyProfiles: {
+    balanced: {
+      attackWave: 1.0,
+      rally: 1.0,
+      mine: 1.0,
+      defend: 1.0,
+      power: 1.0,
+      liquid: 1.0,
+      thermal: 1.0,
+      noop: 1.0
+    },
+    defensive: {
+      attackWave: 0.6,
+      rally: 0.8,
+      mine: 1.1,
+      defend: 1.4,
+      power: 1.1,
+      liquid: 1.0,
+      thermal: 1.1,
+      noop: 1.0
+    },
+    aggressive: {
+      attackWave: 1.5,
+      rally: 1.3,
+      mine: 0.9,
+      defend: 0.8,
+      power: 1.0,
+      liquid: 0.9,
+      thermal: 0.9,
+      noop: 0.8
+    },
+    economic: {
+      attackWave: 0.7,
+      rally: 0.8,
+      mine: 1.6,
+      defend: 0.8,
+      power: 1.2,
+      liquid: 1.2,
+      thermal: 1.2,
+      noop: 1.0
+    }
+  },
   liquidSearchRadius: 10,
   maxConduitSteps: 80,
   liquidHubSearchRadius: 8,
@@ -129,6 +213,12 @@ var config = {
   logicSearchRadius: 8,
   logicControlRadius: 12,
   logicMaxProcessors: 3,
+  logicTurretControl: true,
+  logicTurretMaxLinks: 2,
+  logicTurretSearchRadius: 12,
+  logicTurretRadarSort: "distance",
+  logicTurretExtraScan: true,
+  logicTurretRadarSortAlt: "health",
   logicUseGround: true,
   logicUseAir: true,
   logicUseNaval: false,
@@ -167,6 +257,8 @@ var state = {
   lastReward: 0,
   lastQSaveTick: -9999,
   lastLogicTick: -9999,
+  currentStrategy: "balanced",
+  lastStrategyTick: -9999,
   playerControlledUnitId: -1,
   playerControllerSet: false,
   // Tick when we last attempted to change the player unit controller.
@@ -176,6 +268,7 @@ var state = {
   nnLastLoadTick: -9999,
   nnLastSaveTick: -9999,
   nnLastErrorTick: -9999,
+  rlEpsilon: -1,
   logicControllers: {
     ground: null,
     air: null,
@@ -373,6 +466,14 @@ function isMobileSafe() {
   return config.mobileSafeMode && (Vars.mobile || Vars.android);
 }
 
+function isHeadless() {
+  try {
+    return Vars.headless === true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function applyMobileSafeMode() {
   if (!isMobileSafe()) return;
   config.rlSocketEnabled = false;
@@ -493,10 +594,13 @@ function updateHudDebug() {
   var core = getCore(team);
   var pOk = player != null ? "ok" : "null";
   var cOk = core != null ? "ok" : "null";
+  var epsText = shouldUseEpsilon() ? (" eps:" + Math.round(getEpsilon() * 100) / 100) : "";
   var text = "IA " + (state.aiEnabled ? "ON" : "OFF") +
     " | p:" + pOk +
     " c:" + cOk +
     " obs:" + (config.observerMode ? "1" : "0") +
+    " strat:" + (state.currentStrategy != null ? state.currentStrategy : "-") +
+    epsText +
     " built:" + (state.built ? "1" : "0") +
     " r:" + Math.round(state.lastReward * 100) / 100 +
     " tick:" + state.tick +
@@ -620,6 +724,256 @@ function unitTypeByName(name) {
     // ignore
   }
   return null;
+}
+
+function itemByName(name) {
+  if (name == null) return null;
+  try {
+    var item = Items[name];
+    if (item != null) return item;
+  } catch (e) {
+    // ignore
+  }
+  try {
+    var seq = Vars.content.items();
+    var found = null;
+    seq.each(function(it){
+      if (found != null) return;
+      try {
+        if (it != null && it.name == name) found = it;
+      } catch (e2) {
+        // ignore
+      }
+    });
+    return found;
+  } catch (e3) {
+    // ignore
+  }
+  return null;
+}
+
+function isInstance(obj, clazz) {
+  if (clazz == null || obj == null) return false;
+  try {
+    return obj instanceof clazz;
+  } catch (e) {
+    return false;
+  }
+}
+
+function blockByName(name) {
+  if (name == null) return null;
+  try {
+    var b = Blocks[name];
+    if (b != null) return b;
+  } catch (e) {
+    // ignore
+  }
+  try {
+    var seq = Vars.content.blocks();
+    var found = null;
+    seq.each(function(bl){
+      if (found != null) return;
+      try {
+        if (bl != null && bl.name == name) found = bl;
+      } catch (e2) {
+        // ignore
+      }
+    });
+    return found;
+  } catch (e3) {
+    // ignore
+  }
+  return null;
+}
+
+function blockCost(block) {
+  if (block == null) return 999999;
+  var reqs = block.requirements;
+  if (reqs == null || reqs.length == 0) return 0;
+  var mult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
+  var sum = 0;
+  for (var i = 0; i < reqs.length; i++) {
+    var stack = reqs[i];
+    sum += Math.ceil(stack.amount * mult);
+  }
+  return sum;
+}
+
+function pickBlockFromNames(list, team) {
+  if (list == null || list.length == null) return null;
+  for (var i = 0; i < list.length; i++) {
+    var name = list[i];
+    var b = blockByName(name);
+    if (b == null) continue;
+    if (!blockUnlocked(b)) continue;
+    if (!coreHasItemsFor(b, team)) continue;
+    return b;
+  }
+  return null;
+}
+
+function autoPickBlock(team, predicate) {
+  try {
+    var seq = Vars.content.blocks();
+    var best = null;
+    var bestCost = 999999;
+    seq.each(function(b){
+      if (b == null) return;
+      if (!blockUnlocked(b)) return;
+      if (!coreHasItemsFor(b, team)) return;
+      var ok = false;
+      try {
+        ok = predicate(b);
+      } catch (e) {
+        ok = false;
+      }
+      if (!ok) return;
+      var cost = blockCost(b);
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = b;
+      }
+    });
+    return best;
+  } catch (e2) {
+    return null;
+  }
+}
+
+function pickBlock(list, team, predicate, fallback) {
+  var b = pickBlockFromNames(list, team);
+  if (b != null) return b;
+  if (config.autoBlockSelection) {
+    b = autoPickBlock(team, predicate);
+    if (b != null) return b;
+  }
+  return fallback;
+}
+
+function pickDrillBlock(team) {
+  return pickBlock(config.blockPrefs != null ? config.blockPrefs.drills : null, team, function(b){
+    return b.group == BlockGroup.drills;
+  }, Blocks.mechanicalDrill);
+}
+
+function pickTurretBlock(team) {
+  return pickBlock(config.blockPrefs != null ? config.blockPrefs.turrets : null, team, function(b){
+    return b.group == BlockGroup.turrets;
+  }, Blocks.duo);
+}
+
+function pickConveyorBlock(team) {
+  var names = config.blockPrefs != null ? config.blockPrefs.conveyors : null;
+  var picked = pickBlockFromNames(names, team);
+  if (picked != null) return picked;
+  if (config.autoBlockSelection) {
+    picked = autoPickBlock(team, function(b){
+      return isInstance(b, Conveyor) || isInstance(b, Duct);
+    });
+    if (picked != null) return picked;
+    picked = autoPickBlock(team, function(b){
+      return b.group == BlockGroup.transportation && b.hasItems && b.rotate;
+    });
+    if (picked != null) return picked;
+  }
+  return Blocks.conveyor;
+}
+
+function pickConduitBlock(team) {
+  var names = config.blockPrefs != null ? config.blockPrefs.conduits : null;
+  var picked = pickBlockFromNames(names, team);
+  if (picked != null) return picked;
+  if (config.autoBlockSelection) {
+    picked = autoPickBlock(team, function(b){
+      return isInstance(b, Conduit);
+    });
+    if (picked != null) return picked;
+    picked = autoPickBlock(team, function(b){
+      return b.group == BlockGroup.liquids && b.hasLiquids && b.rotate;
+    });
+    if (picked != null) return picked;
+  }
+  return Blocks.conduit;
+}
+
+function pickPumpBlock(team) {
+  return pickBlock(config.blockPrefs != null ? config.blockPrefs.pumps : null, team, function(b){
+    return isInstance(b, PumpBlock);
+  }, Blocks.mechanicalPump);
+}
+
+function isLiquidHubBlock(block) {
+  if (block == null) return false;
+  if (!block.hasLiquids) return false;
+  if (isInstance(block, PumpBlock)) return false;
+  if (isInstance(block, Conduit)) return false;
+  var minCap = config.liquidHubMinCapacity != null ? config.liquidHubMinCapacity : 100;
+  var cap = block.liquidCapacity != null ? block.liquidCapacity : 0;
+  return cap >= minCap;
+}
+
+function isPreferredBlock(block, list) {
+  if (block == null || list == null || list.length == null) return false;
+  for (var i = 0; i < list.length; i++) {
+    if (block.name == list[i]) return true;
+  }
+  return false;
+}
+
+function pickLiquidHubBlock(core) {
+  var team = getTeam();
+  var fromList = pickBlockFromNames(config.blockPrefs != null ? config.blockPrefs.liquidHubs : null, team);
+  if (fromList != null) return fromList;
+  if (config.autoBlockSelection) {
+    var minCap = config.liquidHubMinCapacity != null ? config.liquidHubMinCapacity : 100;
+    var best = null;
+    var bestCap = -1;
+    var bestCost = 999999;
+    try {
+      Vars.content.blocks().each(function(b){
+        if (b == null) return;
+        if (!blockUnlocked(b)) return;
+        if (!coreHasItemsFor(b, team)) return;
+        if (!isLiquidHubBlock(b)) return;
+        var cap = b.liquidCapacity != null ? b.liquidCapacity : 0;
+        var cost = blockCost(b);
+        if (cap > bestCap || (cap == bestCap && cost < bestCost)) {
+          best = b;
+          bestCap = cap;
+          bestCost = cost;
+        }
+      });
+    } catch (e2) {
+      // ignore
+    }
+    if (best != null) return best;
+  }
+  if (config.preferLiquidTank && blockUnlocked(Blocks.liquidTank)) return Blocks.liquidTank;
+  if (core != null && core.items != null) {
+    var titanium = core.items.get(Items.titanium);
+    var metaglass = core.items.get(Items.metaglass);
+    if (titanium >= 30 && metaglass >= 40 && blockUnlocked(Blocks.liquidTank)) return Blocks.liquidTank;
+  }
+  return blockUnlocked(Blocks.liquidContainer) ? Blocks.liquidContainer : Blocks.liquidRouter;
+}
+
+function pickPowerNodeBlock(team) {
+  return pickBlock(config.blockPrefs != null ? config.blockPrefs.powerNodes : null, team, function(b){
+    return isInstance(b, PowerNodeBlock);
+  }, Blocks.powerNode);
+}
+
+function pickSolarBlock(team) {
+  return pickBlock(config.blockPrefs != null ? config.blockPrefs.solarPanels : null, team, function(b){
+    return isInstance(b, SolarGeneratorBlock);
+  }, Blocks.solarPanel);
+}
+
+function pickThermalBlock(team) {
+  return pickBlock(config.blockPrefs != null ? config.blockPrefs.thermals : null, team, function(b){
+    return isInstance(b, ThermalGeneratorBlock);
+  }, Blocks.thermalGenerator);
 }
 
 function configureBuild(build, value) {
@@ -829,6 +1183,11 @@ function loadNNModel() {
     if (data == null) throw "invalid";
     if (data.features != null) rlQMeta.features = data.features;
     if (data.actions != null) rlQMeta.actions = data.actions;
+    if (data.layers != null && data.readOnly == null) data.readOnly = true;
+    if (data.features == null && rlQMeta.features != null) data.features = rlQMeta.features;
+    if (data.actions == null && rlQMeta.actions != null) data.actions = rlQMeta.actions;
+    if (data.inputSize == null && data.features != null) data.inputSize = data.features.length;
+    if (data.outputSize == null && data.actions != null) data.outputSize = data.actions.length;
     state.nnModel = data;
     state.nnLastLoadTick = state.tick;
     Log.info("[RL] NN model carregado: " + fi.absolutePath());
@@ -850,16 +1209,85 @@ function tanh(x) {
   return (ex - enx) / (ex + enx);
 }
 
+function relu(x) {
+  return x > 0 ? x : 0;
+}
+
+function applyActivation(x, act) {
+  if (act == null || act == "none" || act == "linear") return x;
+  if (act == "relu") return relu(x);
+  if (act == "tanh") return tanh(x);
+  return x;
+}
+
+function featureName(feat) {
+  if (feat == null) return null;
+  if (typeof feat === "string") return feat;
+  try {
+    if (feat.name != null) return feat.name;
+  } catch (e) {
+    // ignore
+  }
+  try {
+    return String(feat);
+  } catch (e2) {
+    return null;
+  }
+}
+
+function normalizeInput(model, input, features) {
+  if (model == null || model.norms == null || features == null) return input;
+  var norms = model.norms;
+  var out = [];
+  for (var i = 0; i < input.length; i++) {
+    var name = featureName(features[i]);
+    var v = input[i];
+    if (name != null && norms[name] != null) {
+      var n = norms[name];
+      if (n != null && n != 0) v = v / n;
+      if (v > 10) v = 10;
+      if (v < -10) v = -10;
+    }
+    out.push(v);
+  }
+  return out;
+}
+
+function nnForwardLayers(model, input) {
+  if (model == null || model.layers == null) return null;
+  var vec = input;
+  for (var li = 0; li < model.layers.length; li++) {
+    var layer = model.layers[li];
+    if (layer == null || layer.w == null) return null;
+    var outSize = layer.out != null ? layer.out : (layer.b != null ? layer.b.length : 0);
+    var inSize = layer["in"] != null ? layer["in"] : vec.length;
+    var out = [];
+    for (var o = 0; o < outSize; o++) {
+      var sum = (layer.b != null && layer.b.length > o) ? layer.b[o] : 0;
+      for (var j = 0; j < inSize; j++) {
+        sum += (layer.w[o * inSize + j] || 0) * (vec[j] || 0);
+      }
+      out.push(applyActivation(sum, layer.act));
+    }
+    vec = out;
+  }
+  return { input: input, output: vec };
+}
+
 function nnForward(stateObj) {
   if (state.nnModel == null) return null;
   var model = state.nnModel;
   if (model.features == null || model.actions == null) return null;
   var input = [];
   for (var i = 0; i < model.features.length; i++) {
-    var name = model.features[i].name;
+    var name = featureName(model.features[i]);
     var val = stateObj[name];
     if (val == null) val = 0;
     input.push(val);
+  }
+  input = normalizeInput(model, input, model.features);
+  if (model.layers != null) {
+    return nnForwardLayers(model, input);
   }
   // hidden = tanh(W1 * input + b1)
   var hidden = [];
@@ -896,8 +1324,10 @@ function nnScoresForState(stateObj) {
 function updateNNModel(prevState, actionName, nextState, reward) {
   if (!config.rlNNEnabled) return false;
   if (state.nnModel == null) return false;
+  if (state.nnModel.layers != null) return false;
   if (state.nnModel.actions == null || state.nnModel.features == null) return false;
   var model = state.nnModel;
+  if (model.hiddenSize == null || model.inputSize == null || model.outputSize == null) return false;
   var actionIndex = -1;
   for (var i = 0; i < model.actions.length; i++) {
     if (model.actions[i] == actionName) { actionIndex = i; break; }
@@ -952,6 +1382,8 @@ function saveNNModelIfNeeded() {
 
 function saveNNModel() {
   if (state.nnModel == null) return false;
+  if (state.nnModel.readOnly) return false;
+  if (state.nnModel.layers != null && config.rlNNSaveExternal === false) return false;
   var fi = resolveNNFi();
   if (fi == null) return false;
   try {
@@ -1138,6 +1570,7 @@ function getCore(team) {
 
 function getLocalPlayer() {
   if (Vars.player != null) return Vars.player;
+  if (isHeadless()) return null;
   var found = null;
   try {
     Groups.player.each(function(p){
@@ -1165,6 +1598,12 @@ function worldHeight() {
 function tileAt(x, y) {
   if (x < 0 || y < 0 || x >= worldWidth() || y >= worldHeight()) return null;
   return Vars.world.tile(x, y);
+}
+
+function clamp01(v) {
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
 }
 
 function canPlaceBlock(block, x, y, rotation, team) {
@@ -1203,6 +1642,35 @@ function reserveFor(item) {
   var val = config.resourceReserve[key];
   if (val == null) return 0;
   return Math.max(0, val);
+}
+
+function resourcePressure(core, item) {
+  if (core == null || core.items == null || item == null) return 0;
+  var reserve = reserveFor(item);
+  if (reserve <= 0) return 0;
+  var total = core.items.get(item);
+  var margin = config.resourceReserveSoftMargin != null ? config.resourceReserveSoftMargin : 0;
+  if (margin < 0) margin = 0;
+  var soft = reserve * (1 + margin);
+  if (soft <= reserve) soft = reserve + 1;
+  if (total <= reserve) return 1;
+  if (total >= soft) return 0;
+  return clamp01((soft - total) / (soft - reserve));
+}
+
+function reservePressure(core) {
+  if (core == null) return 0;
+  var maxp = 0;
+  if (config.resourceReserve != null) {
+    for (var key in config.resourceReserve) {
+      if (!config.resourceReserve.hasOwnProperty(key)) continue;
+      var item = itemByName(key);
+      if (item == null) continue;
+      var p = resourcePressure(core, item);
+      if (p > maxp) maxp = p;
+    }
+  }
+  return maxp;
 }
 
 function availableCoreItems(core, item) {
@@ -1250,6 +1718,103 @@ function consumeCoreItems(block, team) {
     core.items.remove(stack2.item, need2);
   }
   return true;
+}
+
+function getStrategyProfile(name) {
+  if (config.strategyProfiles != null && config.strategyProfiles[name] != null) return config.strategyProfiles[name];
+  if (config.strategyProfiles != null && config.strategyProfiles.balanced != null) return config.strategyProfiles.balanced;
+  return null;
+}
+
+function pickStrategy(core, enemyCore, enemies, powerStats, beforeState) {
+  var mode = config.strategyMode;
+  if (mode != null && mode != "" && mode != "auto") {
+    state.currentStrategy = mode;
+    state.lastStrategyTick = state.tick;
+    return mode;
+  }
+  if (config.strategySwitchCooldown != null && config.strategySwitchCooldown > 0) {
+    if ((state.tick - state.lastStrategyTick) < config.strategySwitchCooldown && state.currentStrategy != null) {
+      return state.currentStrategy;
+    }
+  }
+  var coreHealthFrac = beforeState != null ? beforeState.coreHealthFrac : 1;
+  var unitsTotal = beforeState != null ? beforeState.unitsTotal : 0;
+  var wave = beforeState != null && beforeState.wave != null ? beforeState.wave : state.waveIndex;
+  var pressure = reservePressure(core);
+  var autoCfg = config.strategyAuto || {};
+  var defHealth = autoCfg.defensiveCoreHealthFrac != null ? autoCfg.defensiveCoreHealthFrac : 0.5;
+  var defEnemies = autoCfg.defensiveEnemyCount != null ? autoCfg.defensiveEnemyCount : 6;
+  var defWave = autoCfg.defensiveWaveMin != null ? autoCfg.defensiveWaveMin : -1;
+  var econPressure = autoCfg.economicReservePressure != null ? autoCfg.economicReservePressure : 0.6;
+  var econPower = autoCfg.economicPowerAvg != null ? autoCfg.economicPowerAvg : 0.4;
+  var econWave = autoCfg.economicWaveMax != null ? autoCfg.economicWaveMax : -1;
+  var aggUnits = autoCfg.aggressiveUnitsMin != null ? autoCfg.aggressiveUnitsMin : 10;
+  var aggEnemies = autoCfg.aggressiveEnemyMax != null ? autoCfg.aggressiveEnemyMax : 3;
+  var powerLow = powerStats != null && powerStats.avg != null && powerStats.avg < econPower;
+  var earlyWave = enemyCore == null && econWave >= 0 && wave >= 0 && wave <= econWave;
+  var lateWave = enemyCore == null && defWave >= 0 && wave >= defWave;
+  var strat = "balanced";
+  if (coreHealthFrac < defHealth || enemies > defEnemies || (lateWave && enemies > 0)) {
+    strat = "defensive";
+  } else if (pressure > econPressure || powerLow || earlyWave) {
+    strat = "economic";
+  } else if (enemyCore != null && unitsTotal >= aggUnits && enemies < aggEnemies) {
+    strat = "aggressive";
+  }
+  state.currentStrategy = strat;
+  state.lastStrategyTick = state.tick;
+  return strat;
+}
+
+function applyStrategyScore(name, score, strategy) {
+  if (score <= 0) return score;
+  var profile = getStrategyProfile(strategy);
+  if (profile == null) return score;
+  var mult = profile[name];
+  if (mult == null) mult = 1.0;
+  if (mult < 0) mult = 0;
+  return score * mult;
+}
+
+function shouldUseEpsilon() {
+  if (!config.rlEpsilonEnabled) return false;
+  if (config.rlEpsilonOnlyWhenRL && config.rlPolicyMode == "heuristic") return false;
+  return true;
+}
+
+function getEpsilon() {
+  if (!shouldUseEpsilon()) return 0;
+  var eps = state.rlEpsilon >= 0 ? state.rlEpsilon : (config.rlEpsilon != null ? config.rlEpsilon : 0);
+  var minv = config.rlEpsilonMin != null ? config.rlEpsilonMin : 0;
+  if (eps < minv) eps = minv;
+  return eps;
+}
+
+function decayEpsilon() {
+  if (!shouldUseEpsilon()) return;
+  var decay = config.rlEpsilonDecay != null ? config.rlEpsilonDecay : 1;
+  if (decay >= 1) return;
+  var eps = getEpsilon();
+  eps = eps * decay;
+  var minv = config.rlEpsilonMin != null ? config.rlEpsilonMin : 0;
+  if (eps < minv) eps = minv;
+  state.rlEpsilon = eps;
+}
+
+function pickExploreOrder(ranked) {
+  if (ranked == null || ranked.length == 0) return ranked;
+  var eps = getEpsilon();
+  if (eps <= 0) return ranked;
+  if (Math.random() >= eps) return ranked;
+  var idx = Math.floor(Math.random() * ranked.length);
+  var order = [];
+  order.push(ranked[idx]);
+  for (var i = 0; i < ranked.length; i++) {
+    if (i == idx) continue;
+    order.push(ranked[i]);
+  }
+  return order;
 }
 
 function findPlaceForBlock(block, cx, cy, radius, team) {
@@ -1304,7 +1869,8 @@ function placeBlock(block, x, y, rotation, team) {
     return false;
   }
   var player = getLocalPlayer();
-  if (player == null) {
+  var headless = isHeadless();
+  if (player == null && !headless) {
     if (config.aiDebugHud) state.lastPlaceFail = "no-player";
     warnBuildFail("Aguardando jogador local...");
     return false;
@@ -1314,7 +1880,20 @@ function placeBlock(block, x, y, rotation, team) {
     warnBuildFail("Sem recursos: " + block.localizedName);
     return false;
   }
-  Call.constructFinish(player, block, x, y, rotation || 0, team, false);
+  if (player != null) {
+    Call.constructFinish(player, block, x, y, rotation || 0, team, false);
+  } else {
+    try {
+      if (tile.setNet != null) {
+        tile.setNet(block, team, rotation || 0);
+      } else {
+        tile.setBlock(block, team, rotation || 0);
+      }
+    } catch (e) {
+      if (config.aiDebugHud) state.lastPlaceFail = "place-fail:" + block.name;
+      return false;
+    }
+  }
   if (config.aiDebugHud) state.lastPlaceFail = "";
   return true;
 }
@@ -1345,6 +1924,8 @@ function stepToward(x, y, tx, ty) {
 }
 
 function placeConveyorPath(team, sx, sy, tx, ty, maxSteps) {
+  var conv = pickConveyorBlock(team);
+  if (conv == null) conv = Blocks.conveyor;
   var x = sx;
   var y = sy;
   var steps = 0;
@@ -1356,7 +1937,7 @@ function placeConveyorPath(team, sx, sy, tx, ty, maxSteps) {
     var ntile = tileAt(nx, ny);
     if (ntile == null) break;
     var rot = rotationForStep(step.dx, step.dy);
-    placeBlock(Blocks.conveyor, x, y, rot, team);
+    placeBlock(conv, x, y, rot, team);
     if (ntile.block() != Blocks.air) {
       if (ntile.block().isCore != null && ntile.block().isCore()) break;
       break;
@@ -1368,6 +1949,8 @@ function placeConveyorPath(team, sx, sy, tx, ty, maxSteps) {
 }
 
 function placeConduitPath(team, sx, sy, tx, ty, maxSteps) {
+  var conduit = pickConduitBlock(team);
+  if (conduit == null) conduit = Blocks.conduit;
   var x = sx;
   var y = sy;
   var steps = 0;
@@ -1379,7 +1962,7 @@ function placeConduitPath(team, sx, sy, tx, ty, maxSteps) {
     var ntile = tileAt(nx, ny);
     if (ntile == null) break;
     var rot = rotationForStep(step.dx, step.dy);
-    placeBlock(Blocks.conduit, x, y, rot, team);
+    placeBlock(conduit, x, y, rot, team);
     if (ntile.block() != Blocks.air) {
       break;
     }
@@ -1437,7 +2020,9 @@ function findLiquidTiles(cx, cy, radius, maxCount) {
 
 function placePowerCluster(team, baseX, baseY) {
   var node = clampToBounds(baseX - 2, baseY + 1);
-  var nodePlaced = placeBlock(Blocks.powerNode, node.x, node.y, 0, team);
+  var nodeBlock = pickPowerNodeBlock(team);
+  if (nodeBlock == null) return false;
+  var nodePlaced = placeBlock(nodeBlock, node.x, node.y, 0, team);
 
   var panels = [
     { dx: -1, dy: 0 },
@@ -1445,9 +2030,12 @@ function placePowerCluster(team, baseX, baseY) {
     { dx: -1, dy: 1 },
     { dx: 0, dy: 1 }
   ];
+  var panelBlock = pickSolarBlock(team);
+  if (panelBlock != null) {
   for (var i = 0; i < panels.length; i++) {
     var p = clampToBounds(node.x + panels[i].dx, node.y + panels[i].dy);
-    placeBlock(Blocks.solarPanel, p.x, p.y, 0, team);
+    placeBlock(panelBlock, p.x, p.y, 0, team);
+  }
   }
 
   var batt = clampToBounds(node.x + 1, node.y + 1);
@@ -1490,8 +2078,9 @@ function buildPlan(core) {
 
   // 2) Mineradores em mineros proximos (adapta ao mapa).
   var ores = findOreTiles(cx, cy, config.oreSearchRadius, config.maxDrills);
+  var drill = pickDrillBlock(team);
   for (var i = 0; i < ores.length; i++) {
-    if (placeBlock(Blocks.mechanicalDrill, ores[i].x, ores[i].y, 0, team)) {
+    if (drill != null && placeBlock(drill, ores[i].x, ores[i].y, 0, team)) {
       state.drillCount++;
     }
     var step = stepToward(ores[i].x, ores[i].y, cx, cy);
@@ -1507,9 +2096,10 @@ function buildPlan(core) {
     { dx: 0, dy: 6 },
     { dx: 0, dy: -6 }
   ];
+  var turret = pickTurretBlock(team);
   for (var d = 0; d < defenseOffsets.length; d++) {
     var off = clampOffset(cx, cy, defenseOffsets[d].dx, defenseOffsets[d].dy);
-    if (placeBlock(Blocks.duo, off.x, off.y, 0, team)) {
+    if (turret != null && placeBlock(turret, off.x, off.y, 0, team)) {
       state.turretCount++;
     }
   }
@@ -1587,10 +2177,51 @@ function countBlocks(team, block) {
   return count;
 }
 
+function countBlocksByPredicate(team, predicate) {
+  if (team == null) return 0;
+  var count = 0;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null) return;
+    var ok = false;
+    try {
+      ok = predicate(b);
+    } catch (e) {
+      ok = false;
+    }
+    if (ok) count++;
+  });
+  return count;
+}
+
+function countBlocksByGroup(team, group) {
+  return countBlocksByPredicate(team, function(b){
+    return b.block.group == group;
+  });
+}
+
+function countPowerNodes(team) {
+  return countBlocksByPredicate(team, function(b){
+    return isInstance(b.block, PowerNodeBlock);
+  });
+}
+
+function countPumps(team) {
+  return countBlocksByPredicate(team, function(b){
+    return isInstance(b.block, PumpBlock);
+  });
+}
+
+function countThermals(team) {
+  return countBlocksByPredicate(team, function(b){
+    return isInstance(b.block, ThermalGeneratorBlock);
+  });
+}
+
 function countLiquidHubs(team) {
-  return countBlocks(team, Blocks.liquidContainer) +
-    countBlocks(team, Blocks.liquidTank) +
-    countBlocks(team, Blocks.liquidRouter);
+  return countBlocksByPredicate(team, function(b){
+    var list = config.blockPrefs != null ? config.blockPrefs.liquidHubs : null;
+    return isPreferredBlock(b.block, list) || isLiquidHubBlock(b.block);
+  });
 }
 
 function containsType(list, type) {
@@ -1647,22 +2278,74 @@ function appendSeq(dst, src, limit) {
 }
 
 function commandUnitIds(team, ids, buildTarget, pos) {
-  var player = getLocalPlayer();
-  if (player == null) return;
   if (ids == null || ids.size == 0) return;
-  var arr = toIntArray(ids);
+  var player = getLocalPlayer();
+  if (player != null) {
+    var arr = toIntArray(ids);
 
-  // Move command works as a generic rally/attack order.
-  try {
-    InputHandler.setUnitCommand(player, arr, UnitCommand.moveCommand);
-  } catch (e) {
-    // ignore
+    // Move command works as a generic rally/attack order.
+    try {
+      InputHandler.setUnitCommand(player, arr, UnitCommand.moveCommand);
+    } catch (e) {
+      // ignore
+    }
+
+    try {
+      InputHandler.commandUnits(player, arr, buildTarget, null, pos, false, true);
+    } catch (e2) {
+      // ignore
+    }
+    return;
   }
 
-  try {
-    InputHandler.commandUnits(player, arr, buildTarget, null, pos, false, true);
-  } catch (e2) {
-    // ignore
+  if (!isHeadless()) return;
+
+  for (var i = 0; i < ids.size; i++) {
+    var id = ids.get(i);
+    var unit = null;
+    try {
+      unit = Groups.unit.getByID(id);
+    } catch (e3) {
+      unit = null;
+    }
+    if (unit == null || unit.team != team) continue;
+    var controller = null;
+    try {
+      controller = unit.controller();
+    } catch (e4) {
+      controller = null;
+    }
+    if (!(controller instanceof CommandAI)) {
+      try {
+        unit.controller(new CommandAI());
+      } catch (e5) {
+        continue;
+      }
+      try {
+        controller = unit.controller();
+      } catch (e6) {
+        controller = null;
+      }
+    }
+    if (controller == null) continue;
+    try {
+      controller.command(UnitCommand.moveCommand);
+    } catch (e7) {
+      // ignore
+    }
+    if (buildTarget != null) {
+      try {
+        controller.commandTarget(buildTarget);
+      } catch (e8) {
+        // ignore
+      }
+    } else if (pos != null) {
+      try {
+        controller.commandPosition(pos);
+      } catch (e9) {
+        // ignore
+      }
+    }
   }
 }
 
@@ -1703,26 +2386,162 @@ function unitTypeForRole(role) {
   return type;
 }
 
-function buildLogicProgram(unitType, rallyX, rallyY) {
+function ensureLogicLinks(build, core, team) {
+  if (!config.logicTurretControl) return;
+  if (build == null || core == null) return;
+  var maxLinks = config.logicTurretMaxLinks != null ? config.logicTurretMaxLinks : 0;
+  if (maxLinks <= 0) return;
+  var radius = config.logicTurretSearchRadius != null ? config.logicTurretSearchRadius : config.logicControlRadius;
+  if (radius <= 0) return;
+  var cx = build.tile != null ? build.tile.x : core.tile.x;
+  var cy = build.tile != null ? build.tile.y : core.tile.y;
+  var maxDist2 = radius * radius;
+
+  var turrets = [];
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null) return;
+    if (b.block.group != BlockGroup.turrets) return;
+    var dx = b.tile.x - cx;
+    var dy = b.tile.y - cy;
+    var dist2 = dx * dx + dy * dy;
+    if (dist2 > maxDist2) return;
+    turrets.push({ build: b, dist2: dist2 });
+  });
+  if (turrets.length == 0) return;
+  turrets.sort(function(a, b){ return a.dist2 - b.dist2; });
+
+  var desired = {};
+  var desiredList = [];
+  for (var i = 0; i < turrets.length && desiredList.length < maxLinks; i++) {
+    var tb = turrets[i].build;
+    if (tb == null || tb.tile == null) continue;
+    var key = tb.tile.x + "," + tb.tile.y;
+    if (desired[key]) continue;
+    desired[key] = true;
+    desiredList.push(tb);
+  }
+
+  var linked = {};
+  var links = null;
+  try {
+    links = build.links;
+  } catch (e) {
+    links = null;
+  }
+  if (links != null) {
+    try {
+      for (var li = 0; li < links.size; li++) {
+        var link = links.get(li);
+        if (link == null) continue;
+        var lk = link.x + "," + link.y;
+        linked[lk] = true;
+      }
+    } catch (e2) {
+      // ignore
+    }
+  }
+
+  for (var d = 0; d < desiredList.length; d++) {
+    var db = desiredList[d];
+    if (db == null || db.tile == null) continue;
+    var key2 = db.tile.x + "," + db.tile.y;
+    if (linked[key2]) continue;
+    try {
+      build.configure(db.tile.pos());
+      linked[key2] = true;
+    } catch (e3) {
+      // ignore
+    }
+  }
+
+  if (links != null) {
+    try {
+      for (var li2 = 0; li2 < links.size; li2++) {
+        var link2 = links.get(li2);
+        if (link2 == null) continue;
+        var key3 = link2.x + "," + link2.y;
+        if (desired[key3]) continue;
+        var tile2 = tileAt(link2.x, link2.y);
+        if (tile2 == null || tile2.build == null || tile2.build.block == null) continue;
+        if (tile2.build.block.group != BlockGroup.turrets) continue;
+        try {
+          build.configure(tile2.pos());
+        } catch (e4) {
+          // ignore
+        }
+      }
+    } catch (e5) {
+      // ignore
+    }
+  }
+}
+
+function buildLogicProgram(unitType, rallyX, rallyY, turretLinks) {
   if (unitType == null) return null;
   var uname = unitType.name != null ? unitType.name : String(unitType);
   var lines = [];
-  lines.push("set rallyX " + Math.round(rallyX));
-  lines.push("set rallyY " + Math.round(rallyY));
-  lines.push("ubind @" + uname);
-  lines.push("jump __REBIND__ equal @unit null");
-  lines.push("uradar enemy any any distance 1 target");
-  lines.push("jump __RALLY__ equal target null");
-  lines.push("sensor tx target @x");
-  lines.push("sensor ty target @y");
-  lines.push("ucontrol approach tx ty " + config.logicAttackRadius);
-  lines.push("ucontrol target tx ty 1");
-  lines.push("jump 2 always");
-  var rallyIndex = lines.length;
-  lines.push("ucontrol move rallyX rallyY");
-  lines.push("jump 2 always");
-  lines[3] = "jump 2 equal @unit null";
-  lines[5] = "jump " + rallyIndex + " equal target null";
+  var labels = {};
+  var add = function(text, label){
+    if (label != null) labels[label] = lines.length;
+    lines.push(text);
+  };
+  var useTurrets = config.logicTurretControl && turretLinks != null && turretLinks > 0;
+  var turretSort = config.logicTurretRadarSort != null ? config.logicTurretRadarSort : "distance";
+  var turretExtra = config.logicTurretExtraScan === true;
+  var turretSortAlt = config.logicTurretRadarSortAlt != null ? config.logicTurretRadarSortAlt : turretSort;
+
+  add("set rallyX " + Math.round(rallyX));
+  add("set rallyY " + Math.round(rallyY));
+
+  if (useTurrets) {
+    for (var i = 0; i < turretLinks; i++) {
+      add("getlink lt " + i, i == 0 ? "MAIN" : null);
+      add("jump {{TURT_DONE_" + i + "}} equal lt null");
+      add("radar enemy any any " + turretSort + " lt 1 ttarget");
+      if (turretExtra) {
+        add("jump {{TURT_SCAN2_" + i + "}} equal ttarget null");
+        add("control shootp lt ttarget 1");
+        add("jump {{TURT_DONE_" + i + "}} always");
+        add("radar enemy any any " + turretSortAlt + " lt 1 ttarget", "TURT_SCAN2_" + i);
+        add("jump {{TURT_DONE_" + i + "}} equal ttarget null");
+        add("control shootp lt ttarget 1");
+        add("jump {{TURT_DONE_" + i + "}} always");
+        add("set ttarget null", "TURT_DONE_" + i);
+      } else {
+        add("jump {{TURT_DONE_" + i + "}} equal ttarget null");
+        add("control shootp lt ttarget 1");
+        add("set ttarget null", "TURT_DONE_" + i);
+      }
+    }
+  }
+
+  add("ubind @" + uname, useTurrets ? null : "MAIN");
+  add("jump {{MAIN}} equal @unit null");
+  add("uradar enemy any any distance 1 target");
+  add("jump {{RALLY}} equal target null");
+  add("sensor tx target @x");
+  add("sensor ty target @y");
+  add("ucontrol approach tx ty " + config.logicAttackRadius);
+  add("ucontrol target tx ty 1");
+  add("jump {{MAIN}} always");
+  add("ucontrol move rallyX rallyY", "RALLY");
+  add("jump {{MAIN}} always");
+
+  var keys = [];
+  for (var lk in labels) {
+    if (labels.hasOwnProperty(lk)) keys.push(lk);
+  }
+  for (var i2 = 0; i2 < lines.length; i2++) {
+    var line = lines[i2];
+    for (var k = 0; k < keys.length; k++) {
+      var token = "{{" + keys[k] + "}}";
+      if (line.indexOf(token) >= 0) {
+        line = line.split(token).join(labels[keys[k]]);
+      }
+    }
+    lines[i2] = line;
+  }
+
   return lines.join("\n");
 }
 
@@ -1769,7 +2588,9 @@ function programLogic(build, role, core) {
   if (unitType == null) return false;
   var rallyX = core.x;
   var rallyY = core.y;
-  var code = buildLogicProgram(unitType, rallyX, rallyY);
+  ensureLogicLinks(build, core, build.team);
+  var turretLinks = config.logicTurretControl ? (config.logicTurretMaxLinks || 0) : 0;
+  var code = buildLogicProgram(unitType, rallyX, rallyY, turretLinks);
   if (code == null) return false;
   try {
     if (build.code == null || build.code != code) {
@@ -1917,21 +2738,12 @@ function findLiquidHub(team) {
   var found = null;
   Groups.build.each(function(b){
     if (b == null || b.team != team) return;
-    if (b.block == Blocks.liquidContainer || b.block == Blocks.liquidTank || b.block == Blocks.liquidRouter) {
+    var list = config.blockPrefs != null ? config.blockPrefs.liquidHubs : null;
+    if (isPreferredBlock(b.block, list) || isLiquidHubBlock(b.block)) {
       found = b;
     }
   });
   return found;
-}
-
-function pickLiquidHubBlock(core) {
-  if (config.preferLiquidTank && blockUnlocked(Blocks.liquidTank)) return Blocks.liquidTank;
-  if (core != null && core.items != null) {
-    var titanium = core.items.get(Items.titanium);
-    var metaglass = core.items.get(Items.metaglass);
-    if (titanium >= 30 && metaglass >= 40 && blockUnlocked(Blocks.liquidTank)) return Blocks.liquidTank;
-  }
-  return blockUnlocked(Blocks.liquidContainer) ? Blocks.liquidContainer : Blocks.liquidRouter;
 }
 
 function findCoolantTarget(team, liquid, fromX, fromY) {
@@ -1982,18 +2794,22 @@ function findCoolantTargets(team, liquid, fromX, fromY, limit) {
   return out;
 }
 
-function findHeatSpot(core, team) {
+function findHeatSpot(core, team, thermalBlock) {
   var cx = core.tile.x;
   var cy = core.tile.y;
-  return findPlaceForBlock(Blocks.thermalGenerator, cx, cy, config.thermalSearchRadius, team);
+  var thermal = thermalBlock != null ? thermalBlock : pickThermalBlock(team);
+  if (thermal == null) return null;
+  return findPlaceForBlock(thermal, cx, cy, config.thermalSearchRadius, team);
 }
 
 function actionMine(core) {
   var team = getTeam();
-  if (!coreHasItemsFor(Blocks.mechanicalDrill, team)) return false;
+  var drill = pickDrillBlock(team);
+  if (drill == null) return false;
+  if (!coreHasItemsFor(drill, team)) return false;
   var ore = findBestOreNearCore(core);
   if (ore == null) return false;
-  if (!placeBlock(Blocks.mechanicalDrill, ore.x, ore.y, 0, team)) return false;
+  if (!placeBlock(drill, ore.x, ore.y, 0, team)) return false;
   state.drillCount++;
   var cx = core.tile.x;
   var cy = core.tile.y;
@@ -2007,7 +2823,9 @@ function actionMine(core) {
 function actionLiquid(core) {
   var team = getTeam();
   if (state.pumpCount >= config.maxPumps && state.liquidHubCount >= config.maxLiquidHubs) return false;
-  if (!coreHasItemsFor(Blocks.mechanicalPump, team)) return false;
+  var pumpBlock = pickPumpBlock(team);
+  if (pumpBlock == null) return false;
+  if (!coreHasItemsFor(pumpBlock, team)) return false;
   var cx = core.tile.x;
   var cy = core.tile.y;
 
@@ -2019,6 +2837,7 @@ function actionLiquid(core) {
   }
   if (hubPos == null && state.liquidHubCount < config.maxLiquidHubs) {
     var hubBlock = pickLiquidHubBlock(core);
+    if (hubBlock == null) return false;
     var candidate = findPlaceForBlock(hubBlock, cx, cy, config.liquidHubSearchRadius, team);
     if (candidate != null && placeBlock(hubBlock, candidate.x, candidate.y, 0, team)) {
       hubPos = candidate;
@@ -2031,7 +2850,7 @@ function actionLiquid(core) {
   var pump = null;
   var pumpLiquid = null;
   for (var i = 0; i < liquids.length; i++) {
-    if (placeBlock(Blocks.mechanicalPump, liquids[i].x, liquids[i].y, 0, team)) {
+    if (placeBlock(pumpBlock, liquids[i].x, liquids[i].y, 0, team)) {
       pump = liquids[i];
       pumpLiquid = liquids[i].liquid;
       state.pumpCount++;
@@ -2078,15 +2897,18 @@ function actionLiquid(core) {
     placeConduitPath(team, sx2, sy2, target.x, target.y, config.maxConduitSteps);
   }
 
+  var nodeBlock = pickPowerNodeBlock(team);
   var node = clampToBounds(pump.x + 1, pump.y);
-  placeBlock(Blocks.powerNode, node.x, node.y, 0, team);
+  placeBlock(nodeBlock, node.x, node.y, 0, team);
   return true;
 }
 
 function actionDefend(core) {
   var team = getTeam();
   if (state.turretCount >= config.maxTurrets) return false;
-  if (!coreHasItemsFor(Blocks.duo, team)) return false;
+  var turret = pickTurretBlock(team);
+  if (turret == null) return false;
+  if (!coreHasItemsFor(turret, team)) return false;
   var offsets = [
     { dx: 6, dy: 0 },
     { dx: -6, dy: 0 },
@@ -2100,7 +2922,7 @@ function actionDefend(core) {
   for (var i = 0; i < offsets.length; i++) {
     var pick = offsets[(state.turretCount + i) % offsets.length];
     var off = clampOffset(core.tile.x, core.tile.y, pick.dx, pick.dy);
-    if (placeBlock(Blocks.duo, off.x, off.y, 0, team)) {
+    if (placeBlock(turret, off.x, off.y, 0, team)) {
       state.turretCount++;
       return true;
     }
@@ -2110,17 +2932,21 @@ function actionDefend(core) {
 
 function actionPower(core) {
   if (state.powerClusters >= config.maxPowerClusters) return false;
-  if (!coreHasItemsFor(Blocks.powerNode, getTeam())) return false;
+  var nodeBlock = pickPowerNodeBlock(getTeam());
+  if (nodeBlock == null) return false;
+  if (!coreHasItemsFor(nodeBlock, getTeam())) return false;
   return placePowerCluster(getTeam(), core.tile.x + 4, core.tile.y + 2);
 }
 
 function actionThermal(core) {
   if (state.thermalCount >= config.maxThermals) return false;
   var team = getTeam();
-  if (!coreHasItemsFor(Blocks.thermalGenerator, team)) return false;
-  var spot = findHeatSpot(core, team);
+  var thermal = pickThermalBlock(team);
+  if (thermal == null) return false;
+  if (!coreHasItemsFor(thermal, team)) return false;
+  var spot = findHeatSpot(core, team, thermal);
   if (spot == null) return false;
-  if (!placeBlock(Blocks.thermalGenerator, spot.x, spot.y, 0, team)) return false;
+  if (!placeBlock(thermal, spot.x, spot.y, 0, team)) return false;
   state.thermalCount++;
   return true;
 }
@@ -2186,6 +3012,8 @@ Events.on(WorldLoadEvent, function(){
   state.lastReward = 0;
   state.lastQSaveTick = -9999;
   state.lastLogicTick = -9999;
+  state.currentStrategy = "balanced";
+  state.lastStrategyTick = -9999;
   state.playerControlledUnitId = -1;
   state.playerControllerSet = false;
   state.controllerResetPenalty = 0;
@@ -2193,6 +3021,7 @@ Events.on(WorldLoadEvent, function(){
   state.nnLastLoadTick = -9999;
   state.nnLastSaveTick = -9999;
   state.nnLastErrorTick = -9999;
+  state.rlEpsilon = config.rlEpsilon != null ? config.rlEpsilon : -1;
   state.logicControllers = { ground: null, air: null, naval: null };
   rlSocketClose();
   rlSocket.queue = [];
@@ -2286,12 +3115,12 @@ function runAiLogic() {
   if (core2 == null) return;
 
   // Keep counts in sync with the current world state (e.g., in case buildings were lost).
-  state.drillCount = countBlocks(team2, Blocks.mechanicalDrill);
-  state.turretCount = countBlocks(team2, Blocks.duo);
-  state.powerClusters = countBlocks(team2, Blocks.powerNode);
-  state.pumpCount = countBlocks(team2, Blocks.mechanicalPump);
+  state.drillCount = countBlocksByGroup(team2, BlockGroup.drills);
+  state.turretCount = countBlocksByGroup(team2, BlockGroup.turrets);
+  state.powerClusters = countPowerNodes(team2);
+  state.pumpCount = countPumps(team2);
   state.liquidHubCount = countLiquidHubs(team2);
-  state.thermalCount = countBlocks(team2, Blocks.thermalGenerator);
+  state.thermalCount = countThermals(team2);
 
   configureFactories(team2);
   ensureLogicControllers(core2, team2);
@@ -2306,12 +3135,17 @@ function runAiStep(core, team) {
   var availCopper = availableCoreItems(core, Items.copper);
   var availLead = availableCoreItems(core, Items.lead);
   var wantsAttack = enemyCore != null && shouldAttack(core);
-  var canDrill = coreHasItemsFor(Blocks.mechanicalDrill, team);
-  var canDuo = coreHasItemsFor(Blocks.duo, team);
-  var canPowerNode = coreHasItemsFor(Blocks.powerNode, team);
-  var canThermal = coreHasItemsFor(Blocks.thermalGenerator, team);
+  var drillBlock = pickDrillBlock(team);
+  var turretBlock = pickTurretBlock(team);
+  var powerNodeBlock = pickPowerNodeBlock(team);
+  var thermalBlock = pickThermalBlock(team);
+  var pumpBlock = pickPumpBlock(team);
+  var canDrill = drillBlock != null && coreHasItemsFor(drillBlock, team);
+  var canDuo = turretBlock != null && coreHasItemsFor(turretBlock, team);
+  var canPowerNode = powerNodeBlock != null && coreHasItemsFor(powerNodeBlock, team);
+  var canThermal = thermalBlock != null && coreHasItemsFor(thermalBlock, team);
   var hubBlock = pickLiquidHubBlock(core);
-  var canPump = coreHasItemsFor(Blocks.mechanicalPump, team);
+  var canPump = pumpBlock != null && coreHasItemsFor(pumpBlock, team);
   var canLiquidHub = hubBlock != null && coreHasItemsFor(hubBlock, team);
   var canLiquid = canPump || findLiquidHub(team) != null || canLiquidHub;
   var powerStats = computePowerStatus(team);
@@ -2322,6 +3156,24 @@ function runAiStep(core, team) {
     powerStats.avg < 0.85 ? 10 : 0;
 
   var beforeState = snapshotState(core, enemyCore, enemies, team);
+  var reserveP = reservePressure(core);
+  var reservePenalty = 1;
+  var reserveBoost = 1;
+  if (reserveP > 0) {
+    var pen = config.resourceReservePenalty != null ? config.resourceReservePenalty : 0;
+    if (pen < 0) pen = 0;
+    if (pen > 1) pen = 1;
+    reservePenalty = 1 - (reserveP * pen);
+    if (reservePenalty < 0) reservePenalty = 0;
+    var boost = config.resourceReserveBoost != null ? config.resourceReserveBoost : 0;
+    if (boost < 0) boost = 0;
+    reserveBoost = 1 + (reserveP * boost);
+  }
+  var prevStrategy = state.currentStrategy;
+  var strategy = pickStrategy(core, enemyCore, enemies, powerStats, beforeState);
+  if (strategy != null && prevStrategy != null && strategy != prevStrategy) {
+    Log.info("[IA] Estrategia: " + strategy);
+  }
 
   if (config.rlPolicyMode != "heuristic") {
     if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
@@ -2347,14 +3199,28 @@ function runAiStep(core, team) {
   };
 
   var actions = [];
-  var addAction = function(name, score, run){ actions.push({ name: name, score: score, run: run }); };
-  addAction("thermal", (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0), runCore(actionThermal));
+  var applyStrategyNow = !(config.strategyAffectsRL && config.rlPolicyMode != "heuristic");
+  var addAction = function(name, score, run){
+    var s = applyStrategyNow ? applyStrategyScore(name, score, strategy) : score;
+    actions.push({ name: name, score: s, run: run });
+  };
+  var thermalScore = (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0);
+  thermalScore *= reservePenalty;
+  addAction("thermal", thermalScore, runCore(actionThermal));
   addAction("attackWave", wantsAttack ? 100 : 0, actionHandlers.attackWave);
   addAction("rally", wantsAttack ? 55 : 0, actionHandlers.rally);
-  addAction("mine", (canDrill ? (availCopper < 200 ? 120 : availCopper < 400 ? 90 : 50) + (state.drillCount < config.maxDrills ? 30 : 0) : 0), actionHandlers.mine);
-  addAction("defend", (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0), actionHandlers.defend);
-  addAction("power", (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0), actionHandlers.power);
-  addAction("liquid", (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0), runCore(actionLiquid));
+  var mineScore = (canDrill ? (availCopper < 200 ? 120 : availCopper < 400 ? 90 : 50) + (state.drillCount < config.maxDrills ? 30 : 0) : 0);
+  mineScore *= reserveBoost;
+  addAction("mine", mineScore, actionHandlers.mine);
+  var defendScore = (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0);
+  defendScore *= reservePenalty;
+  addAction("defend", defendScore, actionHandlers.defend);
+  var powerScore = (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0);
+  powerScore *= reservePenalty;
+  addAction("power", powerScore, actionHandlers.power);
+  var liquidScore = (canLiquid ? (state.pumpCount < config.maxPumps ? 45 : 0) + (state.liquidHubCount < config.maxLiquidHubs ? 15 : 0) : 0);
+  liquidScore *= reservePenalty;
+  addAction("liquid", liquidScore, runCore(actionLiquid));
   addAction("noop", 0, actionHandlers.noop);
 
   if (config.rlPolicyMode != "heuristic") {
@@ -2391,12 +3257,20 @@ function runAiStep(core, team) {
     }
   }
 
+  if (config.strategyAffectsRL && config.rlPolicyMode != "heuristic") {
+    for (var sa = 0; sa < actions.length; sa++) {
+      var actS = actions[sa];
+      actS.score = applyStrategyScore(actS.name, actS.score, strategy);
+    }
+  }
+
   var ranked = rankActions(actions);
+  var pickedList = pickExploreOrder(ranked);
   var pickedName = "noop";
   state.lastAction = "none";
   state.lastActionOk = false;
-  for (var r = 0; r < ranked.length; r++) {
-    var picked = ranked[r];
+  for (var r = 0; r < pickedList.length; r++) {
+    var picked = pickedList[r];
     var ok = false;
     try {
       ok = picked.run();
@@ -2414,6 +3288,7 @@ function runAiStep(core, team) {
     }
     break;
   }
+  decayEpsilon();
   var did = state.lastActionOk === true;
 
   var core2 = getCore(team);
@@ -2439,11 +3314,13 @@ Events.run(Trigger.update, function(){
 
   if (!state.aiEnabled) return;
 
+  var headless = isHeadless();
   var localPlayer = getLocalPlayer();
   var team = localPlayer != null ? localPlayer.team() : Vars.state.rules.defaultTeam;
   var core = getCore(team);
-  if (localPlayer == null || core == null) {
-    warnBuildFail("Aguardando player/core...");
+  if (core == null || (!headless && localPlayer == null)) {
+    if (headless) warnBuildFail("Aguardando core...");
+    else warnBuildFail("Aguardando player/core...");
     return;
   }
 
