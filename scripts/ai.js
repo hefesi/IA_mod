@@ -46,7 +46,7 @@ var config = {
   modName: "ia-base-ataque",
   rlLogEnabled: true,
   rlSocketEnabled: true,
-  rlSocketHost: "192.168.25.8",
+  rlSocketHost: "127.0.0.1",
   rlSocketPort: 4567,
   rlSocketReconnectTicks: 300,
   rlSocketTimeoutMs: 200,
