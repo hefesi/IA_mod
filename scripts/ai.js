@@ -169,6 +169,8 @@ var state = {
   lastLogicTick: -9999,
   playerControlledUnitId: -1,
   playerControllerSet: false,
+  // Tick when we last attempted to change the player unit controller.
+  lastControllerAttemptTick: -9999,
   controllerResetPenalty: 0,
   nnModel: null,
   nnLastLoadTick: -9999,
@@ -556,11 +558,32 @@ function ensurePlayerControlled() {
 
   var desiredMode = (!state.aiEnabled || config.observerMode) ? "player" : "ai";
 
-  // Avoid repeatedly reassigning controller every tick.
-  if (state.playerControllerMode === desiredMode && state.playerControlledUnitId === unitId) {
-    if (desiredMode === "ai") updateCameraToUnit(unit);
-    return;
+  // Prevent spamming controller assignments when the game re-assigns control at spawn.
+  var controller = null;
+  try {
+    controller = unit.controller();
+  } catch (e) {
+    // ignore
   }
+
+  // Avoid repeatedly reassigning controller every tick when it is already correct.
+  if (state.playerControllerMode === desiredMode && state.playerControlledUnitId === unitId) {
+    if (desiredMode === "ai") {
+      if (controller instanceof CommandAI) {
+        updateCameraToUnit(unit);
+        return;
+      }
+      // If the controller isn't actually CommandAI, allow a retry but throttle it.
+      if ((state.tick - state.lastControllerAttemptTick) < 60) return;
+    } else {
+      // When player control is desired, avoid forcing it too often.
+      if (controller === player) return;
+      if ((state.tick - state.lastControllerAttemptTick) < 60) return;
+    }
+  }
+
+  // If we got here, we need to attempt switching the controller.
+  state.lastControllerAttemptTick = state.tick;
 
   if (desiredMode === "player") {
     try {

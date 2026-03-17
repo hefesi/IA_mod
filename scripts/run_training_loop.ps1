@@ -22,6 +22,10 @@ param(
 
     [int]$MaxRestarts = 0, # 0 = unlimited
 
+    # By default we only restart when the process exits with a non-zero code (crash/abort).
+    # If the game exits cleanly (exit code 0) we stop the loop unless this switch is set.
+    [switch]$RestartOnNormalExit = $false,
+
     [string]$LogFile = "training_loop.log"
 )
 
@@ -97,6 +101,12 @@ while ($true) {
     # Stop background jobs so they don't keep running
     Get-Job -Name "TrainOut" -ErrorAction SilentlyContinue | Stop-Job -Force | Remove-Job -Force | Out-Null
     Get-Job -Name "TrainErr" -ErrorAction SilentlyContinue | Stop-Job -Force | Remove-Job -Force | Out-Null
+
+    # If the process exited cleanly (exit code 0), stop here unless the user explicitly asked to restart.
+    if ($exitCode -eq 0 -and -not $RestartOnNormalExit) {
+        Log "Process exited cleanly (0). Stopping." 
+        break
+    }
 
     if ($MaxRestarts -gt 0 -and $restartCount -ge $MaxRestarts) {
         Log "Reached max restarts ($MaxRestarts). Stopping."
