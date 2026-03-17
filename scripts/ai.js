@@ -43,7 +43,7 @@ var config = {
   memorySize: 3,
   repeatPenalty: 25,
   actionCooldown: 180,
-  modName: "ia-base-ataque",
+  modName: "auto-game",
   rlLogEnabled: true,
   rlSocketEnabled: true,
   rlSocketHost: "127.0.0.1",
@@ -843,6 +843,13 @@ function loadNNModel() {
   }
 }
 
+function tanh(x) {
+  if (Math.tanh != null) return Math.tanh(x);
+  var ex = Math.exp(x);
+  var enx = Math.exp(-x);
+  return (ex - enx) / (ex + enx);
+}
+
 function nnForward(stateObj) {
   if (state.nnModel == null) return null;
   var model = state.nnModel;
@@ -861,7 +868,7 @@ function nnForward(stateObj) {
     for (var j = 0; j < model.inputSize; j++) {
       sum += (model.w1[h * model.inputSize + j] || 0) * input[j];
     }
-    hidden.push(Math.tanh(sum));
+    hidden.push(tanh(sum));
   }
   // output = W2 * hidden + b2
   var out = [];
@@ -1580,6 +1587,12 @@ function countBlocks(team, block) {
   return count;
 }
 
+function countLiquidHubs(team) {
+  return countBlocks(team, Blocks.liquidContainer) +
+    countBlocks(team, Blocks.liquidTank) +
+    countBlocks(team, Blocks.liquidRouter);
+}
+
 function containsType(list, type) {
   for (var i = 0; i < list.length; i++) {
     if (list[i] == type) return true;
@@ -1904,7 +1917,7 @@ function findLiquidHub(team) {
   var found = null;
   Groups.build.each(function(b){
     if (b == null || b.team != team) return;
-    if (b.block == Blocks.liquidContainer || b.block == Blocks.liquidTank) {
+    if (b.block == Blocks.liquidContainer || b.block == Blocks.liquidTank || b.block == Blocks.liquidRouter) {
       found = b;
     }
   });
@@ -2277,6 +2290,7 @@ function runAiLogic() {
   state.turretCount = countBlocks(team2, Blocks.duo);
   state.powerClusters = countBlocks(team2, Blocks.powerNode);
   state.pumpCount = countBlocks(team2, Blocks.mechanicalPump);
+  state.liquidHubCount = countLiquidHubs(team2);
   state.thermalCount = countBlocks(team2, Blocks.thermalGenerator);
 
   configureFactories(team2);
