@@ -239,6 +239,7 @@ function rlSocketConnect() {
   if (rlSocketConnected()) return true;
   if ((state.tick - rlSocket.lastConnectTick) < config.rlSocketReconnectTicks) return false;
   rlSocket.lastConnectTick = state.tick;
+  Log.info("[RL] Socket connect attempt to " + config.rlSocketHost + ":" + config.rlSocketPort);
   try {
     var s = new Socket();
     s.connect(new InetSocketAddress(config.rlSocketHost, config.rlSocketPort), config.rlSocketTimeoutMs);
@@ -249,6 +250,7 @@ function rlSocketConnect() {
     Log.info("[RL] Socket conectado: " + config.rlSocketHost + ":" + config.rlSocketPort);
     return true;
   } catch (e) {
+    Log.info("[RL] Socket connect error: " + e);
     rlSocketClose();
     return false;
   }
@@ -372,6 +374,7 @@ function isMobileSafe() {
 function applyMobileSafeMode() {
   if (!isMobileSafe()) return;
   config.rlSocketEnabled = false;
+  Log.info("[RL] Mobile safe mode active: rlSocketEnabled=false");
   config.rlLogEnabled = false;
   config.rlPolicyMode = "heuristic";
   config.rlSaveInterval = 0;
