@@ -405,6 +405,9 @@ var state = {
   gameOverEventSent: false,
   contentDemandTick: -9999,
   contentDemand: {},
+  contentDemandSimple: {},
+  contentDemandProfile: {},
+  lastEconomicFocus: null,
   logicControllers: {
     ground: null,
     air: null,
@@ -1235,6 +1238,76 @@ function addRequirementsDemand(map, reqs, weight) {
   });
 }
 
+function ensureDemandProfileEntry(map, item) {
+  if (map == null || item == null) return null;
+  var key = readContentName(item);
+  if (key == "") return null;
+  var entry = map[key];
+  if (entry == null) {
+    entry = {
+      item: item,
+      itemName: key,
+      total: 0,
+      blockDemand: 0,
+      unitDemand: 0,
+      chainDemand: 0,
+      ammoDemand: 0,
+      stock: 0,
+      producersBuilt: 0,
+      producersUnlocked: 0,
+      tier: 1,
+      category: "basic",
+      scarcity: 0,
+      criticality: 0
+    };
+    map[key] = entry;
+  } else if (entry.item == null) {
+    entry.item = item;
+  }
+  return entry;
+}
+
+function addDemandProfile(map, item, amount, source) {
+  if (map == null || item == null || amount == null || amount <= 0) return null;
+  var entry = ensureDemandProfileEntry(map, item);
+  if (entry == null) return null;
+  entry.total += amount;
+  if (source == "block") entry.blockDemand += amount;
+  else if (source == "unit") entry.unitDemand += amount;
+  else if (source == "chain") entry.chainDemand += amount;
+  else if (source == "ammo") entry.ammoDemand += amount;
+  else entry.chainDemand += amount;
+  return entry;
+}
+
+function addRequirementsDemandProfile(map, reqs, weight, source) {
+  var mul = weight != null ? weight : 1;
+  if (mul <= 0) return;
+  eachSeq(reqs, function(stack){
+    if (stack == null || stack.item == null) return;
+    var amount = 0;
+    try {
+      amount = stack.amount != null ? stack.amount : 0;
+    } catch (e) {
+      amount = 0;
+    }
+    if (amount <= 0) amount = 1;
+    addDemandProfile(map, stack.item, amount * mul, source);
+  });
+}
+
+function demandProfileToSimpleMap(profile) {
+  var out = {};
+  if (profile == null) return out;
+  for (var key in profile) {
+    if (!profile.hasOwnProperty(key)) continue;
+    var entry = profile[key];
+    if (entry == null || !(entry.total > 0)) continue;
+    out[key] = entry.total;
+  }
+  return out;
+}
+
 function readContentStat(obj, key) {
   if (obj == null || key == null) return 0;
   try {
@@ -1428,6 +1501,134 @@ function augmentDemandWithProductionChain(team, demand) {
     demand[ckey] += chain[ckey];
   }
   return demand;
+}
+
+function applyProductionChainDemand(profile, team) {
+  if (profile == null) return profile;
+  var chain = {};
+  for (var key in profile) {
+    if (!profile.hasOwnProperty(key)) continue;
+    var entry = profile[key];
+    var weight = entry != null ? entry.total : 0;
+    if (!(weight > 0)) continue;
+    var item = entry.item != null ? entry.item : itemByName(key);
+    if (item == null) continue;
+    try {
+      Vars.content.blocks().each(function(block){
+        if (block == null || !blockUnlocked(block) || !isIndustryBlock(block)) return;
+        if (!blockProducesItem(block, item)) return;
+        addRequirementsDemandProfile(chain, block.requirements, Math.min(24, weight) * 0.18, "chain");
+      });
+    } catch (e) {
+      // ignore
+    }
+  }
+  for (var ckey in chain) {
+    if (!chain.hasOwnProperty(ckey)) continue;
+    var centry = chain[ckey];
+    if (centry == null) continue;
+    var target = ensureDemandProfileEntry(profile, centry.item != null ? centry.item : itemByName(ckey));
+    if (target == null) continue;
+    target.total += centry.total;
+    target.chainDemand += centry.chainDemand;
+  }
+  return profile;
+}
+
+function computeItemScarcity(entry) {
+  if (entry == null) return 0;
+  var reserve = Math.max(20, manualReserveFor(entry.item), entry.total * 2);
+  var stock = entry.stock != null ? entry.stock : 0;
+  var base = clamp01((reserve - stock) / Math.max(1, reserve));
+  if (entry.producersBuilt <= 0) base += entry.producersUnlocked > 0 ? 0.18 : 0.32;
+  else base -= Math.min(0.25, entry.producersBuilt * 0.08);
+  return clamp01(base);
+}
+
+function computeItemCriticality(entry) {
+  if (entry == null) return 0;
+  var strategicBonus = entry.category == "strategic" ? 10 : 0;
+  var noProducerBonus = entry.producersBuilt <= 0 ? 12 : 0;
+  var tierBonus = entry.tier >= 4 ? 8 : 0;
+  return Math.round((entry.total * 0.45 + entry.scarcity * 25 + noProducerBonus + strategicBonus + tierBonus) * 100) / 100;
+}
+
+function scanRawContentDemand(team) {
+  var profile = {};
+  try {
+    Vars.content.blocks().each(function(block){
+      if (block == null || !blockUnlocked(block)) return;
+      var weight = blockDemandWeight(block);
+      addRequirementsDemandProfile(profile, block.requirements, weight, "block");
+      if (isFactoryBlock(block)) {
+        var options = collectFactoryPlanOptions(block);
+        for (var i = 0; i < options.length; i++) {
+          var option = options[i];
+          addRequirementsDemandProfile(profile, option.requirements, weight * 0.8, "unit");
+        }
+      }
+      var outputs = blockOutputItems(block);
+      for (var j = 0; j < outputs.length; j++) {
+        var output = outputs[j];
+        if (output == null || output.item == null) continue;
+        var source = resourceCategoryForItem(output.item) == "combat" ? "ammo" : "chain";
+        addDemandProfile(profile, output.item, Math.max(0.2, (output.amount != null ? output.amount : 1) * 0.35 * weight), source);
+      }
+    });
+  } catch (e) {
+    // ignore
+  }
+  return profile;
+}
+
+function finalizeDemandProfile(team, core, rawProfile) {
+  var profile = rawProfile != null ? rawProfile : {};
+  for (var key in profile) {
+    if (!profile.hasOwnProperty(key)) continue;
+    var entry = profile[key];
+    if (entry == null) continue;
+    var item = entry.item != null ? entry.item : itemByName(key);
+    entry.item = item;
+    entry.itemName = readContentName(item);
+    entry.stock = 0;
+    if (core != null && core.items != null && item != null) {
+      try {
+        entry.stock = core.items.get(item);
+      } catch (e) {
+        entry.stock = 0;
+      }
+    }
+    entry.producersBuilt = countProducerBlocks(team, item);
+    entry.producersUnlocked = unlockedProducerCount(item);
+    entry.tier = itemTierFor(item);
+    entry.category = resourceCategoryForItem(item);
+    entry.scarcity = computeItemScarcity(entry);
+    entry.criticality = computeItemCriticality(entry);
+  }
+  return profile;
+}
+
+function getDemandProfileEntry(team, core, item) {
+  if (item == null) return null;
+  var profile = getContentDemandProfile(team, core);
+  if (profile == null) return null;
+  var key = readContentName(item);
+  if (key == "") return null;
+  return profile[key] != null ? profile[key] : null;
+}
+
+function getContentDemandProfile(team, core) {
+  var interval = config.contentScanInterval != null ? config.contentScanInterval : 600;
+  if (state.contentDemandProfile == null || state.contentDemandSimple == null || (state.tick - state.contentDemandTick) >= interval) {
+    var raw = scanRawContentDemand(team);
+    applyProductionChainDemand(raw, team);
+    var finalProfile = finalizeDemandProfile(team, core, raw);
+    state.contentDemandProfile = finalProfile;
+    state.contentDemandSimple = demandProfileToSimpleMap(finalProfile);
+    state.contentDemand = state.contentDemandSimple;
+    state.contentDemandTick = state.tick;
+  }
+  return state.contentDemandProfile;
 }
 
 function computeProductionChainStatus(core, team) {
@@ -2956,71 +3157,63 @@ function blockUnlocked(block) {
 }
 
 function scanContentDemand(team) {
-  var demand = {};
-  try {
-    Vars.content.blocks().each(function(block){
-      if (block == null) return;
-      if (!blockUnlocked(block)) return;
-      var weight = blockDemandWeight(block);
-      addRequirementsDemand(demand, block.requirements, weight);
-      if (isFactoryBlock(block)) {
-        var options = collectFactoryPlanOptions(block);
-        for (var i = 0; i < options.length; i++) {
-          var option = options[i];
-          addRequirementsDemand(demand, option.requirements, weight * 0.8);
-          if (option.unit != null) {
-            var bonus = (unitCombatValue(option.unit) * 0.03) + (unitEconomicValue(option.unit) * 0.08);
-            var name = readContentName(option.unit);
-            if (name != "") demand["unit:" + name] = bonus;
-          }
-        }
-      }
-    });
-  } catch (e) {
-    // ignore
-  }
-  augmentDemandWithProductionChain(team, demand);
-  state.contentDemand = demand;
-  state.contentDemandTick = state.tick;
-  return demand;
+  getContentDemandProfile(team, getCore(team));
+  return state.contentDemandSimple;
 }
 
 function getContentDemand(team) {
-  var interval = config.contentScanInterval != null ? config.contentScanInterval : 600;
-  if (state.contentDemand == null || (state.tick - state.contentDemandTick) >= interval) {
-    return scanContentDemand(team);
-  }
-  return state.contentDemand;
+  getContentDemandProfile(team, getCore(team));
+  return state.contentDemandSimple != null ? state.contentDemandSimple : {};
 }
 
 function contentDemandForItem(team, item) {
-  if (item == null) return 0;
-  var demand = getContentDemand(team);
-  if (demand == null) return 0;
-  var key = readContentName(item);
-  if (key == "") return 0;
-  return demand[key] != null ? demand[key] : 0;
+  var entry = getDemandProfileEntry(team, getCore(team), item);
+  return entry != null && entry.total != null ? entry.total : 0;
 }
 
-function synthesizeMiningEntry(item, core, team) {
+function computeReservePressureFromReserve(stock, reserve) {
+  if (!(reserve > 0)) return 0;
+  var margin = config.resourceReserveSoftMargin != null ? config.resourceReserveSoftMargin : 0;
+  if (margin < 0) margin = 0;
+  var soft = reserve * (1 + margin);
+  if (soft <= reserve) soft = reserve + 1;
+  if (stock <= reserve) return 1;
+  if (stock >= soft) return 0;
+  return clamp01((soft - stock) / (soft - reserve));
+}
+
+function computeDynamicMiningEntry(item, core, team, profileEntry) {
   if (item == null) return null;
-  var demand = contentDemandForItem(team, item);
-  var reserve = reserveFor(item);
-  if (reserve <= 0 && demand <= 0) return null;
-  var pressure = resourcePressure(core, item);
-  var critical = pressure >= 0.65 || (reserve <= 0 && demand >= 12);
+  var entry = profileEntry != null ? profileEntry : getDemandProfileEntry(team, core, item);
+  if (entry == null) return null;
+  var reserve = reserveFor(item, team, core, entry);
+  if (reserve <= 0 && !(entry.total > 0)) return null;
+  var reservePressure = computeReservePressureFromReserve(entry.stock, reserve);
+  var critical = entry.criticality >= 70 || reservePressure >= 0.8;
   return {
     item: readContentName(item),
-    priority: 0.8 + Math.min(1.4, demand * 0.04) + pressure * 0.6,
-    minDrills: critical ? 1 : 0,
+    priority: 0.7 + entry.criticality / 60 + entry.scarcity * 0.8,
+    minDrills: entry.criticality >= 50 ? 1 : 0,
     critical: critical,
-    bypassSlots: critical ? 1 : 0,
+    bypassSlots: entry.criticality >= 85 ? 2 : 1,
+    demand: entry.total,
+    scarcity: entry.scarcity,
+    criticality: entry.criticality,
+    chainCriticality: entry.chainDemand,
+    producersBuilt: entry.producersBuilt,
+    tier: entry.tier,
+    category: entry.category,
     dynamic: true,
-    demand: demand
+    reserve: reserve,
+    reservePressure: reservePressure
   };
 }
 
-function reserveFor(item) {
+function synthesizeMiningEntry(item, core, team) {
+  return computeDynamicMiningEntry(item, core, team, null);
+}
+
+function manualReserveFor(item) {
   if (config.resourceReserve == null || item == null) return 0;
   var key = null;
   try {
@@ -3032,6 +3225,29 @@ function reserveFor(item) {
   var val = config.resourceReserve[key];
   if (val == null) return 0;
   return Math.max(0, val);
+}
+
+function dynamicReserveFor(item, team, core, profileEntry) {
+  if (item == null) return 0;
+  var entry = profileEntry != null ? profileEntry : getDemandProfileEntry(team, core, item);
+  if (entry == null) return 0;
+  var baseTier = entry.tier <= 1 ? 40 : (entry.tier == 2 ? 35 : (entry.tier == 3 ? 28 : (entry.tier == 4 ? 22 : 16)));
+  var baseCategory = entry.category == "basic" ? 30 : (entry.category == "industrial" ? 24 : 18);
+  var demandFactor = Math.min(160, entry.total * 2);
+  var scarcityFactor = entry.scarcity * 40;
+  var producerFactor = entry.producersBuilt <= 0 ? 20 : 0;
+  var dynamicReserve = baseTier + baseCategory + demandFactor + scarcityFactor + producerFactor;
+  return Math.round(Math.max(0, dynamicReserve));
+}
+
+function reserveFor(item, team, core, profileEntry) {
+  var manual = manualReserveFor(item);
+  var dynamic = dynamicReserveFor(item, team != null ? team : getTeam(), core != null ? core : getCore(team != null ? team : getTeam()), profileEntry);
+  return Math.max(manual, dynamic);
+}
+
+function economicPressure(core, team) {
+  return reservePressure(core, team);
 }
 
 function shouldIgnoreReserve(ignoreReserveItems, item) {
@@ -3060,30 +3276,46 @@ function shouldIgnoreReserve(ignoreReserveItems, item) {
   return false;
 }
 
-function resourcePressure(core, item) {
+function resourcePressure(core, item, team, profileEntry) {
   if (core == null || core.items == null || item == null) return 0;
-  var reserve = reserveFor(item);
+  var entry = profileEntry != null ? profileEntry : getDemandProfileEntry(team != null ? team : getTeam(), core, item);
+  var reserve = reserveFor(item, team, core, entry);
   if (reserve <= 0) return 0;
-  var total = core.items.get(item);
-  var margin = config.resourceReserveSoftMargin != null ? config.resourceReserveSoftMargin : 0;
-  if (margin < 0) margin = 0;
-  var soft = reserve * (1 + margin);
-  if (soft <= reserve) soft = reserve + 1;
-  if (total <= reserve) return 1;
-  if (total >= soft) return 0;
-  return clamp01((soft - total) / (soft - reserve));
+  var total = entry != null ? entry.stock : 0;
+  if (entry == null) {
+    try {
+      total = core.items.get(item);
+    } catch (e) {
+      total = 0;
+    }
+  }
+  return computeReservePressureFromReserve(total, reserve);
 }
 
-function reservePressure(core) {
+function reservePressure(core, team) {
   if (core == null) return 0;
+  var profile = getContentDemandProfile(team != null ? team : getTeam(), core);
+  var seen = {};
   var maxp = 0;
-  if (config.resourceReserve != null) {
-    for (var key in config.resourceReserve) {
-      if (!config.resourceReserve.hasOwnProperty(key)) continue;
-      var item = itemByName(key);
+  if (profile != null) {
+    for (var key in profile) {
+      if (!profile.hasOwnProperty(key)) continue;
+      var entry = profile[key];
+      if (entry == null || !(entry.total > 0)) continue;
+      seen[key] = true;
+      var item = entry.item != null ? entry.item : itemByName(key);
       if (item == null) continue;
-      var p = resourcePressure(core, item);
+      var p = resourcePressure(core, item, team, entry);
       if (p > maxp) maxp = p;
+    }
+  }
+  if (config.resourceReserve != null) {
+    for (var rkey in config.resourceReserve) {
+      if (!config.resourceReserve.hasOwnProperty(rkey) || seen[rkey] === true) continue;
+      var ritem = itemByName(rkey);
+      if (ritem == null) continue;
+      var rp = resourcePressure(core, ritem, team, null);
+      if (rp > maxp) maxp = rp;
     }
   }
   return maxp;
@@ -3091,19 +3323,41 @@ function reservePressure(core) {
 
 function miningRoadmapEntry(item, core, team) {
   if (item == null) return null;
-  if (config.economicMiningRoadmap == null) return synthesizeMiningEntry(item, core, team);
-  var name = null;
-  try {
-    name = item.name;
-  } catch (e) {
-    name = null;
+  var dynamicEntry = computeDynamicMiningEntry(item, core, team, null);
+  var manual = null;
+  if (config.economicMiningRoadmap != null) {
+    var name = null;
+    try {
+      name = item.name;
+    } catch (e) {
+      name = null;
+    }
+    if (name != null) {
+      for (var i = 0; i < config.economicMiningRoadmap.length; i++) {
+        var entry = config.economicMiningRoadmap[i];
+        if (entry != null && entry.item == name) { manual = entry; break; }
+      }
+    }
   }
-  if (name == null) return null;
-  for (var i = 0; i < config.economicMiningRoadmap.length; i++) {
-    var entry = config.economicMiningRoadmap[i];
-    if (entry != null && entry.item == name) return entry;
-  }
-  return synthesizeMiningEntry(item, core, team);
+  if (dynamicEntry == null) return manual;
+  if (manual == null) return dynamicEntry;
+  return {
+    item: dynamicEntry.item,
+    priority: (dynamicEntry.priority != null ? dynamicEntry.priority : 0) + (manual.priority != null ? (manual.priority - 1) * 0.8 : 0),
+    minDrills: Math.max(dynamicEntry.minDrills != null ? dynamicEntry.minDrills : 0, manual.minDrills != null ? manual.minDrills : 0),
+    critical: manual.critical === true || dynamicEntry.critical === true,
+    bypassSlots: Math.max(dynamicEntry.bypassSlots != null ? dynamicEntry.bypassSlots : 0, manual.bypassSlots != null ? manual.bypassSlots : 0),
+    dynamic: true,
+    demand: dynamicEntry.demand,
+    scarcity: dynamicEntry.scarcity,
+    criticality: dynamicEntry.criticality,
+    chainCriticality: dynamicEntry.chainCriticality,
+    producersBuilt: dynamicEntry.producersBuilt,
+    tier: dynamicEntry.tier,
+    category: dynamicEntry.category,
+    reserve: dynamicEntry.reserve,
+    reservePressure: dynamicEntry.reservePressure
+  };
 }
 
 function miningBypassCap(entry) {
@@ -3146,43 +3400,53 @@ function computeMiningPlan(core, team) {
     if (ore == null || ore.item == null) continue;
     var tile = tileAt(ore.x, ore.y);
     if (tile == null || tile.block() != Blocks.air) continue;
+    var profileEntry = getDemandProfileEntry(team, core, ore.item);
     var entry = miningRoadmapEntry(ore.item, core, team);
-    var reservePressureValue = resourcePressure(core, ore.item);
-    var demand = entry != null && entry.demand != null ? entry.demand : contentDemandForItem(team, ore.item);
-    var dynamicPressure = 0;
-    if (reserveFor(ore.item) <= 0 && demand > 0) {
-      dynamicPressure = clamp01((demand / 16) * (core.items != null && core.items.get(ore.item) <= 0 ? 1 : 0.45));
-    }
-    var pressure = Math.max(reservePressureValue, dynamicPressure);
-    var reserve = reserveFor(ore.item);
-    var total = core.items != null ? core.items.get(ore.item) : 0;
-    var deficit = reserve > total ? (reserve - total) : 0;
+    if (entry == null && profileEntry == null) continue;
+    var reserve = reserveFor(ore.item, team, core, profileEntry);
+    var reservePressureValue = resourcePressure(core, ore.item, team, profileEntry);
+    var demand = entry != null && entry.demand != null ? entry.demand : (profileEntry != null ? profileEntry.total : contentDemandForItem(team, ore.item));
     var priority = entry != null && entry.priority != null ? entry.priority : (reserve > 0 ? 1.0 : 0.6);
+    var criticality = entry != null && entry.criticality != null ? entry.criticality : (profileEntry != null ? profileEntry.criticality : 0);
+    var scarcity = entry != null && entry.scarcity != null ? entry.scarcity : (profileEntry != null ? profileEntry.scarcity : 0);
+    var chainCriticality = entry != null && entry.chainCriticality != null ? entry.chainCriticality : (profileEntry != null ? profileEntry.chainDemand : 0);
+    var total = profileEntry != null ? profileEntry.stock : (core.items != null ? core.items.get(ore.item) : 0);
+    var deficit = reserve > total ? (reserve - total) : 0;
     var itemDrills = countDrillsMiningItem(team, ore.item);
     var minDrills = entry != null && entry.minDrills != null ? entry.minDrills : 0;
     var underDrilled = itemDrills < minDrills;
     var critical = entry != null && entry.critical === true;
     var bypassCap = miningBypassCap(entry);
-    var canBypass = critical && pressure >= criticalGate && state.drillCount < bypassCap;
+    var canBypass = critical && reservePressureValue >= criticalGate && state.drillCount < bypassCap;
     var underBaseCap = state.drillCount < config.maxDrills;
     if (!underBaseCap && !canBypass) continue;
+    var idealDrills = Math.max(minDrills, Math.ceil(Math.max(0, demand) / 24));
+    var oversaturationPenalty = Math.max(0, itemDrills - idealDrills) * 12;
+    var tierBonus = profileEntry != null ? Math.max(0, profileEntry.tier - 1) * 6 : 0;
+    var categoryBonus = profileEntry != null ? (profileEntry.category == "basic" ? 10 : (profileEntry.category == "industrial" ? 14 : (profileEntry.category == "strategic" ? 18 : 12))) : 0;
     var score = baseScore;
-    score += pressure * pressureWeight;
+    score += reservePressureValue * pressureWeight;
     score += priority * priorityWeight;
-    score += Math.min(demand, 20) * demandWeight;
+    score += Math.min(demand, 24) * demandWeight;
+    score += criticality * 1.2;
+    score += scarcity * 40;
+    score += Math.min(18, chainCriticality * 2.4);
     score += Math.min(deficit, reserve > 0 ? reserve : 100) * 0.15;
     if (underDrilled) score += underDrilledBonus;
-    if (critical && pressure > 0) score += 18;
+    score += tierBonus + categoryBonus;
+    if (critical && reservePressureValue > 0) score += 18;
     if (underBaseCap) score += 12;
     else if (canBypass) score += 16;
     score -= Math.sqrt(ore.dist2) * distanceWeight;
+    score -= oversaturationPenalty;
     if (best == null || score > best.score) {
       best = {
         ore: ore,
         item: ore.item,
         itemName: ore.itemName,
         score: score,
-        pressure: pressure,
+        pressure: reservePressureValue,
+        reservePressure: reservePressureValue,
         reserve: reserve,
         total: total,
         deficit: deficit,
@@ -3191,9 +3455,23 @@ function computeMiningPlan(core, team) {
         itemDrills: itemDrills,
         minDrills: minDrills,
         critical: critical,
+        criticality: criticality,
+        scarcity: scarcity,
+        chainCriticality: chainCriticality,
         allowBypass: !underBaseCap && canBypass,
         capped: !underBaseCap,
-        missingEconomicSignal: critical || pressure > 0.5 || underDrilled
+        missingEconomicSignal: critical || reservePressureValue > 0.5 || underDrilled,
+        reason: {
+          reservePressure: Math.round(reservePressureValue * 100) / 100,
+          demand: Math.round(demand * 100) / 100,
+          criticality: Math.round(criticality * 100) / 100,
+          scarcity: Math.round(scarcity * 100) / 100,
+          chainCriticality: Math.round(chainCriticality * 100) / 100,
+          category: profileEntry != null ? profileEntry.category : null,
+          tier: profileEntry != null ? profileEntry.tier : 1,
+          itemDrills: itemDrills,
+          oversaturationPenalty: oversaturationPenalty
+        }
       };
     }
   }
@@ -3616,10 +3894,36 @@ function placePowerCluster(team, baseX, baseY, ignoreReserveItems) {
   return nodePlaced;
 }
 
+function scoreProducedItemValue(outputItem, team, core, profile) {
+  if (outputItem == null) return 0;
+  var entry = null;
+  if (profile != null) {
+    var key = readContentName(outputItem);
+    entry = key != "" ? profile[key] : null;
+  }
+  if (entry == null) entry = getDemandProfileEntry(team, core, outputItem);
+  if (entry == null) return 0;
+  var builtPenalty = entry.producersBuilt <= 0 ? 18 : (8 / (1 + entry.producersBuilt));
+  return entry.total * 0.8 + entry.criticality * 0.7 + entry.scarcity * 35 + builtPenalty + entry.tier * 4 + entry.chainDemand * 2.2;
+}
+
+function strategicInputPressureBonus(block, team, core, profile) {
+  if (block == null || block.requirements == null) return 0;
+  var bonus = 0;
+  eachSeq(block.requirements, function(stack){
+    if (stack == null || stack.item == null) return;
+    var entry = getDemandProfileEntry(team, core, stack.item);
+    if (entry == null) return;
+    bonus += entry.criticality * 0.08 + entry.scarcity * 8;
+  });
+  return bonus;
+}
+
 function scoreIndustryBlock(block, team, core, strategyName) {
   if (block == null || !isFactoryBlock(block)) return -999999;
   if (!blockUnlocked(block)) return -999999;
   if (!coreHasItemsFor(block, team)) return -999999;
+  var profile = getContentDemandProfile(team, core);
   var score = 50;
   var strat = currentStrategyName(strategyName);
   var role = factoryRoleForBlock(block);
@@ -3643,16 +3947,14 @@ function scoreIndustryBlock(block, team, core, strategyName) {
   for (var j = 0; j < outputs.length; j++) {
     var output = outputs[j];
     if (output == null || output.item == null) continue;
-    var demand = contentDemandForItem(team, output.item);
-    var builtProducers = countProducerBlocks(team, output.item);
-    score += Math.min(55, demand * (builtProducers <= 0 ? 1.2 : (0.45 / (1 + builtProducers))));
+    score += Math.min(75, scoreProducedItemValue(output.item, team, core, profile));
   }
   var chainStatus = computeProductionChainStatus(core, team);
   score += chainStatus.pressure * 10;
   score += Math.max(0, 1 - chainStatus.coverage) * 20;
+  score += strategicInputPressureBonus(block, team, core, profile);
   score -= blockCost(block) * 0.12;
-  score += contentDemandForItem(team, Items.silicon) * 0.25;
-  if (core != null && reservePressure(core) > 0.55) score -= 12;
+  if (core != null && reservePressure(core, team) > 0.55) score -= 12;
   return score;
 }
 
@@ -4633,6 +4935,30 @@ function findCoolantTargets(team, liquid, fromX, fromY, limit) {
   return out;
 }
 
+function priorityMineItems(core, team) {
+  var profile = getContentDemandProfile(team != null ? team : getTeam(), core);
+  var ranked = [];
+  if (profile != null) {
+    for (var key in profile) {
+      if (!profile.hasOwnProperty(key)) continue;
+      var entry = profile[key];
+      if (entry == null || entry.item == null || !(entry.total > 0)) continue;
+      ranked.push(entry);
+    }
+  }
+  ranked.sort(function(a, b){
+    var bc = b != null && b.criticality != null ? b.criticality : 0;
+    var ac = a != null && a.criticality != null ? a.criticality : 0;
+    if (bc != ac) return bc - ac;
+    var bs = b != null && b.scarcity != null ? b.scarcity : 0;
+    var as = a != null && a.scarcity != null ? a.scarcity : 0;
+    return bs - as;
+  });
+  var items = [];
+  for (var i = 0; i < ranked.length && i < 6; i++) items.push(ranked[i].item);
+  return items;
+}
+
 function findHeatSpot(core, team, thermalBlock) {
   var cx = core.tile.x;
   var cy = core.tile.y;
@@ -5014,11 +5340,25 @@ function chooseMineMicroDecision(ctx) {
   var core = ctx != null ? ctx.core : null;
   var team = ctx != null ? ctx.team : getTeam();
   var decisions = [];
+  var profile = getContentDemandProfile(team, core);
   var priority = priorityMineItems(core, team);
   for (var i = 0; i < priority.length && i < 4; i++) {
     var item = priority[i];
     if (item == null || item.name == null) continue;
-    decisions.push({ actionId: "ensure-" + i, kind: "ensure-item", score: 160 - i * 10, itemName: item.name, features: { optionIndex: i, need: 1.2 - i * 0.08, value: 1.0 } });
+    var entry = profile != null ? profile[item.name] : null;
+    decisions.push({
+      actionId: "ensure-" + i,
+      kind: "ensure-item",
+      score: (entry != null ? entry.criticality : 140) - i * 8,
+      itemName: item.name,
+      features: {
+        optionIndex: i,
+        need: entry != null ? entry.criticality / 100 : 1,
+        scarcity: entry != null ? entry.scarcity : 0,
+        tier: entry != null ? entry.tier / 5 : 0.2,
+        value: entry != null ? Math.min(1.2, entry.total / 100) : 1.0
+      }
+    });
   }
   var plan = ctx != null ? ctx.miningPlan : null;
   if (plan != null && plan.ore != null) {
@@ -5027,7 +5367,14 @@ function chooseMineMicroDecision(ctx) {
       actionId: "ore-plan",
       score: plan.score != null ? plan.score : 120,
       plan: plan,
-      features: { optionIndex: decisions.length, distance: Math.sqrt(plan.ore.dist2 != null ? plan.ore.dist2 : 0), need: plan.pressure != null ? plan.pressure : 0.5, value: plan.score != null ? plan.score / 100 : 1.0 }
+      features: {
+        optionIndex: decisions.length,
+        distance: Math.sqrt(plan.ore.dist2 != null ? plan.ore.dist2 : 0),
+        need: plan.criticality != null ? plan.criticality / 100 : (plan.pressure != null ? plan.pressure : 0.5),
+        scarcity: plan.scarcity != null ? plan.scarcity : 0,
+        tier: plan.reason != null && plan.reason.tier != null ? plan.reason.tier / 5 : 0.2,
+        value: plan.demand != null ? Math.min(1.5, plan.demand / 100) : 1.0
+      }
     });
   }
   return sortMicroDecisions(decisions);
@@ -5508,6 +5855,9 @@ Events.on(WorldLoadEvent, function(){
   state.gameOverEventSent = false;
   state.contentDemandTick = -9999;
   state.contentDemand = {};
+  state.contentDemandSimple = {};
+  state.contentDemandProfile = {};
+  state.lastEconomicFocus = null;
   state.logicControllers = { ground: null, air: null, naval: null };
   rlSocketClose();
   rlSocket.queue = [];
@@ -5653,6 +6003,7 @@ function runAiLogic() {
 }
 
 function runAiStep(core, team) {
+  var demandProfile = getContentDemandProfile(team, core);
   var enemyCore = findEnemyCore(team);
   var enemies = countEnemyUnits(team);
   var availCopper = availableCoreItems(core, Items.copper);
@@ -5674,6 +6025,17 @@ function runAiStep(core, team) {
   var canLiquidHub = hubBlock != null && coreHasItemsFor(hubBlock, team);
   var canLiquid = canPump || findLiquidHub(team) != null || canLiquidHub;
   var miningPlan = computeMiningPlan(core, team);
+  var topDemandEntry = null;
+  var missingProducers = 0;
+  if (demandProfile != null) {
+    for (var dkey in demandProfile) {
+      if (!demandProfile.hasOwnProperty(dkey)) continue;
+      var dentry = demandProfile[dkey];
+      if (dentry == null || !(dentry.total > 0)) continue;
+      if (dentry.producersBuilt <= 0) missingProducers++;
+      if (topDemandEntry == null || dentry.criticality > topDemandEntry.criticality) topDemandEntry = dentry;
+    }
+  }
   var powerStats = computePowerStatus(team);
   var stageInfo = economyStageInfo(core, team, buckets.ground.size + buckets.air.size + buckets.support.size);
   if (stageInfo == null) stageInfo = { stage: 0, industryFactories: state.factoryBlocks };
@@ -5751,6 +6113,15 @@ function runAiStep(core, team) {
   addAction("rally", attackPlan.shouldRally ? 120 : 0, actionHandlers.rally);
   var mineScore = (canDrill && miningPlan != null ? miningPlan.score : 0);
   mineScore += chainStatus.pressure * 18;
+  if (topDemandEntry != null) {
+    mineScore += topDemandEntry.criticality * 0.45 + topDemandEntry.scarcity * 22;
+    mineScore += missingProducers * 6;
+  }
+  state.lastEconomicFocus = topDemandEntry != null ? {
+    item: topDemandEntry.itemName,
+    reason: topDemandEntry.producersBuilt <= 0 ? "high-demand-low-stock-no-producer" : "high-demand-scarcity",
+    criticality: Math.round(topDemandEntry.criticality * 100) / 100
+  } : null;
   mineScore *= reserveBoost;
   addAction("mine", mineScore, actionHandlers.mine);
   var defendScore = (canDuo ? (enemies > 0 ? 90 : 25) + (state.turretCount < desiredTurrets ? 30 : state.turretCount < config.maxTurrets ? 12 : 0) : 0);
