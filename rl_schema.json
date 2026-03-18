@@ -1,11 +1,14 @@
 {
-  "version": 1,
+  "version": 2,
   "actions": [
     "attackWave",
     "rally",
     "mine",
+    "industry",
     "defend",
     "power",
+    "liquid",
+    "thermal",
     "noop"
   ],
   "features": [
@@ -16,6 +19,38 @@
     {
       "name": "lead",
       "bins": [0, 50, 100, 200, 400, 800]
+    },
+    {
+      "name": "coal",
+      "bins": [0, 25, 50, 100, 200]
+    },
+    {
+      "name": "sand",
+      "bins": [0, 25, 50, 100, 200]
+    },
+    {
+      "name": "graphite",
+      "bins": [0, 10, 25, 50, 100]
+    },
+    {
+      "name": "silicon",
+      "bins": [0, 10, 25, 50, 100]
+    },
+    {
+      "name": "titanium",
+      "bins": [0, 20, 50, 100, 200]
+    },
+    {
+      "name": "plastanium",
+      "bins": [0, 10, 20, 40, 80]
+    },
+    {
+      "name": "industryFactories",
+      "bins": [0, 1, 2, 3, 4]
+    },
+    {
+      "name": "economyStage",
+      "bins": [0.5, 1.5, 2.5, 3.5]
     },
     {
       "name": "drills",
@@ -57,6 +92,14 @@
   "norms": {
     "copper": 1000.0,
     "lead": 1000.0,
+    "coal": 300.0,
+    "sand": 300.0,
+    "graphite": 200.0,
+    "silicon": 200.0,
+    "titanium": 300.0,
+    "plastanium": 120.0,
+    "industryFactories": 5.0,
+    "economyStage": 4.0,
     "drills": 10.0,
     "turrets": 10.0,
     "power": 5.0,
