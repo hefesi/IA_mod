@@ -3,47 +3,15 @@ import json
 import random
 from collections import defaultdict
 
-
-DEFAULT_ACTIONS = ["attackWave", "rally", "mine", "defend", "power", "noop"]
-
-
-def num(d, key):
-    try:
-        return float(d.get(key, 0))
-    except Exception:
-        return 0.0
-
-
-def reward(s, s2):
-    r = 0.0
-    r += 0.005 * (num(s2, "copper") - num(s, "copper"))
-    r += 0.007 * (num(s2, "lead") - num(s, "lead"))
-    r += 2.0 * (num(s2, "drills") - num(s, "drills"))
-    r += 4.0 * (num(s2, "turrets") - num(s, "turrets"))
-    r += 1.5 * (num(s2, "power") - num(s, "power"))
-    r += 6.0 * max(0.0, num(s, "enemies") - num(s2, "enemies"))
-    r -= 1.5 * max(0.0, num(s, "unitsTotal") - num(s2, "unitsTotal"))
-    r += 50.0 * (num(s2, "coreHealthFrac") - num(s, "coreHealthFrac"))
-    if num(s, "enemyCore") == 1 and num(s2, "enemyCore") == 0:
-        r += 200.0
-    if num(s, "corePresent") == 1 and num(s2, "corePresent") == 0:
-        r -= 250.0
-    return r
-
-
-FEATURE_BUCKETS = [
-    ("copper", [0, 50, 100, 200, 400, 800]),
-    ("lead", [0, 50, 100, 200, 400, 800]),
-    ("drills", [0, 1, 2, 3, 4, 5]),
-    ("turrets", [0, 2, 4, 6, 8]),
-    ("power", [0, 1, 2, 3]),
-    ("enemies", [0, 1, 3, 6, 10, 20]),
-    ("unitsTotal", [0, 3, 6, 10, 20, 40]),
-    ("coreHealthFrac", [0.1, 0.25, 0.5, 0.75, 0.9]),
-    ("corePresent", [0.5]),
-    ("enemyCore", [0.5]),
-    ("distEnemy", [5, 10, 20, 40, 80]),
-]
+from rl_common import (
+    DEFAULT_ACTIONS,
+    FEATURE_DEFS,
+    FEATURE_BUCKETS,
+    NORMS,
+    load_transitions,
+    num,
+    reward_from_transition,
+)
 
 
 def bucketize(val, bins):
@@ -61,38 +29,6 @@ def encode_state(s):
     return tuple(key)
 
 
-def iter_transitions(log_path, limit=0):
-    count = 0
-    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            payload = None
-            if "[RL]" in line:
-                payload = line.split("[RL]", 1)[1].strip()
-            else:
-                payload = line.strip()
-            if not payload:
-                continue
-            try:
-                yield json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            count += 1
-            if limit and count >= limit:
-                break
-
-
-def load_transitions(log_path, limit=0):
-    transitions = []
-    actions = set(DEFAULT_ACTIONS)
-    for tr in iter_transitions(log_path, limit=limit):
-        a = tr.get("a", "noop")
-        actions.add(a)
-        transitions.append(tr)
-    action_list = DEFAULT_ACTIONS + sorted(a for a in actions if a not in DEFAULT_ACTIONS)
-    action_index = {a: i for i, a in enumerate(action_list)}
-    return transitions, action_list, action_index
-
-
 def main():
     parser = argparse.ArgumentParser(description="Offline Q-Learning trainer for Mindustry RL logs.")
     parser.add_argument("--log", default="mindustry.log", help="Path to Mindustry log or socket log.")
@@ -104,7 +40,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Max transitions to read (0 = no limit).")
     args = parser.parse_args()
 
-    transitions, action_list, action_index = load_transitions(args.log, limit=args.limit)
+    transitions, action_list, action_index = load_transitions(args.log, limit=args.limit, default_actions=DEFAULT_ACTIONS)
     if not transitions:
         print("no_transitions_found")
         return
@@ -120,7 +56,7 @@ def main():
             s2 = tr.get("s2", {})
             a = tr.get("a", "noop")
             a_idx = action_index.get(a, action_index.get("noop", 0))
-            r = reward(s, s2)
+            r = reward_from_transition(tr)
             total_r += r
 
             key = encode_state(s)
@@ -134,7 +70,8 @@ def main():
 
     out = {
         "actions": action_list,
-        "features": [{"name": name, "bins": bins} for name, bins in FEATURE_BUCKETS],
+        "features": FEATURE_DEFS,
+        "norms": NORMS,
         "q": {",".join(map(str, k)): v for k, v in q.items()},
     }
 

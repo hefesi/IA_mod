@@ -5,10 +5,11 @@ Fluxo:
  1) Sobe scripts/rl_socket_server.py em 127.0.0.1:4567
  2) (Opcional) abre o Mindustry.exe automaticamente
  3) Coleta transições por tempo, quantidade máxima ou até ENTER
- 4) Treina Q-table com scripts/rl_qlearn.py
+ 4) Treina uma policy PPO-style com scripts/rl_ppo.py
+ 5) Exporta a policy para nn_model.json
 
 Uso rápido:
-  .\scripts\train_on_pc.ps1 -Exe "C:\Games\Mindustry\Mindustry.exe" -MindustryArgs "-map maze -mode survival -autoplay"
+  .\scripts\train_on_pc.ps1 -Exe "C:\Games\Mindustry\Mindustry.exe" -MindustryArgs "-map Maze -mode survival -autoplay"
 
 Importante no mod (scripts/ai.js):
   config.rlSocketEnabled = true
@@ -23,7 +24,9 @@ param(
     [int]$MaxTransitions = 0,
     [int]$Epochs = 5,
     [string]$LogFile = "rl_socket.log",
-    [string]$OutQTable = "q_table.json",
+    [string]$OutModel = "ppo_model.pt",
+    [string]$OutMeta = "ppo_meta.json",
+    [string]$OutNNJson = "nn_model.json",
     [switch]$NoWait,
     [switch]$NoLaunch
 )
@@ -100,10 +103,18 @@ if ((Get-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue).State -eq "Runn
     Stop-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue
 }
 
-Write-Host "Treinando Q-table..." -ForegroundColor Cyan
-& $python scripts/rl_qlearn.py --log $LogFile --out $OutQTable --epochs $Epochs
+Write-Host "Treinando policy PPO-style..." -ForegroundColor Cyan
+& $python scripts/rl_ppo.py --log $LogFile --out $OutModel --out-meta $OutMeta --epochs $Epochs
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Falha ao executar rl_qlearn.py"
+    Write-Error "Falha ao executar rl_ppo.py"
+    Remove-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue
+    exit 1
+}
+
+Write-Host "Exportando policy para nn_model.json..." -ForegroundColor Cyan
+& $python scripts/rl_export_nn_json.py --model $OutModel --meta $OutMeta --out $OutNNJson
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Falha ao executar rl_export_nn_json.py"
     Remove-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue
     exit 1
 }
@@ -112,5 +123,7 @@ Remove-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue
 
 Write-Host "\nTreino concluído." -ForegroundColor Green
 Write-Host "Log de transições: $LogFile"
-Write-Host "Q-table gerada:      $OutQTable"
-Write-Host "No mod, confirme config.rlQTableFile/config.rlQTablePath para carregar esse arquivo." -ForegroundColor Green
+Write-Host "Checkpoint PPO:      $OutModel"
+Write-Host "Meta PPO:            $OutMeta"
+Write-Host "Policy exportada:    $OutNNJson"
+Write-Host "No mod, confirme config.rlPolicyMode='nn' e config.rlNNFile/config.rlNNPath para carregar esse arquivo." -ForegroundColor Green

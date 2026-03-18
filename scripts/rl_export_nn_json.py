@@ -49,11 +49,11 @@ def extract_linear_layers(sd, prefix="net"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export PyTorch DQN to Mindustry nn_model.json format.")
+    parser = argparse.ArgumentParser(description="Export PyTorch policy checkpoint to Mindustry nn_model.json format.")
     parser.add_argument("--model", required=True, help="Path to .pt state_dict.")
     parser.add_argument("--meta", required=True, help="Path to meta JSON (actions/features/norms).")
     parser.add_argument("--out", default="nn_model.json", help="Output JSON for the mod.")
-    parser.add_argument("--prefix", default="net", help="State dict prefix for Sequential (default: net).")
+    parser.add_argument("--prefix", default="", help="State dict prefix for the policy head. Defaults to meta.policy_prefix or auto-detect.")
     parser.add_argument("--hidden-act", default="relu", help="Activation for hidden layers (default: relu).")
     args = parser.parse_args()
 
@@ -61,7 +61,14 @@ def main():
     with open(args.meta, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    layers = extract_linear_layers(sd, prefix=args.prefix)
+    prefix = args.prefix or meta.get("policy_prefix") or ""
+    if not prefix:
+        if any(key.startswith("policy_net.") for key in sd.keys()):
+            prefix = "policy_net"
+        else:
+            prefix = "net"
+
+    layers = extract_linear_layers(sd, prefix=prefix)
 
     out_layers = []
     for i, (w, b) in enumerate(layers):
@@ -78,6 +85,9 @@ def main():
 
     payload = {
         "format": "layers-v1",
+        "algorithm": meta.get("algorithm", "policy-network"),
+        "policy": meta.get("policy", "categorical"),
+        "output": meta.get("output", "logits"),
         "readOnly": True,
         "layers": out_layers,
         "features": meta.get("features"),

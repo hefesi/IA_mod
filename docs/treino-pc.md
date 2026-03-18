@@ -17,8 +17,12 @@ No `scripts/ai.js` do mod:
 No PowerShell, dentro do repositório:
 
 ```powershell
-.\scripts\train_on_pc.ps1 -Exe "C:\Users\Asus\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Google Play Games\Mindustry.exe" -MindustryArgs "-map maze -mode survival -autoplay" -Timeout 1800 -Epochs 8
+.\scripts\train_on_pc.ps1 -Exe "C:\Users\Asus\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Google Play Games\Mindustry.exe" -MindustryArgs "-map Maze -mode survival -autoplay" -Timeout 1800 -Epochs 8
 ```
+
+Para curriculo de mapas e randomizacao automatizada de rodadas, hoje o caminho mais simples e confiavel e usar `scripts/train_headless.ps1`.
+
+Quando quiser fixar um mapa aqui, prefira o nome exatamente como o servidor lista no pack `Default`, por exemplo `Maze`, `Fork`, `Archipelago` ou `Wasteland`.
 
 Parâmetros úteis:
 - `-Timeout`: para automaticamente após N segundos sem nova conexão.
@@ -28,17 +32,9 @@ Parâmetros úteis:
 
 ## Saídas
 - Log bruto: `rl_socket.log`
-- Modelo Q-table: `q_table.json`
-
-Depois, aponte `config.rlQTableFile` / `config.rlQTablePath` para a Q-table gerada.
-
-## Exportando modelo DQN para o mod (PyTorch -> JSON)
-
-Se você treinou com `scripts/rl_dqn.py` (saídas: `dqn_model.pt` e `dqn_meta.json`), converta para o formato lido pelo mod:
-
-```powershell
-python .\\scripts\\rl_export_nn_json.py --model dqn_model.pt --meta dqn_meta.json --out nn_model.json
-```
+- Checkpoint PPO-style: `ppo_model.pt`
+- Metadados do treino: `ppo_meta.json`
+- Policy pronta para o mod: `nn_model.json`
 
 Depois, no `scripts/ai.js` do mod:
 - `rlPolicyMode: "nn"`

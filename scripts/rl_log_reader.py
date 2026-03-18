@@ -1,45 +1,5 @@
 import argparse
-import json
-
-
-def num(d, key):
-    try:
-        return float(d.get(key, 0))
-    except Exception:
-        return 0.0
-
-
-def reward(s, s2):
-    r = 0.0
-    r += 0.005 * (num(s2, "copper") - num(s, "copper"))
-    r += 0.007 * (num(s2, "lead") - num(s, "lead"))
-    r += 2.0 * (num(s2, "drills") - num(s, "drills"))
-    r += 4.0 * (num(s2, "turrets") - num(s, "turrets"))
-    r += 1.5 * (num(s2, "power") - num(s, "power"))
-    r += 6.0 * max(0.0, num(s, "enemies") - num(s2, "enemies"))
-    r -= 1.5 * max(0.0, num(s, "unitsTotal") - num(s2, "unitsTotal"))
-    r += 50.0 * (num(s2, "coreHealthFrac") - num(s, "coreHealthFrac"))
-    if num(s, "enemyCore") == 1 and num(s2, "enemyCore") == 0:
-        r += 200.0
-    if num(s, "corePresent") == 1 and num(s2, "corePresent") == 0:
-        r -= 250.0
-    return r
-
-
-def iter_transitions(log_path):
-    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            payload = None
-            if "[RL]" in line:
-                payload = line.split("[RL]", 1)[1].strip()
-            else:
-                payload = line.strip()
-            if not payload:
-                continue
-            try:
-                yield json.loads(payload)
-            except json.JSONDecodeError:
-                continue
+from rl_common import iter_transitions, reward_from_transition
 
 
 def main():
@@ -55,9 +15,7 @@ def main():
     max_r = None
 
     for tr in iter_transitions(args.log):
-        s = tr.get("s", {})
-        s2 = tr.get("s2", {})
-        r = reward(s, s2)
+        r = reward_from_transition(tr)
         if args.print:
             print("t={t} a={a} r={r:.2f}".format(t=tr.get("t"), a=tr.get("a"), r=r))
 

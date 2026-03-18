@@ -58,17 +58,23 @@ var config = {
   rlSocketReconnectTicks: 300,
   rlSocketTimeoutMs: 200,
   rlSocketQueueMax: 200,
-  rlPolicyMode: "hybrid",
+  rlPolicyMode: "nn",
   rlQTableFile: "q_table.json",
   rlQTablePath: "",
   rlQTableReloadTicks: 0,
   rlQTableBlend: 0.7,
   rlNNEnabled: true,
+  rlSchemaFile: "rl_schema.json",
+  rlSchemaPath: "",
   rlNNFile: "nn_model.json",
   rlNNPath: "",
   rlNNHidden: 16,
   rlNNReloadTicks: 0,
-  rlNNSaveInterval: 1800,
+  rlNNBootstrapMissing: false,
+  rlNNFallbackHeuristic: true,
+  rlPolicySample: true,
+  rlPolicyTemperature: 1.0,
+  rlNNSaveInterval: 0,
   rlNNSaveExternal: false,
   rlNNAlpha: 0.01,
   rlNNGamma: 0.9,
@@ -77,7 +83,7 @@ var config = {
   rlEpsilonMin: 0.02,
   rlEpsilonDecay: 0.999,
   rlEpsilonOnlyWhenRL: true,
-  rlOnlineEnabled: true,
+  rlOnlineEnabled: false,
   rlAlpha: 0.12,
   rlGamma: 0.9,
   rlRewardClamp: 120,
@@ -284,23 +290,19 @@ var rlSocket = {
   queue: []
 };
 
+var rlSchemaLastLoadTick = -9999;
+var rlSchemaLastErrorTick = -9999;
 var rlQTable = null;
-var rlQMeta = {
-  actions: ["attackWave", "rally", "mine", "defend", "power", "noop"],
-  features: [
-    { name: "copper", bins: [0, 50, 100, 200, 400, 800] },
-    { name: "lead", bins: [0, 50, 100, 200, 400, 800] },
-    { name: "drills", bins: [0, 1, 2, 3, 4, 5] },
-    { name: "turrets", bins: [0, 2, 4, 6, 8] },
-    { name: "power", bins: [0, 1, 2, 3] },
-    { name: "enemies", bins: [0, 1, 3, 6, 10, 20] },
-    { name: "unitsTotal", bins: [0, 3, 6, 10, 20, 40] },
-    { name: "coreHealthFrac", bins: [0.1, 0.25, 0.5, 0.75, 0.9] },
-    { name: "corePresent", bins: [0.5] },
-    { name: "enemyCore", bins: [0.5] },
-    { name: "distEnemy", bins: [5, 10, 20, 40, 80] }
-  ]
-};
+
+function emptyRLMeta() {
+  return {
+    actions: [],
+    features: [],
+    norms: {}
+  };
+}
+
+var rlQMeta = emptyRLMeta();
 var rlQTableLastLoadTick = -9999;
 var rlQTableLastErrorTick = -9999;
 var aiHud = {
@@ -312,6 +314,88 @@ var aiHud = {
 
 function rlSocketConnected() {
   return rlSocket.sock != null && rlSocket.out != null;
+}
+
+function hasBucketizedFeatures(features) {
+  if (features == null || features.length == null || features.length == 0) return false;
+  try {
+    return features[0] != null && features[0].name != null && features[0].bins != null && features[0].bins.length != null;
+  } catch (e) {
+    return false;
+  }
+}
+
+function applyRLMeta(data) {
+  if (data == null) return false;
+  var changed = false;
+  if (data.actions != null && data.actions.length != null) {
+    rlQMeta.actions = data.actions;
+    changed = true;
+  }
+  // Keep bucketized state features separate from NN feature-name lists.
+  if (hasBucketizedFeatures(data.features)) {
+    rlQMeta.features = data.features;
+    changed = true;
+  }
+  if (data.norms != null) {
+    rlQMeta.norms = data.norms;
+    changed = true;
+  }
+  return changed;
+}
+
+function resolveSchemaFi() {
+  if (config.rlSchemaPath != null && config.rlSchemaPath != "") {
+    try {
+      return new Fi(config.rlSchemaPath);
+    } catch (e) {
+      return null;
+    }
+  }
+  try {
+    var mod = Vars.mods.getMod(config.modName);
+    if (mod != null && mod.root != null) {
+      return mod.root.child(config.rlSchemaFile);
+    }
+  } catch (e2) {
+    // ignore
+  }
+  try {
+    return new Fi(config.rlSchemaFile);
+  } catch (e3) {
+    return null;
+  }
+}
+
+function loadRLSchema(force) {
+  if (!force && rlQMeta.actions != null && rlQMeta.actions.length > 0 && rlQMeta.features != null && rlQMeta.features.length > 0) {
+    return true;
+  }
+  var fi = resolveSchemaFi();
+  if (fi == null || !fi.exists()) {
+    if ((state.tick - rlSchemaLastErrorTick) > 600) {
+      Log.info("[RL] Schema nao encontrado: " + config.rlSchemaFile);
+      rlSchemaLastErrorTick = state.tick;
+    }
+    return false;
+  }
+  try {
+    var text = fi.readString();
+    var data = JSON.parse(String(text));
+    if (!applyRLMeta(data) || rlQMeta.features.length == 0) {
+      Log.info("[RL] Schema invalido.");
+      return false;
+    }
+    rlSchemaLastLoadTick = state.tick;
+    Log.info("[RL] Schema carregado: " + fi.absolutePath());
+    return true;
+  } catch (e4) {
+    if ((state.tick - rlSchemaLastErrorTick) > 600) {
+      Log.info("[RL] Erro ao carregar schema RL.");
+      rlSchemaLastErrorTick = state.tick;
+    }
+    return false;
+  }
 }
 
 function rlSocketClose() {
@@ -1068,6 +1152,7 @@ function resolveQTableFi() {
 }
 
 function loadQTable() {
+  loadRLSchema(false);
   var fi = resolveQTableFi();
   if (fi == null || !fi.exists()) {
     if ((state.tick - rlQTableLastErrorTick) > 600) {
@@ -1081,8 +1166,7 @@ function loadQTable() {
     var text = fi.readString();
     var data = JSON.parse(String(text));
     rlQTable = data.q != null ? data.q : null;
-    if (data.actions != null && data.actions.length != null) rlQMeta.actions = data.actions;
-    if (data.features != null && data.features.length != null) rlQMeta.features = data.features;
+    applyRLMeta(data);
     if (rlQTable == null) {
       Log.info("[RL] Q-table invalida (sem chave 'q').");
       return false;
@@ -1162,14 +1246,14 @@ function loadNNModel() {
   if (!config.rlNNEnabled) return false;
   if (config.rlPolicyMode != "nn") return false;
   if (state.nnModel != null && config.rlNNReloadTicks > 0 && (state.tick - state.nnLastLoadTick) < config.rlNNReloadTicks) return true;
+  loadRLSchema(false);
   var fi = resolveNNFi();
   if (fi == null || !fi.exists()) {
     if ((state.tick - state.nnLastErrorTick) > 600) {
       Log.info("[RL] NN model nao encontrado: " + config.rlNNFile);
       state.nnLastErrorTick = state.tick;
     }
-    // Initialize a new model if we have features/actions.
-    if (rlQMeta && rlQMeta.features && rlQMeta.actions) {
+    if (config.rlNNBootstrapMissing && rlQMeta && rlQMeta.features && rlQMeta.actions) {
       state.nnModel = initializeNNModel(rlQMeta.features, rlQMeta.actions);
       state.nnLastLoadTick = state.tick;
       return true;
@@ -1181,11 +1265,13 @@ function loadNNModel() {
     var text = fi.readString();
     var data = JSON.parse(String(text));
     if (data == null) throw "invalid";
-    if (data.features != null) rlQMeta.features = data.features;
-    if (data.actions != null) rlQMeta.actions = data.actions;
+    applyRLMeta(data);
     if (data.layers != null && data.readOnly == null) data.readOnly = true;
+    if (data.algorithm == "ppo-style" && data.policy == null) data.policy = "categorical";
+    if (data.algorithm == "ppo-style" && data.output == null) data.output = "logits";
     if (data.features == null && rlQMeta.features != null) data.features = rlQMeta.features;
     if (data.actions == null && rlQMeta.actions != null) data.actions = rlQMeta.actions;
+    if (data.norms == null && rlQMeta.norms != null) data.norms = rlQMeta.norms;
     if (data.inputSize == null && data.features != null) data.inputSize = data.features.length;
     if (data.outputSize == null && data.actions != null) data.outputSize = data.actions.length;
     state.nnModel = data;
@@ -1321,6 +1407,89 @@ function nnScoresForState(stateObj) {
   return scores;
 }
 
+function nnUsesPolicySampling() {
+  if (config.rlPolicyMode != "nn") return false;
+  if (!config.rlPolicySample) return false;
+  if (state.nnModel == null) return false;
+  if (state.nnModel.policy == "categorical") return true;
+  if (state.nnModel.output == "logits" || state.nnModel.output == "probs") return true;
+  return state.nnModel.algorithm == "ppo-style";
+}
+
+function softmaxValues(values, temperature) {
+  if (values == null || values.length == 0) return [];
+  var temp = temperature != null ? temperature : 1;
+  if (temp <= 0) temp = 1;
+  var maxv = values[0];
+  for (var i = 1; i < values.length; i++) {
+    if (values[i] > maxv) maxv = values[i];
+  }
+  var exps = [];
+  var sum = 0;
+  for (var j = 0; j < values.length; j++) {
+    var e = Math.exp((values[j] - maxv) / temp);
+    if (!(e >= 0)) e = 0;
+    exps.push(e);
+    sum += e;
+  }
+  if (sum <= 0) {
+    var uniform = [];
+    for (var k = 0; k < values.length; k++) uniform.push(1 / values.length);
+    return uniform;
+  }
+  for (var m = 0; m < exps.length; m++) exps[m] = exps[m] / sum;
+  return exps;
+}
+
+function sampleWeightedIndex(weights) {
+  if (weights == null || weights.length == 0) return -1;
+  var r = Math.random();
+  var acc = 0;
+  for (var i = 0; i < weights.length; i++) {
+    acc += weights[i];
+    if (r <= acc) return i;
+  }
+  return weights.length - 1;
+}
+
+function pickPolicyOrder(actions) {
+  if (actions == null || actions.length == 0) return actions;
+  var model = state.nnModel;
+  if (model == null) return actions;
+  var remaining = [];
+  for (var i = 0; i < actions.length; i++) remaining.push(actions[i]);
+  var ordered = [];
+  var outputKind = model.output != null ? model.output : "logits";
+  var temperature = config.rlPolicyTemperature != null ? config.rlPolicyTemperature : 1.0;
+
+  while (remaining.length > 0) {
+    var weights = [];
+    if (outputKind == "probs") {
+      var probSum = 0;
+      for (var j = 0; j < remaining.length; j++) {
+        var p = remaining[j].score;
+        if (!(p > 0)) p = 0;
+        weights.push(p);
+        probSum += p;
+      }
+      if (probSum <= 0) {
+        for (var j2 = 0; j2 < remaining.length; j2++) weights[j2] = 1 / remaining.length;
+      } else {
+        for (var j3 = 0; j3 < weights.length; j3++) weights[j3] = weights[j3] / probSum;
+      }
+    } else {
+      var logits = [];
+      for (var k = 0; k < remaining.length; k++) logits.push(remaining[k].score);
+      weights = softmaxValues(logits, temperature);
+    }
+    var idx = sampleWeightedIndex(weights);
+    if (idx < 0) break;
+    ordered.push(remaining[idx]);
+    remaining.splice(idx, 1);
+  }
+  return ordered.length > 0 ? ordered : actions;
+}
+
 function updateNNModel(prevState, actionName, nextState, reward) {
   if (!config.rlNNEnabled) return false;
   if (state.nnModel == null) return false;
@@ -1409,8 +1578,13 @@ function encodeStateKey(stateObj, features) {
   var key = [];
   for (var i = 0; i < features.length; i++) {
     var f = features[i];
-    var name = f.name;
-    var bins = f.bins;
+    var name = featureName(f);
+    var bins = [];
+    try {
+      if (f != null && f.bins != null && f.bins.length != null) bins = f.bins;
+    } catch (e) {
+      bins = [];
+    }
     var val = stateObj[name];
     if (val == null) val = 0;
     key.push(bucketize(val, bins));
@@ -1538,7 +1712,8 @@ function saveQTable() {
     var payload = {
       q: rlQTable,
       actions: rlQMeta.actions,
-      features: rlQMeta.features
+      features: rlQMeta.features,
+      norms: rlQMeta.norms
     };
     var text = JSON.stringify(payload);
     fi.parent().mkdirs();
@@ -1780,6 +1955,8 @@ function applyStrategyScore(name, score, strategy) {
 function shouldUseEpsilon() {
   if (!config.rlEpsilonEnabled) return false;
   if (config.rlEpsilonOnlyWhenRL && config.rlPolicyMode == "heuristic") return false;
+  if (nnUsesPolicySampling()) return false;
+  if (config.rlPolicyMode == "nn" && state.nnModel == null) return false;
   return true;
 }
 
@@ -2988,6 +3165,18 @@ function rankActions(actions) {
   return ranked;
 }
 
+function policyReadyActions(actions) {
+  var ready = [];
+  for (var i = 0; i < actions.length; i++) {
+    var a = actions[i];
+    if (!actionReady(a.name)) continue;
+    var score = a.score - recentPenalty(a.name);
+    if (score <= -999998) continue;
+    ready.push({ name: a.name, score: score, run: a.run });
+  }
+  return ready;
+}
+
 Events.on(WorldLoadEvent, function(){
   state.built = false;
   state.lastMode = "";
@@ -3025,6 +3214,9 @@ Events.on(WorldLoadEvent, function(){
   state.logicControllers = { ground: null, air: null, naval: null };
   rlSocketClose();
   rlSocket.queue = [];
+  rlQMeta = emptyRLMeta();
+  rlSchemaLastLoadTick = -9999;
+  rlSchemaLastErrorTick = -9999;
   rlQTable = null;
   rlQTableLastLoadTick = -9999;
   rlQTableLastErrorTick = -9999;
@@ -3034,7 +3226,9 @@ Events.on(WorldLoadEvent, function(){
   aiHud.debugLabel = null;
   aiHud.useIcon = false;
   ensureHudButton();
-  if (config.rlPolicyMode != "heuristic") loadQTable();
+  loadRLSchema(true);
+  if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") loadQTable();
+  if (config.rlPolicyMode == "nn") loadNNModel();
   Log.info("[IA] Mundo carregado. Preparando plano de base.");
 });
 
@@ -3202,7 +3396,7 @@ function runAiStep(core, team) {
   var applyStrategyNow = !(config.strategyAffectsRL && config.rlPolicyMode != "heuristic");
   var addAction = function(name, score, run){
     var s = applyStrategyNow ? applyStrategyScore(name, score, strategy) : score;
-    actions.push({ name: name, score: s, run: run });
+    actions.push({ name: name, baseScore: s, score: s, run: run });
   };
   var thermalScore = (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0);
   thermalScore *= reservePenalty;
@@ -3246,9 +3440,13 @@ function runAiStep(core, team) {
       if (nnScores != null) {
         for (var qi2 = 0; qi2 < actions.length; qi2++) {
           var act2 = actions[qi2];
+          if (act2.baseScore <= 0 && act2.name != "noop") {
+            act2.score = -999999;
+            continue;
+          }
           var nnv = nnScores[act2.name];
           if (nnv == null) {
-            act2.score = 0;
+            if (!config.rlNNFallbackHeuristic) act2.score = -999999;
             continue;
           }
           act2.score = nnv;
@@ -3265,7 +3463,9 @@ function runAiStep(core, team) {
   }
 
   var ranked = rankActions(actions);
-  var pickedList = pickExploreOrder(ranked);
+  var policyActions = nnUsesPolicySampling() ? policyReadyActions(actions) : null;
+  var pickedList = nnUsesPolicySampling() ? pickPolicyOrder(policyActions) : pickExploreOrder(ranked);
+  if ((pickedList == null || pickedList.length == 0) && ranked != null && ranked.length > 0) pickedList = ranked;
   var pickedName = "noop";
   state.lastAction = "none";
   state.lastActionOk = false;

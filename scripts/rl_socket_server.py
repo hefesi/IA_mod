@@ -3,29 +3,7 @@ import json
 import socket
 import time
 
-
-def num(d, key):
-    try:
-        return float(d.get(key, 0))
-    except Exception:
-        return 0.0
-
-
-def reward(s, s2):
-    r = 0.0
-    r += 0.005 * (num(s2, "copper") - num(s, "copper"))
-    r += 0.007 * (num(s2, "lead") - num(s, "lead"))
-    r += 2.0 * (num(s2, "drills") - num(s, "drills"))
-    r += 4.0 * (num(s2, "turrets") - num(s, "turrets"))
-    r += 1.5 * (num(s2, "power") - num(s, "power"))
-    r += 6.0 * max(0.0, num(s, "enemies") - num(s2, "enemies"))
-    r -= 1.5 * max(0.0, num(s, "unitsTotal") - num(s2, "unitsTotal"))
-    r += 50.0 * (num(s2, "coreHealthFrac") - num(s, "coreHealthFrac"))
-    if num(s, "enemyCore") == 1 and num(s2, "enemyCore") == 0:
-        r += 200.0
-    if num(s, "corePresent") == 1 and num(s2, "corePresent") == 0:
-        r -= 250.0
-    return r
+from rl_common import reward_from_transition
 
 
 def handle_connection(conn, addr, out_path, verbose, max_transitions=0):
@@ -51,7 +29,7 @@ def handle_connection(conn, addr, out_path, verbose, max_transitions=0):
                     tr = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                r = reward(tr.get("s", {}), tr.get("s2", {}))
+                r = reward_from_transition(tr)
                 count += 1
                 total += r
                 if verbose:
