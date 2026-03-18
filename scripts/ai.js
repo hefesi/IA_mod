@@ -90,6 +90,13 @@ var config = {
   rlNNBootstrapMissing: false,
   rlNNFallbackHeuristic: true,
   rlNNHeuristicAssist: true,
+  rlMicroPolicyEnabled: true,
+  rlMicroPolicyDir: "micro_policies",
+  rlMicroPolicyFilePattern: "micro_{action}.json",
+  rlMicroPolicyReloadTicks: 0,
+  rlMicroPolicyBootstrapMissing: false,
+  rlMicroHeuristicBlend: 0.15,
+  rlMicroLogCandidates: true,
   rlPolicySample: true,
   rlPolicyTemperature: 1.0,
   rlNNSaveInterval: 0,
@@ -390,6 +397,10 @@ var state = {
   nnLastLoadTick: -9999,
   nnLastSaveTick: -9999,
   nnLastErrorTick: -9999,
+  microPolicies: {},
+  microLastLoadTicks: {},
+  microLastErrorTicks: {},
+  pendingMicroTransition: null,
   rlEpsilon: -1,
   lastRLState: null,
   gameOverEventSent: false,
@@ -399,7 +410,8 @@ var state = {
     ground: null,
     air: null,
     naval: null
-  }
+  },
+  lastMicroReward: 0
 };
 
 // --- RL logging helpers (offline training via logs) ---
@@ -722,7 +734,22 @@ function snapshotState(core, enemyCore, enemies, team) {
 }
 
 function emitTransition(prevState, actionName, nextState, info) {
-  var payload = { s: prevState, a: actionName, s2: nextState, info: info, t: state.tick };
+  var payload = { type: "transition", s: prevState, a: actionName, s2: nextState, info: info, t: state.tick };
+  var line = JSON.stringify(payload);
+  if (config.rlLogEnabled) Log.info("[RL]" + line);
+  rlSocketSend(line);
+}
+
+function emitMicroTransition(prevState, policyName, decisionName, nextState, info) {
+  var payload = {
+    type: "micro",
+    policy: policyName,
+    a: decisionName,
+    s: prevState,
+    s2: nextState,
+    info: info != null ? info : {},
+    t: state.tick
+  };
   var line = JSON.stringify(payload);
   if (config.rlLogEnabled) Log.info("[RL]" + line);
   rlSocketSend(line);
@@ -897,6 +924,7 @@ function updateHudDebug() {
     epsText +
     " built:" + (state.built ? "1" : "0") +
     " r:" + Math.round(state.lastReward * 100) / 100 +
+    " mr:" + Math.round(state.lastMicroReward * 100) / 100 +
     " tick:" + state.tick +
     " last:" + (state.lastAction == "" ? "-" : state.lastAction) +
     " micro:" + (state.lastMicroAction == "" ? "-" : state.lastMicroAction) +
@@ -2153,6 +2181,123 @@ function loadNNModel() {
   }
 }
 
+function microPolicyDefaultFeatures() {
+  var out = [
+    "enemyCount",
+    "unitsTotal",
+    "economyStage",
+    "reservePressure",
+    "chainPressure",
+    "chainCoverage",
+    "powerPressure",
+    "liquidPressure",
+    "defensePressure"
+  ];
+  for (var i = 0; i < 8; i++) {
+    out.push("opt" + i + "Score");
+    out.push("opt" + i + "Need");
+    out.push("opt" + i + "Risk");
+    out.push("opt" + i + "Value");
+    out.push("opt" + i + "Dist");
+    out.push("opt" + i + "Enabled");
+  }
+  return out;
+}
+
+function microPolicyDefaultActions(actionName) {
+  if (actionName == "mine") return ["ensure-0", "ensure-1", "ensure-2", "ensure-3", "ore-plan"];
+  if (actionName == "defend") return ["slot-0", "slot-1", "slot-2", "slot-3", "slot-4", "slot-5", "slot-6", "slot-7"];
+  if (actionName == "industry") return ["module-0", "module-1", "module-2", "mine-input-0", "mine-input-1", "mine-input-2", "expand-factory", "upgrade-economy"];
+  if (actionName == "attackWave") return ["commit-wave"];
+  if (actionName == "rally") return ["rally-force"];
+  if (actionName == "power") return ["cluster-0", "cluster-1", "cluster-2", "cluster-3"];
+  if (actionName == "thermal") return ["heat-spot-0"];
+  if (actionName == "liquid") return ["source-0", "source-1", "source-2", "source-3"];
+  return ["default"];
+}
+
+function initializeMicroPolicyModel(actionName) {
+  var features = microPolicyDefaultFeatures();
+  var actions = microPolicyDefaultActions(actionName);
+  var hiddenSize = config.rlNNHidden || 16;
+  var model = {
+    policy: actionName,
+    inputSize: features.length,
+    hiddenSize: hiddenSize,
+    outputSize: actions.length,
+    features: features,
+    actions: actions,
+    w1: [],
+    b1: [],
+    w2: [],
+    b2: []
+  };
+  var scale = 0.1;
+  for (var i = 0; i < hiddenSize * features.length; i++) model.w1.push((Math.random() * 2 - 1) * scale);
+  for (var j = 0; j < hiddenSize; j++) model.b1.push(0);
+  for (var k = 0; k < hiddenSize * actions.length; k++) model.w2.push((Math.random() * 2 - 1) * scale);
+  for (var m = 0; m < actions.length; m++) model.b2.push(0);
+  return model;
+}
+
+function resolveMicroPolicyFi(actionName) {
+  if (actionName == null || actionName == "") return null;
+  var fileName = String(config.rlMicroPolicyFilePattern || "micro_{action}.json").replace("{action}", actionName);
+  try {
+    if (config.rlMicroPolicyDir != null && config.rlMicroPolicyDir != "") {
+      var mod = Vars.mods.getMod(config.modName);
+      if (mod != null && mod.root != null) return mod.root.child(config.rlMicroPolicyDir).child(fileName);
+    }
+  } catch (e) {
+    // ignore
+  }
+  try {
+    return new Fi(fileName);
+  } catch (e2) {
+    return null;
+  }
+}
+
+function loadMicroPolicyModel(actionName) {
+  if (!config.rlMicroPolicyEnabled) return null;
+  if (actionName == null || actionName == "") return null;
+  var cached = state.microPolicies[actionName];
+  var lastLoad = state.microLastLoadTicks[actionName];
+  if (cached != null && config.rlMicroPolicyReloadTicks > 0 && (state.tick - lastLoad) < config.rlMicroPolicyReloadTicks) return cached;
+  var fi = resolveMicroPolicyFi(actionName);
+  if (fi == null || !fi.exists()) {
+    if ((state.tick - (state.microLastErrorTicks[actionName] || -9999)) > 600) {
+      Log.info("[RL] Micro policy nao encontrada: " + actionName);
+      state.microLastErrorTicks[actionName] = state.tick;
+    }
+    if (config.rlMicroPolicyBootstrapMissing) {
+      cached = initializeMicroPolicyModel(actionName);
+      state.microPolicies[actionName] = cached;
+      state.microLastLoadTicks[actionName] = state.tick;
+      return cached;
+    }
+    state.microPolicies[actionName] = null;
+    return null;
+  }
+  try {
+    var text = fi.readString();
+    var data = JSON.parse(String(text));
+    if (data == null) throw "invalid";
+    if (data.features == null) data.features = microPolicyDefaultFeatures();
+    if (data.actions == null) data.actions = microPolicyDefaultActions(actionName);
+    if (data.inputSize == null) data.inputSize = data.features.length;
+    if (data.outputSize == null) data.outputSize = data.actions.length;
+    if (data.policy == null) data.policy = actionName;
+    state.microPolicies[actionName] = data;
+    state.microLastLoadTicks[actionName] = state.tick;
+    return data;
+  } catch (e3) {
+    state.microPolicies[actionName] = null;
+    state.microLastErrorTicks[actionName] = state.tick;
+    return null;
+  }
+}
+
 function tanh(x) {
   if (Math.tanh != null) return Math.tanh(x);
   var ex = Math.exp(x);
@@ -2243,6 +2388,66 @@ function normalizeInput(model, input, features) {
     out.push(v);
   }
   return out;
+}
+
+function decisionLabel(actionName, decision) {
+  if (actionName == null) actionName = "unknown";
+  if (decision == null) return actionName + "/default";
+  var parts = [actionName, decision.actionId != null ? decision.actionId : (decision.kind != null ? decision.kind : "default")];
+  if (decision.itemName != null) parts.push(decision.itemName);
+  else if (decision.module != null) parts.push(decision.module);
+  else if (decision.block != null && decision.block.name != null) parts.push(decision.block.name);
+  if (decision.x != null && decision.y != null) parts.push(decision.x + "," + decision.y);
+  return parts.join("/");
+}
+
+function clampMetric(v) {
+  if (v == null || isNaN(v)) return 0;
+  if (v > 10) return 10;
+  if (v < -10) return -10;
+  return v;
+}
+
+function buildMicroPolicyState(actionName, ctx, decisions) {
+  var snap = ctx != null ? ctx.beforeState : null;
+  var out = {
+    enemyCount: clampMetric((snap != null ? snap.enemies : 0) / 20),
+    unitsTotal: clampMetric((snap != null ? snap.unitsTotal : 0) / 40),
+    economyStage: clampMetric((snap != null ? snap.economyStage : 0) / 5),
+    reservePressure: clampMetric(snap != null ? snap.economicPressure : 0),
+    chainPressure: clampMetric(snap != null ? snap.chainPressure : 0),
+    chainCoverage: clampMetric(snap != null ? snap.chainCoverage : 0),
+    powerPressure: clampMetric(snap != null ? snap.powerPressure : 0),
+    liquidPressure: clampMetric(snap != null ? snap.liquidPressure : 0),
+    defensePressure: clampMetric(snap != null ? snap.defensePressure : 0)
+  };
+  for (var i = 0; i < 8; i++) {
+    var decision = decisions != null && decisions.length > i ? decisions[i] : null;
+    var features = decision != null && decision.features != null ? decision.features : {};
+    out["opt" + i + "Score"] = clampMetric((decision != null && decision.score != null ? decision.score : 0) / 100);
+    out["opt" + i + "Need"] = clampMetric(features.need != null ? features.need : 0);
+    out["opt" + i + "Risk"] = clampMetric(features.risk != null ? features.risk : 0);
+    out["opt" + i + "Value"] = clampMetric(features.value != null ? features.value : 0);
+    out["opt" + i + "Dist"] = clampMetric(features.distance != null ? features.distance / 20 : 0);
+    out["opt" + i + "Enabled"] = decision != null ? 1 : 0;
+  }
+  return out;
+}
+
+function microPolicyScores(actionName, ctx, decisions) {
+  var model = loadMicroPolicyModel(actionName);
+  if (model == null || model.features == null || model.actions == null || decisions == null || decisions.length == 0) return null;
+  var stateObj = buildMicroPolicyState(actionName, ctx, decisions);
+  var prev = state.nnModel;
+  state.nnModel = model;
+  var fwd = nnForward(stateObj);
+  state.nnModel = prev;
+  if (fwd == null || fwd.output == null || fwd.output.length == 0) return null;
+  var scores = {};
+  for (var i = 0; i < model.actions.length && i < fwd.output.length; i++) {
+    scores[model.actions[i]] = fwd.output[i];
+  }
+  return scores;
 }
 
 function nnForwardLayers(model, input) {
@@ -4730,7 +4935,7 @@ function actionAttackWave(core, enemyCore) {
   return waveIds.size > 0;
 }
 
-function buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan) {
+function buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan, beforeState) {
   return {
     core: core,
     team: team,
@@ -4744,7 +4949,8 @@ function buildMacroActionContext(core, team, enemyCore, enemies, buckets, attack
     chainStatus: chainStatus,
     ammoProfile: ammoProfile,
     strategy: strategy,
-    industryPlan: industryPlan
+    industryPlan: industryPlan,
+    beforeState: beforeState
   };
 }
 
@@ -4764,26 +4970,59 @@ function markMicroDecision(actionName, decision) {
   state.lastMicroAction = actionName + ":" + kind;
 }
 
+function selectMicroDecision(actionName, ctx, decisions) {
+  if (decisions == null || decisions.length == 0) return null;
+  var blend = config.rlMicroHeuristicBlend != null ? config.rlMicroHeuristicBlend : 0.15;
+  if (blend < 0) blend = 0;
+  if (blend > 1) blend = 1;
+  var learnedScores = microPolicyScores(actionName, ctx, decisions);
+  var scored = [];
+  for (var i = 0; i < decisions.length; i++) {
+    var decision = decisions[i];
+    if (decision == null) continue;
+    var heuristicScore = decision.score != null ? decision.score : 0;
+    var actionId = decision.actionId != null ? decision.actionId : null;
+    var learnedScore = (learnedScores != null && actionId != null && learnedScores[actionId] != null) ? learnedScores[actionId] : null;
+    var finalScore = heuristicScore;
+    if (learnedScore != null) {
+      finalScore = learnedScore * (1 - blend) + heuristicScore * blend;
+    }
+    scored.push({
+      decision: decision,
+      heuristicScore: heuristicScore,
+      learnedScore: learnedScore,
+      finalScore: finalScore
+    });
+  }
+  scored.sort(function(a, b){ return b.finalScore - a.finalScore; });
+  if (scored.length == 0) return null;
+  return {
+    picked: scored[0].decision,
+    scored: scored
+  };
+}
+
 function chooseMineMicroDecision(ctx) {
   var core = ctx != null ? ctx.core : null;
   var team = ctx != null ? ctx.team : getTeam();
   var decisions = [];
   var priority = priorityMineItems(core, team);
-  for (var i = 0; i < priority.length; i++) {
+  for (var i = 0; i < priority.length && i < 4; i++) {
     var item = priority[i];
     if (item == null || item.name == null) continue;
-    decisions.push({ kind: "ensure-item", score: 160 - i * 10, itemName: item.name });
+    decisions.push({ actionId: "ensure-" + i, kind: "ensure-item", score: 160 - i * 10, itemName: item.name, features: { optionIndex: i, need: 1.2 - i * 0.08, value: 1.0 } });
   }
   var plan = ctx != null ? ctx.miningPlan : null;
   if (plan != null && plan.ore != null) {
     decisions.push({
       kind: "ore",
+      actionId: "ore-plan",
       score: plan.score != null ? plan.score : 120,
-      plan: plan
+      plan: plan,
+      features: { optionIndex: decisions.length, distance: Math.sqrt(plan.ore.dist2 != null ? plan.ore.dist2 : 0), need: plan.pressure != null ? plan.pressure : 0.5, value: plan.score != null ? plan.score / 100 : 1.0 }
     });
   }
-  decisions = sortMicroDecisions(decisions);
-  return decisions.length > 0 ? decisions[0] : null;
+  return sortMicroDecisions(decisions);
 }
 
 function executeMineMicroDecision(ctx, decision) {
@@ -4837,10 +5076,23 @@ function chooseDefendMicroDecision(ctx) {
       var towardEnemy = ddx * ddx + ddy * ddy;
       score += 30 / Math.max(1, Math.sqrt(towardEnemy));
     }
-    out.push({ kind: "turret-slot", score: score, turret: turret, x: off.x, y: off.y });
+    out.push({
+      kind: "turret-slot",
+      actionId: "slot-" + i,
+      score: score,
+      turret: turret,
+      x: off.x,
+      y: off.y,
+      features: {
+        optionIndex: i,
+        distance: Math.sqrt(pick.dx * pick.dx + pick.dy * pick.dy),
+        need: ctx.enemies > 0 ? 1 : 0.4,
+        risk: ctx.enemyCore != null ? 0.3 : 0.1,
+        value: score / 100
+      }
+    });
   }
-  out = sortMicroDecisions(out);
-  return out.length > 0 ? out[0] : null;
+  return sortMicroDecisions(out);
 }
 
 function executeDefendMicroDecision(ctx, decision) {
@@ -4855,11 +5107,13 @@ function chooseIndustryMicroDecision(ctx) {
   var core = ctx.core;
   var team = ctx.team;
   var decisions = [];
+  var usedActionIds = {};
   var needs = rankIndustryNeeds(core, team);
   for (var i = 0; i < needs.length && i < 3; i++) {
     var need = needs[i];
     if (need == null) continue;
-    decisions.push({ kind: "module", score: 120 + need.score, module: need.name });
+    decisions.push({ actionId: "module-" + i, kind: "module", score: 120 + need.score, module: need.name, features: { optionIndex: i, need: need.score / 100, value: 1.2 } });
+    usedActionIds["module-" + i] = true;
     var def = need.def;
     if (def != null && def.inputs != null) {
       for (var j = 0; j < def.inputs.length; j++) {
@@ -4868,17 +5122,20 @@ function chooseIndustryMicroDecision(ctx) {
         if (item == null) continue;
         var inputTarget = industryInputTarget(need.name, input.name);
         if (countDrillsForItem(team, item) <= 0 || coreItemCount(core, item) < inputTarget) {
-          decisions.push({ kind: "mine-input", score: 110 + need.score * 0.8, itemName: input.name, module: need.name });
+          var inputIdx = Math.min(2, j);
+          var inputActionId = "mine-input-" + inputIdx;
+          if (usedActionIds[inputActionId] === true) continue;
+          decisions.push({ actionId: inputActionId, kind: "mine-input", score: 110 + need.score * 0.8, itemName: input.name, module: need.name, features: { optionIndex: decisions.length, need: need.score / 100, value: 0.9 } });
+          usedActionIds[inputActionId] = true;
         }
       }
     }
   }
   if (ctx.industryPlan != null && ctx.industryPlan.block != null) {
-    decisions.push({ kind: "expand-factory", score: 100 + ctx.industryPlan.score, block: ctx.industryPlan.block });
+    decisions.push({ actionId: "expand-factory", kind: "expand-factory", score: 100 + ctx.industryPlan.score, block: ctx.industryPlan.block, features: { optionIndex: decisions.length, need: ctx.industryPlan.score / 100, value: 1.1 } });
   }
-  decisions.push({ kind: "upgrade-economy", score: 70 + (ctx.stageInfo != null ? ctx.stageInfo.stage * 5 : 0) });
-  decisions = sortMicroDecisions(decisions);
-  return decisions.length > 0 ? decisions[0] : null;
+  decisions.push({ actionId: "upgrade-economy", kind: "upgrade-economy", score: 70 + (ctx.stageInfo != null ? ctx.stageInfo.stage * 5 : 0), features: { optionIndex: decisions.length, need: 0.5, value: 0.8 } });
+  return sortMicroDecisions(decisions);
 }
 
 function executeIndustryMicroDecision(ctx, decision) {
@@ -4897,12 +5154,14 @@ function chooseAttackWaveMicroDecision(ctx) {
   if (!(canWave && cooled && ctx.attackPlan.canCommit)) return null;
   var waveIds = collectWaveIds(ctx.buckets);
   if (waveIds.size <= 0) return null;
-  return {
+  return [{
     kind: "commit-wave",
+    actionId: "commit-wave",
     score: 100 + waveIds.size + (ctx.attackPlan.friendlyForce != null ? ctx.attackPlan.friendlyForce : 0),
     waveIds: waveIds,
-    target: new Vec2(ctx.enemyCore.x, ctx.enemyCore.y)
-  };
+    target: new Vec2(ctx.enemyCore.x, ctx.enemyCore.y),
+    features: { optionIndex: 0, need: ctx.attackPlan.canCommit ? 1 : 0, risk: ctx.attackPlan.enemyTurrets != null ? ctx.attackPlan.enemyTurrets / 10 : 0, value: waveIds.size / 10 }
+  }];
 }
 
 function executeAttackWaveMicroDecision(ctx, decision) {
@@ -4918,12 +5177,14 @@ function chooseRallyMicroDecision(ctx) {
   if (ctx == null || ctx.core == null || ctx.enemyCore == null || ctx.buckets == null) return null;
   var rallyIds = collectRallyIds(ctx.buckets);
   if (rallyIds.size <= 0) return null;
-  return {
+  return [{
     kind: "rally-force",
+    actionId: "rally-force",
     score: 100 + rallyIds.size,
     rallyIds: rallyIds,
-    rallyPoint: getRallyPoint(ctx.core, ctx.enemyCore, config.rallyDistance)
-  };
+    rallyPoint: getRallyPoint(ctx.core, ctx.enemyCore, config.rallyDistance),
+    features: { optionIndex: 0, need: rallyIds.size / 10, value: 0.8 }
+  }];
 }
 
 function executeRallyMicroDecision(ctx, decision) {
@@ -4944,15 +5205,27 @@ function choosePowerMicroDecision(ctx) {
     { dx: 4, dy: -2, score: 92 },
     { dx: -4, dy: -2, score: 88 }
   ];
-  var best = null;
+  var options = [];
   for (var i = 0; i < offsets.length; i++) {
     var off = offsets[i];
     var x = ctx.core.tile.x + off.dx;
     var y = ctx.core.tile.y + off.dy;
-    var cand = { kind: "cluster", score: off.score, x: x, y: y };
-    if (best == null || cand.score > best.score) best = cand;
+    var cand = {
+      kind: "cluster",
+      actionId: "cluster-" + i,
+      score: off.score,
+      x: x,
+      y: y,
+      features: {
+        optionIndex: i,
+        distance: Math.sqrt(off.dx * off.dx + off.dy * off.dy),
+        need: ctx.powerStats != null ? (1 - clamp01(ctx.powerStats.avg)) : 0.3,
+        value: off.score / 100
+      }
+    };
+    options.push(cand);
   }
-  return best;
+  return sortMicroDecisions(options);
 }
 
 function executePowerMicroDecision(ctx, decision) {
@@ -4967,7 +5240,7 @@ function chooseThermalMicroDecision(ctx) {
   if (thermal == null || !coreHasItemsFor(thermal, ctx.team)) return null;
   var spot = findHeatSpot(ctx.core, ctx.team, thermal);
   if (spot == null) return null;
-  return { kind: "heat-spot", score: 100, thermal: thermal, x: spot.x, y: spot.y };
+  return [{ actionId: "heat-spot-0", kind: "heat-spot", score: 100, thermal: thermal, x: spot.x, y: spot.y, features: { optionIndex: 0, need: 1, value: 1 } }];
 }
 
 function executeThermalMicroDecision(ctx, decision) {
@@ -4985,14 +5258,25 @@ function chooseLiquidMicroDecision(ctx) {
   if (pumpBlock == null || !coreHasItemsFor(pumpBlock, team)) return null;
   var liquids = findLiquidTiles(ctx.core.tile.x, ctx.core.tile.y, config.liquidSearchRadius, config.maxPumps);
   if (liquids.length == 0) return null;
-  var best = liquids[0];
-  return {
-    kind: "liquid-network",
-    score: 100 - Math.sqrt(best.dist2),
-    pumpX: best.x,
-    pumpY: best.y,
-    liquid: best.liquid
-  };
+  var decisions = [];
+  for (var i = 0; i < liquids.length && i < 4; i++) {
+    var best = liquids[i];
+    decisions.push({
+      kind: "liquid-network",
+      actionId: "source-" + i,
+      score: 100 - Math.sqrt(best.dist2),
+      pumpX: best.x,
+      pumpY: best.y,
+      liquid: best.liquid,
+      features: {
+        optionIndex: i,
+        distance: Math.sqrt(best.dist2),
+        need: state.pumpCount < config.maxPumps ? 1 : 0.5,
+        value: 1 - Math.min(1, Math.sqrt(best.dist2) / 20)
+      }
+    });
+  }
+  return sortMicroDecisions(decisions);
 }
 
 function executeLiquidMicroDecision(ctx, decision) {
@@ -5002,17 +5286,36 @@ function executeLiquidMicroDecision(ctx, decision) {
 
 function runActionSubpolicy(actionName, ctx) {
   if (actionName == null || ctx == null) return false;
-  var decision = null;
-  if (actionName == "mine") decision = chooseMineMicroDecision(ctx);
-  else if (actionName == "defend") decision = chooseDefendMicroDecision(ctx);
-  else if (actionName == "industry") decision = chooseIndustryMicroDecision(ctx);
-  else if (actionName == "attackWave") decision = chooseAttackWaveMicroDecision(ctx);
-  else if (actionName == "rally") decision = chooseRallyMicroDecision(ctx);
-  else if (actionName == "power") decision = choosePowerMicroDecision(ctx);
-  else if (actionName == "thermal") decision = chooseThermalMicroDecision(ctx);
-  else if (actionName == "liquid") decision = chooseLiquidMicroDecision(ctx);
+  var decisions = null;
+  if (actionName == "mine") decisions = chooseMineMicroDecision(ctx);
+  else if (actionName == "defend") decisions = chooseDefendMicroDecision(ctx);
+  else if (actionName == "industry") decisions = chooseIndustryMicroDecision(ctx);
+  else if (actionName == "attackWave") decisions = chooseAttackWaveMicroDecision(ctx);
+  else if (actionName == "rally") decisions = chooseRallyMicroDecision(ctx);
+  else if (actionName == "power") decisions = choosePowerMicroDecision(ctx);
+  else if (actionName == "thermal") decisions = chooseThermalMicroDecision(ctx);
+  else if (actionName == "liquid") decisions = chooseLiquidMicroDecision(ctx);
   else if (actionName == "noop") return true;
-  if (decision == null) return false;
+  if (decisions == null || decisions.length == 0) return false;
+  var selected = selectMicroDecision(actionName, ctx, decisions);
+  if (selected == null || selected.picked == null) return false;
+  var decision = selected.picked;
+  var selectedLabel = decisionLabel(actionName, decision);
+  state.pendingMicroTransition = {
+    policy: actionName,
+    action: selectedLabel,
+    state: ctx.beforeState,
+    options: []
+  };
+  for (var si = 0; si < selected.scored.length; si++) {
+    var entry = selected.scored[si];
+    state.pendingMicroTransition.options.push({
+      action: decisionLabel(actionName, entry.decision),
+      heuristicScore: Math.round(entry.heuristicScore * 100) / 100,
+      learnedScore: entry.learnedScore != null ? (Math.round(entry.learnedScore * 100) / 100) : null,
+      finalScore: Math.round(entry.finalScore * 100) / 100
+    });
+  }
   markMicroDecision(actionName, decision);
   if (actionName == "mine") return executeMineMicroDecision(ctx, decision);
   if (actionName == "defend") return executeDefendMicroDecision(ctx, decision);
@@ -5185,8 +5488,13 @@ Events.on(WorldLoadEvent, function(){
   state.nnLastLoadTick = -9999;
   state.nnLastSaveTick = -9999;
   state.nnLastErrorTick = -9999;
+  state.microPolicies = {};
+  state.microLastLoadTicks = {};
+  state.microLastErrorTicks = {};
+  state.pendingMicroTransition = null;
   state.rlEpsilon = config.rlEpsilon != null ? config.rlEpsilon : -1;
   state.lastRLState = null;
+  state.lastMicroReward = 0;
   state.gameOverEventSent = false;
   state.contentDemandTick = -9999;
   state.contentDemand = {};
@@ -5395,7 +5703,7 @@ function runAiStep(core, team) {
   }
   configureFactories(team, core, strategy);
   var industryPlan = computeIndustryExpansionPlan(core, team, strategy);
-  var macroCtx = buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan);
+  var macroCtx = buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan, beforeState);
 
   if (config.rlPolicyMode != "heuristic") {
     if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
@@ -5527,6 +5835,7 @@ function runAiStep(core, team) {
   var pickedName = "noop";
   state.lastAction = "none";
   state.lastActionOk = false;
+  state.pendingMicroTransition = null;
   for (var r = 0; r < pickedList.length; r++) {
     var picked = pickedList[r];
     var ok = false;
@@ -5535,7 +5844,10 @@ function runAiStep(core, team) {
     } catch (e) {
       ok = false;
     }
-    if (!ok) continue;
+    if (!ok) {
+      state.pendingMicroTransition = null;
+      continue;
+    }
     pickedName = picked.name;
     state.lastAction = picked.name;
     state.lastActionOk = true;
@@ -5555,10 +5867,26 @@ function runAiStep(core, team) {
   var afterState = snapshotState(core2, enemyCore2, enemies2, team);
   var reward = computeReward(beforeState, pickedName, afterState, { ok: did });
   state.lastReward = reward;
+  state.lastMicroReward = reward;
   updateOnlineQTable(beforeState, pickedName, afterState, reward);
   updateNNModel(beforeState, pickedName, afterState, reward);
   saveQTableIfNeeded();
   saveNNModelIfNeeded();
+  if (state.pendingMicroTransition != null) {
+    var microInfo = {
+      ok: did,
+      reward: reward
+    };
+    if (config.rlMicroLogCandidates) microInfo.actionSpace = state.pendingMicroTransition.options;
+    emitMicroTransition(
+      state.pendingMicroTransition.state != null ? state.pendingMicroTransition.state : beforeState,
+      state.pendingMicroTransition.policy,
+      state.pendingMicroTransition.action,
+      afterState,
+      microInfo
+    );
+    state.pendingMicroTransition = null;
+  }
   emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
   state.lastRLState = afterState;
 }
