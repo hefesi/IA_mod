@@ -29,6 +29,8 @@ Para reduzir overfitting em um unico estilo de partida, o script tambem pode col
 .\scripts\train_headless.ps1 -CurriculumMaps "Maze","Fork","Archipelago" -CurriculumRuns 6 -CurriculumRandomize -CurriculumSeed 42 -Timeout 600 -Epochs 8
 ```
 
+No fluxo atual, cada `CurriculumRun` tambem encerra automaticamente quando a partida dispara `GameOver` (por exemplo: nucleo perdido, ataque concluido ou objetivo de sobrevivencia fechado). O `-Timeout` continua valendo como fallback.
+
 Se voce ja souber os comandos exatos que quer alternar, pode usar `-CurriculumCommands` diretamente:
 
 ```powershell

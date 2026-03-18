@@ -36,6 +36,16 @@ var config = {
   waveMinGround: 6,
   waveMinAir: 4,
   waveSupportMax: 2,
+  attackMinCopper: 400,
+  attackMinLead: 300,
+  attackMinForce: 10,
+  attackAdvantageRatio: 1.4,
+  attackOverwhelmRatio: 1.8,
+  attackTurretThreat: 3.0,
+  attackMaxEnemyTurrets: 4,
+  attackDefenseRadius: 18,
+  attackRallyMinUnits: 8,
+  attackRallyRadius: 10,
   oreSearchRadius: 12,
   maxDrills: 5,
   maxConveyorSteps: 60,
@@ -58,6 +68,7 @@ var config = {
   rlSocketReconnectTicks: 300,
   rlSocketTimeoutMs: 200,
   rlSocketQueueMax: 200,
+  rlEmitGameOverEvent: true,
   rlPolicyMode: "nn",
   rlQTableFile: "q_table.json",
   rlQTablePath: "",
@@ -111,10 +122,10 @@ var config = {
   autoDisableHudOnMobile: true,
   campaignSafeMode: true,
   warnInterval: 300,
-  aiControlPlayerUnit: true,
+  aiControlPlayerUnit: false,
   // When true, the local player unit is excluded from AI commands and the player retains direct control.
   // Set to false so the AI can fully control the player's unit automatically.
-  observerMode: false,
+  observerMode: true,
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
   controllerResetPenalty: -1,
   resourceReserve: {
@@ -240,6 +251,7 @@ var state = {
   lastMode: "",
   tick: 0,
   lastWaveTick: -9999,
+  lastRallyTick: -9999,
   waveIndex: 0,
   drillCount: 0,
   turretCount: 0,
@@ -275,6 +287,8 @@ var state = {
   nnLastSaveTick: -9999,
   nnLastErrorTick: -9999,
   rlEpsilon: -1,
+  lastRLState: null,
+  gameOverEventSent: false,
   logicControllers: {
     ground: null,
     air: null,
@@ -314,6 +328,28 @@ var aiHud = {
 
 function rlSocketConnected() {
   return rlSocket.sock != null && rlSocket.out != null;
+}
+
+function tilesToWorld(tiles) {
+  var scale = 1;
+  try {
+    if (Vars.tilesize != null && Vars.tilesize > 0) scale = Vars.tilesize;
+  } catch (e) {
+    // ignore
+  }
+  return tiles * scale;
+}
+
+function tileCenterToWorld(x, y) {
+  var size = tilesToWorld(1);
+  return {
+    x: x * size + size / 2,
+    y: y * size + size / 2
+  };
+}
+
+function shouldExcludePlayerUnit() {
+  return config.observerMode || !config.aiControlPlayerUnit;
 }
 
 function hasBucketizedFeatures(features) {
@@ -536,6 +572,26 @@ function emitTransition(prevState, actionName, nextState, info) {
   var line = JSON.stringify(payload);
   if (config.rlLogEnabled) Log.info("[RL]" + line);
   rlSocketSend(line);
+}
+
+function emitSocketEvent(eventName, data) {
+  var payload = { type: "event", event: eventName, t: state.tick, data: data != null ? data : {} };
+  if (config.rlLogEnabled) Log.info("[RL-EVENT]" + JSON.stringify(payload));
+  rlSocketSend(JSON.stringify(payload));
+}
+
+function safeTeamName(team) {
+  if (team == null) return "";
+  try {
+    if (team.name != null) return String(team.name);
+  } catch (e) {
+    // ignore
+  }
+  try {
+    return String(team);
+  } catch (e2) {
+    return "";
+  }
 }
 
 function setAiEnabled(enabled, player) {
@@ -2292,11 +2348,115 @@ function buildPlan(core) {
   }
 }
 
-function shouldAttack(core) {
-  if (core == null || core.items == null) return false;
+function countEnemyTurretsNearCore(team, enemyCore, radiusTiles) {
+  if (enemyCore == null || enemyCore.tile == null) return 0;
+  var cx = enemyCore.tile.x;
+  var cy = enemyCore.tile.y;
+  var radius = radiusTiles != null ? radiusTiles : config.attackDefenseRadius;
+  var maxDist2 = radius * radius;
+  var count = 0;
+  Groups.build.each(function(b){
+    if (b == null || b.team == null || b.team == team || b.block == null || b.tile == null) return;
+    if (b.block.group != BlockGroup.turrets) return;
+    var dx = b.tile.x - cx;
+    var dy = b.tile.y - cy;
+    if ((dx * dx + dy * dy) > maxDist2) return;
+    count++;
+  });
+  return count;
+}
+
+function attackForceScore(buckets) {
+  if (buckets == null) return 0;
+  return buckets.ground.size + buckets.air.size * 1.25 + buckets.support.size * 0.75;
+}
+
+function attackThreatScore(enemies, enemyTurrets) {
+  var turretThreat = config.attackTurretThreat != null ? config.attackTurretThreat : 3.0;
+  return enemies + enemyTurrets * turretThreat;
+}
+
+function countFriendlyUnitsNearPoint(team, pos, radiusTiles) {
+  if (team == null || pos == null) return 0;
+  var radius = tilesToWorld(radiusTiles != null ? radiusTiles : config.attackRallyRadius);
+  var maxDist2 = radius * radius;
+  var playerId = -1;
+  if (shouldExcludePlayerUnit()) {
+    var player = getLocalPlayer();
+    if (player != null && player.unit() != null) playerId = player.unit().id;
+  }
+  var count = 0;
+  Groups.unit.each(function(u){
+    if (u == null || u.team != team) return;
+    if (playerId != -1 && u.id == playerId) return;
+    var dx = u.x - pos.x;
+    var dy = u.y - pos.y;
+    if ((dx * dx + dy * dy) > maxDist2) return;
+    count++;
+  });
+  return count;
+}
+
+function assessAttackOpportunity(core, enemyCore, team, buckets, enemies) {
+  if (core == null || core.items == null || enemyCore == null) {
+    return {
+      allowed: false,
+      reason: "missing-core",
+      friendlyForce: 0,
+      enemyThreat: 0,
+      enemyTurrets: 0
+    };
+  }
+
   var copper = availableCoreItems(core, Items.copper);
   var lead = availableCoreItems(core, Items.lead);
-  return copper >= 400 && lead >= 300;
+  var friendlyForce = attackForceScore(buckets);
+  var enemyTurrets = countEnemyTurretsNearCore(team, enemyCore, config.attackDefenseRadius);
+  var enemyThreat = attackThreatScore(enemies, enemyTurrets);
+  var resourceOk = copper >= config.attackMinCopper && lead >= config.attackMinLead;
+  var forceOk = friendlyForce >= config.attackMinForce && friendlyForce >= enemyThreat * config.attackAdvantageRatio;
+  var defenseOk = enemyTurrets <= config.attackMaxEnemyTurrets || friendlyForce >= enemyThreat * config.attackOverwhelmRatio;
+  var allowed = resourceOk && forceOk && defenseOk;
+  var reason = "ready";
+  if (!resourceOk) reason = "low-resources";
+  else if (!forceOk) reason = "low-advantage";
+  else if (!defenseOk) reason = "heavy-defense";
+
+  return {
+    allowed: allowed,
+    reason: reason,
+    resourceOk: resourceOk,
+    forceOk: forceOk,
+    defenseOk: defenseOk,
+    friendlyForce: friendlyForce,
+    enemyThreat: enemyThreat,
+    enemyTurrets: enemyTurrets
+  };
+}
+
+function evaluateAttackPlan(core, enemyCore, team, buckets, enemies) {
+  var attack = assessAttackOpportunity(core, enemyCore, team, buckets, enemies);
+  attack.rallyPoint = null;
+  attack.rallyUnits = 0;
+  attack.rallyNeed = 0;
+  attack.shouldRally = false;
+  attack.canCommit = false;
+  if (!attack.allowed || enemyCore == null) return attack;
+
+  var rallyPoint = getRallyPoint(core, enemyCore, config.rallyDistance);
+  var waveUnits = buckets.ground.size + buckets.air.size + Math.min(buckets.support.size, config.waveSupportMax);
+  var rallyNeed = Math.max(1, Math.min(config.attackRallyMinUnits, waveUnits));
+  var rallyUnits = countFriendlyUnitsNearPoint(team, rallyPoint, config.attackRallyRadius);
+  var hasFreshRally = state.lastRallyTick > state.lastWaveTick;
+  var grouped = rallyUnits >= rallyNeed;
+
+  attack.rallyPoint = rallyPoint;
+  attack.rallyUnits = rallyUnits;
+  attack.rallyNeed = rallyNeed;
+  attack.shouldRally = !hasFreshRally || !grouped;
+  attack.canCommit = hasFreshRally && grouped;
+  if (!attack.canCommit && attack.reason == "ready") attack.reason = hasFreshRally ? "regrouping" : "needs-rally";
+  return attack;
 }
 
 function findEnemyCore(team) {
@@ -2324,7 +2484,7 @@ function findEnemyCore(team) {
 function collectUnitIds(team) {
   var ids = new IntSeq();
   var playerId = -1;
-  if (config.observerMode) {
+  if (shouldExcludePlayerUnit()) {
     var player = getLocalPlayer();
     if (player != null && player.unit() != null) playerId = player.unit().id;
   }
@@ -2423,7 +2583,7 @@ function collectUnitBuckets(team) {
     support: new IntSeq()
   };
   var playerId = -1;
-  if (config.observerMode) {
+  if (shouldExcludePlayerUnit()) {
     var player = getLocalPlayer();
     if (player != null && player.unit() != null) playerId = player.unit().id;
   }
@@ -2865,13 +3025,16 @@ function collectRallyIds(buckets) {
 }
 
 function getRallyPoint(core, enemyCore, dist) {
-  var dx = enemyCore.x - core.x;
-  var dy = enemyCore.y - core.y;
+  var baseX = core.tile.x;
+  var baseY = core.tile.y;
+  var dx = enemyCore.tile.x - baseX;
+  var dy = enemyCore.tile.y - baseY;
   var len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-  var rx = Math.round(core.x + (dx / len) * dist);
-  var ry = Math.round(core.y + (dy / len) * dist);
+  var rx = Math.round(baseX + (dx / len) * dist);
+  var ry = Math.round(baseY + (dy / len) * dist);
   var clamped = clampToBounds(rx, ry);
-  return new Vec2(clamped.x, clamped.y);
+  var world = tileCenterToWorld(clamped.x, clamped.y);
+  return new Vec2(world.x, world.y);
 }
 
 function pushHistory(name) {
@@ -3133,16 +3296,19 @@ function actionRally(core, enemyCore) {
   var buckets = collectUnitBuckets(team);
   var rally = getRallyPoint(core, enemyCore, config.rallyDistance);
   var rallyIds = collectRallyIds(buckets);
+  if (rallyIds.size <= 0) return false;
   commandUnitIds(team, rallyIds, null, rally);
-  return rallyIds.size > 0;
+  state.lastRallyTick = state.tick;
+  return true;
 }
 
 function actionAttackWave(core, enemyCore) {
   var team = getTeam();
   var buckets = collectUnitBuckets(team);
+  var attackPlan = evaluateAttackPlan(core, enemyCore, team, buckets, countEnemyUnits(team));
   var canWave = waveReady(buckets);
   var cooled = (state.tick - state.lastWaveTick) >= config.waveCooldown;
-  if (!(canWave && cooled)) return false;
+  if (!(canWave && cooled && attackPlan.canCommit)) return false;
   var waveIds = collectWaveIds(buckets);
   commandUnitIds(team, waveIds, enemyCore, new Vec2(enemyCore.x, enemyCore.y));
   state.lastWaveTick = state.tick;
@@ -3182,6 +3348,7 @@ Events.on(WorldLoadEvent, function(){
   state.lastMode = "";
   state.tick = 0;
   state.lastWaveTick = -9999;
+  state.lastRallyTick = -9999;
   state.waveIndex = 0;
   state.drillCount = 0;
   state.turretCount = 0;
@@ -3211,6 +3378,8 @@ Events.on(WorldLoadEvent, function(){
   state.nnLastSaveTick = -9999;
   state.nnLastErrorTick = -9999;
   state.rlEpsilon = config.rlEpsilon != null ? config.rlEpsilon : -1;
+  state.lastRLState = null;
+  state.gameOverEventSent = false;
   state.logicControllers = { ground: null, air: null, naval: null };
   rlSocketClose();
   rlSocket.queue = [];
@@ -3230,6 +3399,37 @@ Events.on(WorldLoadEvent, function(){
   if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") loadQTable();
   if (config.rlPolicyMode == "nn") loadNNModel();
   Log.info("[IA] Mundo carregado. Preparando plano de base.");
+});
+
+Events.on(GameOverEvent, function(e){
+  if (!config.rlEmitGameOverEvent || state.gameOverEventSent) return;
+  state.gameOverEventSent = true;
+
+  var team = getTeam();
+  if (team == null && Vars.state != null && Vars.state.rules != null) team = Vars.state.rules.defaultTeam;
+  var winner = e != null ? e.winner : null;
+  var core = getCore(team);
+  var enemyCore = findEnemyCore(team);
+  var enemies = countEnemyUnits(team);
+  var terminalState = snapshotState(core, enemyCore, enemies, team);
+  var prevState = state.lastRLState != null ? state.lastRLState : terminalState;
+  var terminalInfo = {
+    ok: true,
+    terminal: true,
+    reason: "gameOver",
+    winner: safeTeamName(winner)
+  };
+  terminalInfo.reward = computeReward(prevState, "noop", terminalState, terminalInfo);
+  emitTransition(prevState, "noop", terminalState, terminalInfo);
+  state.lastRLState = terminalState;
+
+  emitSocketEvent("gameOver", {
+    winner: safeTeamName(winner),
+    team: safeTeamName(team),
+    won: team != null && winner != null && team == winner ? 1 : 0,
+    lost: team != null && winner != null && team != winner ? 1 : 0
+  });
+  rlSocketClose();
 });
 
 Events.on(PlayerChatEvent, function(e){
@@ -3328,7 +3528,9 @@ function runAiStep(core, team) {
   var enemies = countEnemyUnits(team);
   var availCopper = availableCoreItems(core, Items.copper);
   var availLead = availableCoreItems(core, Items.lead);
-  var wantsAttack = enemyCore != null && shouldAttack(core);
+  var buckets = collectUnitBuckets(team);
+  var attackPlan = evaluateAttackPlan(core, enemyCore, team, buckets, enemies);
+  var wantsAttack = enemyCore != null && attackPlan.allowed;
   var drillBlock = pickDrillBlock(team);
   var turretBlock = pickTurretBlock(team);
   var powerNodeBlock = pickPowerNodeBlock(team);
@@ -3401,12 +3603,13 @@ function runAiStep(core, team) {
   var thermalScore = (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + 35) : 0);
   thermalScore *= reservePenalty;
   addAction("thermal", thermalScore, runCore(actionThermal));
-  addAction("attackWave", wantsAttack ? 100 : 0, actionHandlers.attackWave);
-  addAction("rally", wantsAttack ? 55 : 0, actionHandlers.rally);
+  addAction("attackWave", attackPlan.canCommit ? 100 : 0, actionHandlers.attackWave);
+  addAction("rally", attackPlan.shouldRally ? 120 : 0, actionHandlers.rally);
   var mineScore = (canDrill ? (availCopper < 200 ? 120 : availCopper < 400 ? 90 : 50) + (state.drillCount < config.maxDrills ? 30 : 0) : 0);
   mineScore *= reserveBoost;
   addAction("mine", mineScore, actionHandlers.mine);
   var defendScore = (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0);
+  if (enemyCore != null && !wantsAttack && attackPlan.enemyTurrets >= config.attackMaxEnemyTurrets) defendScore += 20;
   defendScore *= reservePenalty;
   addAction("defend", defendScore, actionHandlers.defend);
   var powerScore = (canPowerNode && state.powerClusters < config.maxPowerClusters && availCopper > 200 && availLead > 150 ? 20 : 0) + powerNeedScore + (state.pumpCount > state.powerClusters ? 15 : 0);
@@ -3502,6 +3705,7 @@ function runAiStep(core, team) {
   saveQTableIfNeeded();
   saveNNModelIfNeeded();
   emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
+  state.lastRLState = afterState;
 }
 
 
@@ -3513,6 +3717,7 @@ Events.run(Trigger.update, function(){
   ensurePlayerControlled();
 
   if (!state.aiEnabled) return;
+  if (Vars.state != null && Vars.state.gameOver) return;
 
   var headless = isHeadless();
   var localPlayer = getLocalPlayer();

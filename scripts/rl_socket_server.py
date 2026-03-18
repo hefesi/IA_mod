@@ -6,7 +6,18 @@ import time
 from rl_common import reward_from_transition
 
 
-def handle_connection(conn, addr, out_path, verbose, max_transitions=0):
+def socket_event_name(payload):
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") != "event":
+        return None
+    name = payload.get("event")
+    if not isinstance(name, str) or not name:
+        return None
+    return name
+
+
+def handle_connection(conn, addr, out_path, verbose, max_transitions=0, stop_on_event=""):
     buf = ""
     count = 0
     total = 0.0
@@ -23,23 +34,30 @@ def handle_connection(conn, addr, out_path, verbose, max_transitions=0):
                 line = line.strip()
                 if not line:
                     continue
-                f.write(line + "\n")
-                f.flush()
                 try:
                     tr = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                event_name = socket_event_name(tr)
+                if event_name is not None:
+                    if verbose:
+                        print("event={} t={}".format(event_name, tr.get("t")))
+                    if stop_on_event and event_name == stop_on_event:
+                        return count, event_name
+                    continue
+                f.write(line + "\n")
+                f.flush()
                 r = reward_from_transition(tr)
                 count += 1
                 total += r
                 if verbose:
                     print("t={t} a={a} r={r:.2f}".format(t=tr.get("t"), a=tr.get("a"), r=r))
                 if max_transitions and count >= max_transitions:
-                    return count
+                    return count, None
     if verbose and count:
         avg = total / count
         print("client_done transitions={} avg_reward={:.3f}".format(count, avg))
-    return count
+    return count, None
 
 
 def main():
@@ -50,6 +68,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print per-transition rewards.")
     parser.add_argument("--max-transitions", type=int, default=0, help="Stop server after this many transitions (0 = unlimited).")
     parser.add_argument("--timeout", type=float, default=0.0, help="Stop server after this many seconds of no connection (0 = unlimited).")
+    parser.add_argument("--stop-on-event", default="", help="Stop server when a socket control event with this name is received.")
     args = parser.parse_args()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -67,7 +86,17 @@ def main():
                 print("timeout_reached, stopping server")
                 break
             try:
-                count = handle_connection(conn, addr, args.out, args.verbose, max_transitions=args.max_transitions)
+                count, stop_event = handle_connection(
+                    conn,
+                    addr,
+                    args.out,
+                    args.verbose,
+                    max_transitions=args.max_transitions,
+                    stop_on_event=args.stop_on_event,
+                )
+                if stop_event:
+                    print("stop_event_received={}, stopping server".format(stop_event))
+                    break
                 if args.max_transitions and count >= args.max_transitions:
                     print("max_transitions reached ({}), stopping server".format(count))
                     break

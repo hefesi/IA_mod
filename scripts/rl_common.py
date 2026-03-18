@@ -83,6 +83,12 @@ def reward_from_transition(tr):
 
 
 def is_terminal_transition(tr):
+    info = tr.get("info") or {}
+    try:
+        if bool(info.get("terminal")):
+            return True
+    except Exception:
+        pass
     s = tr.get("s", {})
     s2 = tr.get("s2", {})
     if num(s, "enemyCore") == 1 and num(s2, "enemyCore") == 0:
@@ -112,9 +118,14 @@ def iter_transitions(log_path, limit=0):
             if not payload:
                 continue
             try:
-                yield json.loads(payload)
+                tr = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(tr, dict):
+                continue
+            if tr.get("type") == "event":
+                continue
+            yield tr
             count += 1
             if limit and count >= limit:
                 break

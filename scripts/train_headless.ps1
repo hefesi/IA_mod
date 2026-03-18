@@ -211,7 +211,7 @@ function Start-SocketCollectionJob {
 
     $job = Start-Job -Name $JobName -ScriptBlock {
         param($python, $script, $logFile, $timeout, $maxTransitions)
-        $args = @($script, "--host", "127.0.0.1", "--port", "4567", "--out", $logFile, "--verbose")
+        $args = @($script, "--host", "127.0.0.1", "--port", "4567", "--out", $logFile, "--verbose", "--stop-on-event", "gameOver")
         if ($timeout -gt 0) { $args += @("--timeout", $timeout) }
         if ($maxTransitions -gt 0) { $args += @("--max-transitions", $maxTransitions) }
         & $python @args
