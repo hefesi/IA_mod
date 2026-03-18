@@ -133,7 +133,7 @@ def vec_from_state(s):
     return vec
 
 
-def iter_transitions(log_path, limit=0):
+def iter_transitions(log_path, limit=0, transition_type="transition"):
     count = 0
     with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -146,8 +146,20 @@ def iter_transitions(log_path, limit=0):
                 continue
             if not isinstance(tr, dict):
                 continue
-            if tr.get("type") == "event":
+            tr_type = tr.get("type")
+            if tr_type == "event":
                 continue
+            if transition_type == "any":
+                pass
+            elif transition_type == "macro":
+                if tr_type not in (None, "transition", "macro"):
+                    continue
+            elif transition_type == "micro":
+                if tr_type != "micro":
+                    continue
+            else:
+                if tr_type not in (None, "transition", transition_type):
+                    continue
             yield tr
             count += 1
             if limit and count >= limit:
@@ -162,8 +174,8 @@ def build_action_list(transitions, default_actions=None):
     return base + sorted(a for a in actions if a not in base)
 
 
-def load_transitions(log_path, limit=0, default_actions=None):
-    transitions = list(iter_transitions(log_path, limit=limit))
+def load_transitions(log_path, limit=0, default_actions=None, transition_type="transition"):
+    transitions = list(iter_transitions(log_path, limit=limit, transition_type=transition_type))
     action_list = build_action_list(transitions, default_actions=default_actions)
     action_index = {a: i for i, a in enumerate(action_list)}
     return transitions, action_list, action_index
