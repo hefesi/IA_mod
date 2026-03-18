@@ -1,11 +1,14 @@
 {
-  "version": 1,
+  "version": 2,
   "actions": [
     "attackWave",
     "rally",
     "mine",
+    "industry",
     "defend",
     "power",
+    "liquid",
+    "thermal",
     "noop"
   ],
   "features": [
