@@ -283,12 +283,12 @@ var config = {
   preferredGroundUnit: "dagger",
   preferredAirUnit: "mono",
   preferredNavalUnit: "risso",
-  logicEnabled: true,
+  logicEnabled: false,
   logicBuildInterval: 600,
   logicSearchRadius: 8,
   logicControlRadius: 12,
   logicMaxProcessors: 3,
-  logicTurretControl: true,
+  logicTurretControl: false,
   logicTurretMaxLinks: 2,
   logicTurretSearchRadius: 12,
   logicTurretRadarSort: "distance",
@@ -4698,6 +4698,29 @@ function validateLogicController(ctrl, team) {
   return tile.build;
 }
 
+function isManagedAILogicController(build) {
+  if (build == null || build.tile == null || build.block == null) return false;
+  if (!isLogicBlock(build.block)) return false;
+  var key = build.tile.x + "," + build.tile.y;
+  var tracked = state.logicControllers;
+  if (tracked != null) {
+    if (tracked.ground != null && (tracked.ground.x + "," + tracked.ground.y) == key) return true;
+    if (tracked.air != null && (tracked.air.x + "," + tracked.air.y) == key) return true;
+    if (tracked.naval != null && (tracked.naval.x + "," + tracked.naval.y) == key) return true;
+  }
+  var code = null;
+  try {
+    code = build.code;
+  } catch (e) {
+    code = null;
+  }
+  if (code == null) return false;
+  code = String(code);
+  return code.indexOf("uradar enemy any any distance 1 target") >= 0 &&
+         code.indexOf("ucontrol approach tx ty") >= 0 &&
+         code.indexOf("ucontrol move rallyX rallyY") >= 0;
+}
+
 function countLogicProcessors(team, core) {
   var count = 0;
   var cx = core != null ? core.tile.x : 0;
@@ -4756,10 +4779,13 @@ function programLogic(build, role, core) {
 }
 
 function setLogicProcessorsEnabled(enabled) {
-  if (!config.logicEnabled) return;
   var team = getTeam();
   var core = getCore(team);
   if (core == null) return;
+  if (!enabled || !config.logicEnabled) {
+    disableManagedLogicControllers(core, team);
+    return;
+  }
   var cx = core.tile.x;
   var cy = core.tile.y;
   var radius = config.logicControlRadius;
@@ -4776,6 +4802,28 @@ function setLogicProcessorsEnabled(enabled) {
       // ignore
     }
   });
+}
+
+function disableManagedLogicControllers(core, team) {
+  if (core == null) return;
+  var cx = core.tile.x;
+  var cy = core.tile.y;
+  var radius = config.logicControlRadius;
+  var maxDist2 = radius * radius;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null || b.tile == null) return;
+    if (!isLogicBlock(b.block)) return;
+    var dx = b.tile.x - cx;
+    var dy = b.tile.y - cy;
+    if (dx * dx + dy * dy > maxDist2) return;
+    if (!isManagedAILogicController(b)) return;
+    try {
+      b.enabled = false;
+    } catch (e) {
+      // ignore
+    }
+  });
+  state.logicControllers = { ground: null, air: null, naval: null };
 }
 
 function ensureLogicControllers(core, team) {
@@ -5258,7 +5306,7 @@ function actionAttackWave(core, enemyCore) {
   return waveIds.size > 0;
 }
 
-function buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan, beforeState) {
+function buildActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan, beforeState, topDemandEntry, topIndustryNeed, reservePressure, powerNeedScore, missingProducers) {
   return {
     core: core,
     team: team,
@@ -5273,8 +5321,112 @@ function buildMacroActionContext(core, team, enemyCore, enemies, buckets, attack
     ammoProfile: ammoProfile,
     strategy: strategy,
     industryPlan: industryPlan,
-    beforeState: beforeState
+    beforeState: beforeState,
+    topDemandEntry: topDemandEntry,
+    topIndustryNeed: topIndustryNeed,
+    reservePressure: reservePressure,
+    powerNeedScore: powerNeedScore,
+    missingProducers: missingProducers
   };
+}
+
+function findActionEntry(actions, name) {
+  if (actions == null || name == null) return null;
+  for (var i = 0; i < actions.length; i++) {
+    var action = actions[i];
+    if (action != null && action.name == name) return action;
+  }
+  return null;
+}
+
+function applySituationalActionGuards(actions, ctx) {
+  if (actions == null || ctx == null) return;
+  var coreHealth = 1;
+  if (ctx.beforeState != null && ctx.beforeState.coreHealthFrac != null) coreHealth = ctx.beforeState.coreHealthFrac;
+  coreHealth = clamp01(coreHealth);
+
+  var enemies = ctx.enemies != null ? ctx.enemies : 0;
+  var enemyTurrets = ctx.attackPlan != null && ctx.attackPlan.enemyTurrets != null ? ctx.attackPlan.enemyTurrets : 0;
+  var ammoPressure = 0;
+  if (ctx.ammoProfile != null) {
+    ammoPressure = Math.max(
+      ctx.ammoProfile.kineticPressure || 0,
+      ctx.ammoProfile.explosivePressure || 0,
+      ctx.ammoProfile.energyPressure || 0
+    );
+  }
+
+  var defenseEmergency = (1 - coreHealth) * 90 + Math.min(45, enemies * 7) + enemyTurrets * 4 + ammoPressure * 10;
+  var reservePressure = ctx.reservePressure != null ? ctx.reservePressure : 0;
+  var chainPressure = ctx.chainStatus != null && ctx.chainStatus.pressure != null ? ctx.chainStatus.pressure : 0;
+  var chainCoverage = ctx.chainStatus != null && ctx.chainStatus.coverage != null ? ctx.chainStatus.coverage : 1;
+  var economyEmergency = reservePressure * 70 + chainPressure * 30 + Math.max(0, 1 - chainCoverage) * 25;
+  if (ctx.missingProducers != null) economyEmergency += Math.min(24, ctx.missingProducers * 6);
+  if (ctx.topDemandEntry != null && ctx.topDemandEntry.producersBuilt <= 0) economyEmergency += 12;
+
+  var powerEmergency = ctx.powerNeedScore != null ? ctx.powerNeedScore : 0;
+  if (ctx.powerStats != null && ctx.powerStats.avg != null) powerEmergency += (1 - clamp01(ctx.powerStats.avg)) * 45;
+
+  var attackConfidence = 0;
+  if (ctx.attackPlan != null) {
+    if (ctx.attackPlan.allowed) attackConfidence += 30;
+    if (ctx.attackPlan.canCommit) attackConfidence += 35;
+    if (ctx.attackPlan.shouldRally) attackConfidence += 10;
+    var forceEdge =
+      (ctx.attackPlan.friendlyForce != null ? ctx.attackPlan.friendlyForce : 0) -
+      (ctx.attackPlan.enemyThreat != null ? ctx.attackPlan.enemyThreat : 0);
+    attackConfidence += Math.max(-30, Math.min(35, forceEdge * 4));
+    attackConfidence -= enemyTurrets * 6;
+  }
+
+  var defend = findActionEntry(actions, "defend");
+  var mine = findActionEntry(actions, "mine");
+  var industry = findActionEntry(actions, "industry");
+  var power = findActionEntry(actions, "power");
+  var thermal = findActionEntry(actions, "thermal");
+  var liquid = findActionEntry(actions, "liquid");
+  var attackWave = findActionEntry(actions, "attackWave");
+  var rally = findActionEntry(actions, "rally");
+  var noop = findActionEntry(actions, "noop");
+
+  if (defend != null && defenseEmergency > 30) {
+    defend.score = Math.max(defend.score, defend.baseScore + defenseEmergency);
+  }
+  if (mine != null && economyEmergency > 35) {
+    mine.score = Math.max(mine.score, mine.baseScore + economyEmergency * 0.65);
+  }
+  if (industry != null && economyEmergency > 35) {
+    industry.score = Math.max(industry.score, industry.baseScore + economyEmergency * 0.5);
+  }
+  if (power != null && powerEmergency > 30) {
+    power.score = Math.max(power.score, power.baseScore + powerEmergency);
+  }
+  if (thermal != null && powerEmergency > 45) {
+    thermal.score = Math.max(thermal.score, thermal.baseScore + powerEmergency * 0.8);
+  }
+  if (liquid != null && ctx.topIndustryNeed != null && ctx.topIndustryNeed.name == "plastanium") {
+    liquid.score = Math.max(liquid.score, liquid.baseScore + 30);
+  }
+
+  var blockAttack =
+    defenseEmergency > 60 ||
+    economyEmergency > 75 ||
+    powerEmergency > 70 ||
+    coreHealth < 0.65;
+
+  if (blockAttack) {
+    if (attackWave != null) attackWave.score = -999999;
+    if (rally != null) rally.score = Math.min(rally.score, 20);
+  } else if (attackConfidence > 45) {
+    if (attackWave != null) attackWave.score = Math.max(attackWave.score, attackWave.baseScore + attackConfidence);
+    if (rally != null && ctx.attackPlan != null && ctx.attackPlan.shouldRally) {
+      rally.score = Math.max(rally.score, rally.baseScore + attackConfidence * 0.8);
+    }
+  }
+
+  if (noop != null && (defenseEmergency > 25 || economyEmergency > 25 || powerEmergency > 25 || attackConfidence > 35)) {
+    noop.score = -999999;
+  }
 }
 
 function sortMicroDecisions(list) {
@@ -5639,7 +5791,32 @@ function executeLiquidMicroDecision(ctx, decision) {
   return actionLiquid(ctx.core);
 }
 
-function runActionSubpolicy(actionName, ctx) {
+function executeActionDecision(actionName, ctx, decision) {
+  if (actionName == "mine") return executeMineMicroDecision(ctx, decision);
+  if (actionName == "defend") return executeDefendMicroDecision(ctx, decision);
+  if (actionName == "industry") return executeIndustryMicroDecision(ctx, decision);
+  if (actionName == "attackWave") return executeAttackWaveMicroDecision(ctx, decision);
+  if (actionName == "rally") return executeRallyMicroDecision(ctx, decision);
+  if (actionName == "power") return executePowerMicroDecision(ctx, decision);
+  if (actionName == "thermal") return executeThermalMicroDecision(ctx, decision);
+  if (actionName == "liquid") return executeLiquidMicroDecision(ctx, decision);
+  return false;
+}
+
+function runDirectAction(actionName, ctx) {
+  if (actionName == "mine") return actionMine(ctx.core, ctx.miningPlan);
+  if (actionName == "defend") return actionDefend(ctx.core);
+  if (actionName == "industry") return actionIndustry(ctx.core, ctx.industryPlan);
+  if (actionName == "attackWave") return actionAttackWave(ctx.core, ctx.enemyCore);
+  if (actionName == "rally") return actionRally(ctx.core, ctx.enemyCore);
+  if (actionName == "power") return actionPower(ctx.core);
+  if (actionName == "thermal") return actionThermal(ctx.core);
+  if (actionName == "liquid") return actionLiquid(ctx.core);
+  if (actionName == "noop") return true;
+  return false;
+}
+
+function runActionPlan(actionName, ctx) {
   if (actionName == null || ctx == null) return false;
   var decisions = null;
   if (actionName == "mine") decisions = chooseMineMicroDecision(ctx);
@@ -5651,21 +5828,21 @@ function runActionSubpolicy(actionName, ctx) {
   else if (actionName == "thermal") decisions = chooseThermalMicroDecision(ctx);
   else if (actionName == "liquid") decisions = chooseLiquidMicroDecision(ctx);
   else if (actionName == "noop") return true;
-  if (decisions == null || decisions.length == 0) return false;
+  if (decisions == null || decisions.length == 0) {
+    state.lastMicroAction = actionName + ":direct";
+    state.pendingMicroTransition = null;
+    return runDirectAction(actionName, ctx);
+  }
   var selected = selectMicroDecision(actionName, ctx, decisions);
-  if (selected == null || selected.picked == null) return false;
-  var decision = selected.picked;
-  var selectedLabel = decisionLabel(actionName, decision);
-  state.pendingMicroTransition = {
-    policy: actionName,
-    action: selectedLabel,
-    state: ctx.beforeState,
-    options: [],
-    selectionMode: selected.learnedAvailable ? "micro-policy" : "heuristic-fallback"
-  };
+  if (selected == null || selected.scored == null || selected.scored.length == 0) {
+    state.lastMicroAction = actionName + ":direct";
+    state.pendingMicroTransition = null;
+    return runDirectAction(actionName, ctx);
+  }
+  var options = [];
   for (var si = 0; si < selected.scored.length; si++) {
     var entry = selected.scored[si];
-    state.pendingMicroTransition.options.push({
+    options.push({
       action: decisionLabel(actionName, entry.decision),
       heuristicScore: Math.round(entry.heuristicScore * 100) / 100,
       learnedScore: entry.learnedScore != null ? (Math.round(entry.learnedScore * 100) / 100) : null,
@@ -5673,16 +5850,23 @@ function runActionSubpolicy(actionName, ctx) {
       selectionMode: entry.selectionMode
     });
   }
-  markMicroDecision(actionName, decision);
-  if (actionName == "mine") return executeMineMicroDecision(ctx, decision);
-  if (actionName == "defend") return executeDefendMicroDecision(ctx, decision);
-  if (actionName == "industry") return executeIndustryMicroDecision(ctx, decision);
-  if (actionName == "attackWave") return executeAttackWaveMicroDecision(ctx, decision);
-  if (actionName == "rally") return executeRallyMicroDecision(ctx, decision);
-  if (actionName == "power") return executePowerMicroDecision(ctx, decision);
-  if (actionName == "thermal") return executeThermalMicroDecision(ctx, decision);
-  if (actionName == "liquid") return executeLiquidMicroDecision(ctx, decision);
-  return false;
+  for (var si2 = 0; si2 < selected.scored.length; si2++) {
+    var entry2 = selected.scored[si2];
+    if (entry2 == null || entry2.decision == null) continue;
+    if (!executeActionDecision(actionName, ctx, entry2.decision)) continue;
+    markMicroDecision(actionName, entry2.decision);
+    state.pendingMicroTransition = {
+      policy: actionName,
+      action: decisionLabel(actionName, entry2.decision),
+      state: ctx.beforeState,
+      options: options,
+      selectionMode: entry2.selectionMode
+    };
+    return true;
+  }
+  state.lastMicroAction = actionName + ":direct";
+  state.pendingMicroTransition = null;
+  return runDirectAction(actionName, ctx);
 }
 
 function rankActions(actions) {
@@ -5996,7 +6180,8 @@ function runAiLogic() {
   state.industryBlocks = countIndustryBlocks(team2);
   state.factoryBlocks = countFactoryBlocks(team2);
 
-  ensureLogicControllers(core2, team2);
+  if (config.logicEnabled) ensureLogicControllers(core2, team2);
+  else disableManagedLogicControllers(core2, team2);
 
   // Loop principal: snapshot -> escolhe acao -> executa -> recompensa -> Q-table/NN -> salvar.
   runAiStep(core2, team2);
@@ -6075,7 +6260,27 @@ function runAiStep(core, team) {
   }
   configureFactories(team, core, strategy);
   var industryPlan = computeIndustryExpansionPlan(core, team, strategy);
-  var macroCtx = buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan, beforeState);
+  var actionCtx = buildActionContext(
+    core,
+    team,
+    enemyCore,
+    enemies,
+    buckets,
+    attackPlan,
+    miningPlan,
+    powerStats,
+    stageInfo,
+    chainStatus,
+    ammoProfile,
+    strategy,
+    industryPlan,
+    beforeState,
+    topDemandEntry,
+    topIndustryNeed,
+    reserveP,
+    powerNeedScore,
+    missingProducers
+  );
 
   if (config.rlPolicyMode != "heuristic") {
     if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
@@ -6089,14 +6294,14 @@ function runAiStep(core, team) {
   }
 
   var actionHandlers = {
-    attackWave: function(){ return runActionSubpolicy("attackWave", macroCtx); },
-    rally: function(){ return runActionSubpolicy("rally", macroCtx); },
-    mine: function(){ return runActionSubpolicy("mine", macroCtx); },
-    defend: function(){ return runActionSubpolicy("defend", macroCtx); },
-    power: function(){ return runActionSubpolicy("power", macroCtx); },
-    liquid: function(){ return runActionSubpolicy("liquid", macroCtx); },
-    thermal: function(){ return runActionSubpolicy("thermal", macroCtx); },
-    industry: function(){ return runActionSubpolicy("industry", macroCtx); },
+    attackWave: function(){ return runActionPlan("attackWave", actionCtx); },
+    rally: function(){ return runActionPlan("rally", actionCtx); },
+    mine: function(){ return runActionPlan("mine", actionCtx); },
+    defend: function(){ return runActionPlan("defend", actionCtx); },
+    power: function(){ return runActionPlan("power", actionCtx); },
+    liquid: function(){ return runActionPlan("liquid", actionCtx); },
+    thermal: function(){ return runActionPlan("thermal", actionCtx); },
+    industry: function(){ return runActionPlan("industry", actionCtx); },
     noop: function(){ return true; }
   };
 
@@ -6208,6 +6413,8 @@ function runAiStep(core, team) {
       actS.score = applyStrategyScore(actS.name, actS.score, strategy);
     }
   }
+
+  applySituationalActionGuards(actions, actionCtx);
 
   var ranked = rankActions(actions);
   var policyActions = nnUsesPolicySampling() ? policyReadyActions(actions) : null;
