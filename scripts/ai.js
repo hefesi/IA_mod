@@ -372,6 +372,7 @@ var state = {
   lastTapY: -1,
   lastAiTick: -9999,
   lastAction: "",
+  lastMicroAction: "",
   lastActionOk: false,
   lastPlaceFail: "",
   lastWarnTick: -9999,
@@ -898,6 +899,7 @@ function updateHudDebug() {
     " r:" + Math.round(state.lastReward * 100) / 100 +
     " tick:" + state.tick +
     " last:" + (state.lastAction == "" ? "-" : state.lastAction) +
+    " micro:" + (state.lastMicroAction == "" ? "-" : state.lastMicroAction) +
     (state.lastPlaceFail != "" ? (" fail:" + state.lastPlaceFail) : "");
   try {
     aiHud.debugLabel.setText(text);
@@ -4728,6 +4730,301 @@ function actionAttackWave(core, enemyCore) {
   return waveIds.size > 0;
 }
 
+function buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan) {
+  return {
+    core: core,
+    team: team,
+    enemyCore: enemyCore,
+    enemies: enemies,
+    buckets: buckets,
+    attackPlan: attackPlan,
+    miningPlan: miningPlan,
+    powerStats: powerStats,
+    stageInfo: stageInfo,
+    chainStatus: chainStatus,
+    ammoProfile: ammoProfile,
+    strategy: strategy,
+    industryPlan: industryPlan
+  };
+}
+
+function sortMicroDecisions(list) {
+  if (list == null) return [];
+  list.sort(function(a, b){
+    var bs = b != null && b.score != null ? b.score : 0;
+    var as = a != null && a.score != null ? a.score : 0;
+    return bs - as;
+  });
+  return list;
+}
+
+function markMicroDecision(actionName, decision) {
+  if (actionName == null || decision == null) return;
+  var kind = decision.kind != null ? decision.kind : "default";
+  state.lastMicroAction = actionName + ":" + kind;
+}
+
+function chooseMineMicroDecision(ctx) {
+  var core = ctx != null ? ctx.core : null;
+  var team = ctx != null ? ctx.team : getTeam();
+  var decisions = [];
+  var priority = priorityMineItems(core, team);
+  for (var i = 0; i < priority.length; i++) {
+    var item = priority[i];
+    if (item == null || item.name == null) continue;
+    decisions.push({ kind: "ensure-item", score: 160 - i * 10, itemName: item.name });
+  }
+  var plan = ctx != null ? ctx.miningPlan : null;
+  if (plan != null && plan.ore != null) {
+    decisions.push({
+      kind: "ore",
+      score: plan.score != null ? plan.score : 120,
+      plan: plan
+    });
+  }
+  decisions = sortMicroDecisions(decisions);
+  return decisions.length > 0 ? decisions[0] : null;
+}
+
+function executeMineMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null) return false;
+  var core = ctx.core;
+  var team = ctx.team;
+  if (decision.kind == "ensure-item") {
+    return ensureMiningForItem(core, decision.itemName);
+  }
+  if (decision.kind != "ore" || decision.plan == null || decision.plan.ore == null) return false;
+  var stageInfo = economyStageInfo(core, team);
+  if (state.drillCount >= allowedDrillCapacity(stageInfo, team)) return false;
+  var drill = pickDrillBlock(team, industryReserveIgnore);
+  if (drill == null || !coreHasItemsFor(drill, team)) return false;
+  var ore = decision.plan.ore;
+  if (!placeBlock(drill, ore.x, ore.y, 0, team)) return false;
+  state.drillCount++;
+  var cx = core.tile.x;
+  var cy = core.tile.y;
+  var step = stepToward(ore.x, ore.y, cx, cy);
+  placeConveyorPath(team, ore.x + step.dx, ore.y + step.dy, cx, cy, config.maxConveyorSteps, null, industryReserveIgnore);
+  return true;
+}
+
+function chooseDefendMicroDecision(ctx) {
+  if (ctx == null || ctx.core == null) return null;
+  var core = ctx.core;
+  var team = ctx.team;
+  if (state.turretCount >= config.maxTurrets) return null;
+  var turret = pickTurretBlock(team);
+  if (turret == null || !coreHasItemsFor(turret, team)) return null;
+  var offsets = [
+    { dx: 6, dy: 0 },
+    { dx: -6, dy: 0 },
+    { dx: 0, dy: 6 },
+    { dx: 0, dy: -6 },
+    { dx: 8, dy: 3 },
+    { dx: -8, dy: 3 },
+    { dx: 8, dy: -3 },
+    { dx: -8, dy: -3 }
+  ];
+  var out = [];
+  for (var i = 0; i < offsets.length; i++) {
+    var pick = offsets[(state.turretCount + i) % offsets.length];
+    var off = clampOffset(core.tile.x, core.tile.y, pick.dx, pick.dy);
+    var score = 100 - (Math.abs(pick.dx) + Math.abs(pick.dy));
+    if (ctx.enemies > 0) score += 20;
+    if (ctx.enemyCore != null && ctx.enemyCore.tile != null) {
+      var ddx = off.x - ctx.enemyCore.tile.x;
+      var ddy = off.y - ctx.enemyCore.tile.y;
+      var towardEnemy = ddx * ddx + ddy * ddy;
+      score += 30 / Math.max(1, Math.sqrt(towardEnemy));
+    }
+    out.push({ kind: "turret-slot", score: score, turret: turret, x: off.x, y: off.y });
+  }
+  out = sortMicroDecisions(out);
+  return out.length > 0 ? out[0] : null;
+}
+
+function executeDefendMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null || decision.turret == null) return false;
+  if (!placeBlock(decision.turret, decision.x, decision.y, 0, ctx.team)) return false;
+  state.turretCount++;
+  return true;
+}
+
+function chooseIndustryMicroDecision(ctx) {
+  if (ctx == null || ctx.core == null) return null;
+  var core = ctx.core;
+  var team = ctx.team;
+  var decisions = [];
+  var needs = rankIndustryNeeds(core, team);
+  for (var i = 0; i < needs.length && i < 3; i++) {
+    var need = needs[i];
+    if (need == null) continue;
+    decisions.push({ kind: "module", score: 120 + need.score, module: need.name });
+    var def = need.def;
+    if (def != null && def.inputs != null) {
+      for (var j = 0; j < def.inputs.length; j++) {
+        var input = def.inputs[j];
+        var item = itemByName(input.name);
+        if (item == null) continue;
+        var inputTarget = industryInputTarget(need.name, input.name);
+        if (countDrillsForItem(team, item) <= 0 || coreItemCount(core, item) < inputTarget) {
+          decisions.push({ kind: "mine-input", score: 110 + need.score * 0.8, itemName: input.name, module: need.name });
+        }
+      }
+    }
+  }
+  if (ctx.industryPlan != null && ctx.industryPlan.block != null) {
+    decisions.push({ kind: "expand-factory", score: 100 + ctx.industryPlan.score, block: ctx.industryPlan.block });
+  }
+  decisions.push({ kind: "upgrade-economy", score: 70 + (ctx.stageInfo != null ? ctx.stageInfo.stage * 5 : 0) });
+  decisions = sortMicroDecisions(decisions);
+  return decisions.length > 0 ? decisions[0] : null;
+}
+
+function executeIndustryMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null) return false;
+  if (decision.kind == "module") return ensureIndustryModule(ctx.core, decision.module);
+  if (decision.kind == "mine-input") return ensureMiningForItem(ctx.core, decision.itemName);
+  if (decision.kind == "expand-factory" && decision.block != null) return placeIndustryBlock(ctx.core, ctx.team, decision.block);
+  if (decision.kind == "upgrade-economy") return tryUpgradeEconomy(ctx.team);
+  return false;
+}
+
+function chooseAttackWaveMicroDecision(ctx) {
+  if (ctx == null || ctx.enemyCore == null || ctx.attackPlan == null || ctx.buckets == null) return null;
+  var canWave = waveReady(ctx.buckets);
+  var cooled = (state.tick - state.lastWaveTick) >= config.waveCooldown;
+  if (!(canWave && cooled && ctx.attackPlan.canCommit)) return null;
+  var waveIds = collectWaveIds(ctx.buckets);
+  if (waveIds.size <= 0) return null;
+  return {
+    kind: "commit-wave",
+    score: 100 + waveIds.size + (ctx.attackPlan.friendlyForce != null ? ctx.attackPlan.friendlyForce : 0),
+    waveIds: waveIds,
+    target: new Vec2(ctx.enemyCore.x, ctx.enemyCore.y)
+  };
+}
+
+function executeAttackWaveMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null || ctx.enemyCore == null || decision.waveIds == null || decision.waveIds.size <= 0) return false;
+  commandUnitIds(ctx.team, decision.waveIds, ctx.enemyCore, decision.target);
+  state.lastWaveTick = state.tick;
+  state.waveIndex++;
+  Log.info("[IA] Onda " + state.waveIndex + " lançada: " + decision.waveIds.size + " unidades.");
+  return true;
+}
+
+function chooseRallyMicroDecision(ctx) {
+  if (ctx == null || ctx.core == null || ctx.enemyCore == null || ctx.buckets == null) return null;
+  var rallyIds = collectRallyIds(ctx.buckets);
+  if (rallyIds.size <= 0) return null;
+  return {
+    kind: "rally-force",
+    score: 100 + rallyIds.size,
+    rallyIds: rallyIds,
+    rallyPoint: getRallyPoint(ctx.core, ctx.enemyCore, config.rallyDistance)
+  };
+}
+
+function executeRallyMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null || decision.rallyIds == null || decision.rallyIds.size <= 0) return false;
+  commandUnitIds(ctx.team, decision.rallyIds, null, decision.rallyPoint);
+  state.lastRallyTick = state.tick;
+  return true;
+}
+
+function choosePowerMicroDecision(ctx) {
+  if (ctx == null || ctx.core == null) return null;
+  if (state.powerClusters >= config.maxPowerClusters) return null;
+  var nodeBlock = pickPowerNodeBlock(ctx.team);
+  if (nodeBlock == null || !coreHasItemsFor(nodeBlock, ctx.team)) return null;
+  var offsets = [
+    { dx: 4, dy: 2, score: 100 },
+    { dx: -4, dy: 2, score: 95 },
+    { dx: 4, dy: -2, score: 92 },
+    { dx: -4, dy: -2, score: 88 }
+  ];
+  var best = null;
+  for (var i = 0; i < offsets.length; i++) {
+    var off = offsets[i];
+    var x = ctx.core.tile.x + off.dx;
+    var y = ctx.core.tile.y + off.dy;
+    var cand = { kind: "cluster", score: off.score, x: x, y: y };
+    if (best == null || cand.score > best.score) best = cand;
+  }
+  return best;
+}
+
+function executePowerMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null) return false;
+  return placePowerCluster(ctx.team, decision.x, decision.y);
+}
+
+function chooseThermalMicroDecision(ctx) {
+  if (ctx == null || ctx.core == null) return null;
+  if (state.thermalCount >= config.maxThermals) return null;
+  var thermal = pickThermalBlock(ctx.team);
+  if (thermal == null || !coreHasItemsFor(thermal, ctx.team)) return null;
+  var spot = findHeatSpot(ctx.core, ctx.team, thermal);
+  if (spot == null) return null;
+  return { kind: "heat-spot", score: 100, thermal: thermal, x: spot.x, y: spot.y };
+}
+
+function executeThermalMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null || decision.thermal == null) return false;
+  if (!placeBlock(decision.thermal, decision.x, decision.y, 0, ctx.team)) return false;
+  state.thermalCount++;
+  return true;
+}
+
+function chooseLiquidMicroDecision(ctx) {
+  if (ctx == null || ctx.core == null) return null;
+  var team = ctx.team;
+  if (state.pumpCount >= config.maxPumps && state.liquidHubCount >= config.maxLiquidHubs) return null;
+  var pumpBlock = pickPumpBlock(team);
+  if (pumpBlock == null || !coreHasItemsFor(pumpBlock, team)) return null;
+  var liquids = findLiquidTiles(ctx.core.tile.x, ctx.core.tile.y, config.liquidSearchRadius, config.maxPumps);
+  if (liquids.length == 0) return null;
+  var best = liquids[0];
+  return {
+    kind: "liquid-network",
+    score: 100 - Math.sqrt(best.dist2),
+    pumpX: best.x,
+    pumpY: best.y,
+    liquid: best.liquid
+  };
+}
+
+function executeLiquidMicroDecision(ctx, decision) {
+  if (ctx == null || decision == null) return false;
+  return actionLiquid(ctx.core);
+}
+
+function runActionSubpolicy(actionName, ctx) {
+  if (actionName == null || ctx == null) return false;
+  var decision = null;
+  if (actionName == "mine") decision = chooseMineMicroDecision(ctx);
+  else if (actionName == "defend") decision = chooseDefendMicroDecision(ctx);
+  else if (actionName == "industry") decision = chooseIndustryMicroDecision(ctx);
+  else if (actionName == "attackWave") decision = chooseAttackWaveMicroDecision(ctx);
+  else if (actionName == "rally") decision = chooseRallyMicroDecision(ctx);
+  else if (actionName == "power") decision = choosePowerMicroDecision(ctx);
+  else if (actionName == "thermal") decision = chooseThermalMicroDecision(ctx);
+  else if (actionName == "liquid") decision = chooseLiquidMicroDecision(ctx);
+  else if (actionName == "noop") return true;
+  if (decision == null) return false;
+  markMicroDecision(actionName, decision);
+  if (actionName == "mine") return executeMineMicroDecision(ctx, decision);
+  if (actionName == "defend") return executeDefendMicroDecision(ctx, decision);
+  if (actionName == "industry") return executeIndustryMicroDecision(ctx, decision);
+  if (actionName == "attackWave") return executeAttackWaveMicroDecision(ctx, decision);
+  if (actionName == "rally") return executeRallyMicroDecision(ctx, decision);
+  if (actionName == "power") return executePowerMicroDecision(ctx, decision);
+  if (actionName == "thermal") return executeThermalMicroDecision(ctx, decision);
+  if (actionName == "liquid") return executeLiquidMicroDecision(ctx, decision);
+  return false;
+}
+
 function rankActions(actions) {
   var ranked = [];
   for (var i = 0; i < actions.length; i++) {
@@ -4868,6 +5165,7 @@ Events.on(WorldLoadEvent, function(){
   state.factoryBlocks = 0;
   state.actionHistory = [];
   state.lastActionTicks = {};
+  state.lastMicroAction = "";
   state.aiEnabled = config.aiEnabledDefault;
   state.lastFactoryConfigTick = -9999;
   state.lastErrorTick = -9999;
@@ -5097,6 +5395,7 @@ function runAiStep(core, team) {
   }
   configureFactories(team, core, strategy);
   var industryPlan = computeIndustryExpansionPlan(core, team, strategy);
+  var macroCtx = buildMacroActionContext(core, team, enemyCore, enemies, buckets, attackPlan, miningPlan, powerStats, stageInfo, chainStatus, ammoProfile, strategy, industryPlan);
 
   if (config.rlPolicyMode != "heuristic") {
     if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
@@ -5109,18 +5408,15 @@ function runAiStep(core, team) {
     }
   }
 
-  var runCore = function(fn){ return function(){ return fn(core); }; };
-  var runEnemy = function(fn){ return function(){ return enemyCore != null && fn(core, enemyCore); }; };
-
   var actionHandlers = {
-    attackWave: runEnemy(actionAttackWave),
-    rally: runEnemy(actionRally),
-    mine: function(){ return actionMine(core, miningPlan); },
-    defend: runCore(actionDefend),
-    power: runCore(actionPower),
-    liquid: runCore(actionLiquid),
-    thermal: runCore(actionThermal),
-    industry: function(){ return actionIndustry(core, industryPlan); },
+    attackWave: function(){ return runActionSubpolicy("attackWave", macroCtx); },
+    rally: function(){ return runActionSubpolicy("rally", macroCtx); },
+    mine: function(){ return runActionSubpolicy("mine", macroCtx); },
+    defend: function(){ return runActionSubpolicy("defend", macroCtx); },
+    power: function(){ return runActionSubpolicy("power", macroCtx); },
+    liquid: function(){ return runActionSubpolicy("liquid", macroCtx); },
+    thermal: function(){ return runActionSubpolicy("thermal", macroCtx); },
+    industry: function(){ return runActionSubpolicy("industry", macroCtx); },
     noop: function(){ return true; }
   };
 
