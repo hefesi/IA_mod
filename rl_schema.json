@@ -21,36 +21,8 @@
       "bins": [0, 50, 100, 200, 400, 800]
     },
     {
-      "name": "coal",
-      "bins": [0, 25, 50, 100, 200]
-    },
-    {
-      "name": "sand",
-      "bins": [0, 25, 50, 100, 200]
-    },
-    {
-      "name": "graphite",
-      "bins": [0, 10, 25, 50, 100]
-    },
-    {
-      "name": "silicon",
-      "bins": [0, 10, 25, 50, 100]
-    },
-    {
       "name": "titanium",
-      "bins": [0, 20, 50, 100, 200]
-    },
-    {
-      "name": "plastanium",
-      "bins": [0, 10, 20, 40, 80]
-    },
-    {
-      "name": "industryFactories",
-      "bins": [0, 1, 2, 3, 4]
-    },
-    {
-      "name": "economyStage",
-      "bins": [0.5, 1.5, 2.5, 3.5]
+      "bins": [0, 20, 40, 80, 160, 320]
     },
     {
       "name": "drills",
@@ -73,6 +45,10 @@
       "bins": [0, 3, 6, 10, 20, 40]
     },
     {
+      "name": "industryBlocks",
+      "bins": [0, 1, 2, 4, 6, 10]
+    },
+    {
       "name": "coreHealthFrac",
       "bins": [0.1, 0.25, 0.5, 0.75, 0.9]
     },
@@ -92,19 +68,13 @@
   "norms": {
     "copper": 1000.0,
     "lead": 1000.0,
-    "coal": 300.0,
-    "sand": 300.0,
-    "graphite": 200.0,
-    "silicon": 200.0,
-    "titanium": 300.0,
-    "plastanium": 120.0,
-    "industryFactories": 5.0,
-    "economyStage": 4.0,
+    "titanium": 500.0,
     "drills": 10.0,
     "turrets": 10.0,
     "power": 5.0,
     "enemies": 50.0,
     "unitsTotal": 50.0,
+    "industryBlocks": 20.0,
     "coreHealthFrac": 1.0,
     "corePresent": 1.0,
     "enemyCore": 1.0,

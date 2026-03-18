@@ -158,69 +158,25 @@ var config = {
   resourceReserveSoftMargin: 0.5,
   resourceReservePenalty: 0.6,
   resourceReserveBoost: 0.8,
-  industryTargets: {
-    graphite: {
-      output: 50,
-      inputs: {
-        coal: 80
-      }
-    },
-    silicon: {
-      output: 50,
-      inputs: {
-        coal: 100,
-        sand: 100
-      }
-    },
-    plastanium: {
-      output: 30,
-      inputs: {
-        titanium: 90
-      },
-      liquids: {
-        oil: 120
-      }
-    }
-  },
-  economyRoadmap: {
-    bootstrap: {
-      copperDrills: 2,
-      leadDrills: 2,
-      copper: 220,
-      lead: 180,
-      drills: 4,
-      power: 1,
-      turrets: 2
-    },
-    smelting: {
-      coalDrills: 1,
-      sandDrills: 1,
-      graphiteFactories: 1,
-      siliconFactories: 1,
-      graphite: 40,
-      silicon: 40,
-      drills: 6,
-      power: 1
-    },
-    advanced: {
-      titaniumDrills: 1,
-      plastaniumFactories: 1,
-      titanium: 80,
-      plastanium: 20,
-      drills: 7,
-      power: 2,
-      liquid: 1
-    },
-    assault: {
-      drills: 8,
-      turrets: 4,
-      power: 2,
-      graphite: 80,
-      silicon: 80,
-      plastanium: 25,
-      units: 12
-    }
-  },
+  economicMiningRoadmap: [
+    { item: "copper", priority: 1.0, minDrills: 1, critical: false },
+    { item: "lead", priority: 1.05, minDrills: 1, critical: false },
+    { item: "graphite", priority: 1.1, minDrills: 0, critical: false },
+    { item: "metaglass", priority: 1.1, minDrills: 0, critical: false },
+    { item: "silicon", priority: 1.2, minDrills: 0, critical: false },
+    { item: "titanium", priority: 1.5, minDrills: 1, critical: true, bypassSlots: 2 },
+    { item: "thorium", priority: 1.35, minDrills: 1, critical: true, bypassSlots: 1 }
+  ],
+  mineRoadmapBaseScore: 35,
+  mineRoadmapPressureWeight: 120,
+  mineRoadmapPriorityWeight: 30,
+  mineRoadmapDistanceWeight: 1.5,
+  mineRoadmapUnderDrilledBonus: 28,
+  mineCriticalBypassSlots: 2,
+  mineCriticalPressureGate: 0.2,
+  rlNNEconomicGuard: true,
+  rlNNEconomicGuardFloor: 1.0,
+  rlNNEconomicGuardThreshold: 70,
   strategyMode: "auto",
   strategySwitchCooldown: 600,
   strategyAffectsRL: false,
@@ -396,6 +352,7 @@ var state = {
   pumpCount: 0,
   liquidHubCount: 0,
   thermalCount: 0,
+  industryBlocks: 0,
   actionHistory: [],
   lastActionTicks: {},
   aiEnabled: true,
@@ -639,24 +596,14 @@ function snapshotState(core, enemyCore, enemies, team) {
   var corePresent = core != null;
   var copper = 0;
   var lead = 0;
-  var coal = 0;
-  var sand = 0;
-  var graphite = 0;
-  var silicon = 0;
   var titanium = 0;
-  var plastanium = 0;
   var coreItems = 0;
   var coreHealth = 0;
   var coreMax = 1;
   if (corePresent && core.items != null) {
     copper = core.items.get(Items.copper);
     lead = core.items.get(Items.lead);
-    coal = core.items.get(Items.coal);
-    sand = core.items.get(Items.sand);
-    graphite = core.items.get(Items.graphite);
-    silicon = core.items.get(Items.silicon);
     titanium = core.items.get(Items.titanium);
-    plastanium = core.items.get(Items.plastanium);
     try {
       coreItems = core.items.total();
     } catch (e0) {
@@ -702,14 +649,7 @@ function snapshotState(core, enemyCore, enemies, team) {
     tick: state.tick,
     copper: copper,
     lead: lead,
-    coal: coal,
-    sand: sand,
-    graphite: graphite,
-    silicon: silicon,
     titanium: titanium,
-    plastanium: plastanium,
-    industryFactories: industryFactories,
-    economyStage: economyStage,
     drills: state.drillCount,
     turrets: state.turretCount,
     power: state.powerClusters,
@@ -727,7 +667,8 @@ function snapshotState(core, enemyCore, enemies, team) {
     unitsGround: unitsGround,
     unitsAir: unitsAir,
     unitsSupport: unitsSupport,
-    unitsTotal: unitsTotal
+    unitsTotal: unitsTotal,
+    industryBlocks: state.industryBlocks
   };
 }
 
@@ -1735,6 +1676,25 @@ function nnScoresForState(stateObj) {
   return scores;
 }
 
+function nnModelHasFeature(name) {
+  if (state.nnModel == null || state.nnModel.features == null || name == null) return false;
+  for (var i = 0; i < state.nnModel.features.length; i++) {
+    if (featureName(state.nnModel.features[i]) == name) return true;
+  }
+  return false;
+}
+
+function shouldProtectEconomicMineScore(plan) {
+  if (!config.rlNNEconomicGuard) return false;
+  if (plan == null) return false;
+  var threshold = config.rlNNEconomicGuardThreshold != null ? config.rlNNEconomicGuardThreshold : 0;
+  if (plan.score < threshold && !plan.missingEconomicSignal) return false;
+  if (!nnModelHasFeature("titanium")) return true;
+  if (!nnModelHasFeature("industryBlocks")) return true;
+  if (plan.itemName != null && !nnModelHasFeature(plan.itemName) && (plan.critical || plan.pressure > 0.5)) return true;
+  return false;
+}
+
 function nnUsesPolicySampling() {
   if (config.rlPolicyMode != "nn") return false;
   if (!config.rlPolicySample) return false;
@@ -2534,14 +2494,20 @@ function findOreTiles(cx, cy, radius, maxCount) {
     for (var dy = -radius; dy <= radius; dy++) {
       var tile = tileAt(cx + dx, cy + dy);
       if (tile == null) continue;
-      if (tile.drop() != null) {
+      var drop = null;
+      try {
+        drop = tile.drop();
+      } catch (e) {
+        drop = null;
+      }
+      if (drop != null) {
         var dist2 = dx * dx + dy * dy;
-        found.push({ x: tile.x, y: tile.y, dist2: dist2 });
+        found.push({ x: tile.x, y: tile.y, dist2: dist2, item: drop, itemName: drop.name });
       }
     }
   }
   found.sort(function(a, b){ return a.dist2 - b.dist2; });
-  if (found.length > maxCount) found.length = maxCount;
+  if (maxCount != null && maxCount >= 0 && found.length > maxCount) found.length = maxCount;
   return found;
 }
 
@@ -2932,6 +2898,39 @@ function countBlocksByPredicate(team, predicate) {
 function countBlocksByGroup(team, group) {
   return countBlocksByPredicate(team, function(b){
     return b.block.group == group;
+  });
+}
+
+function isIndustryBlock(block) {
+  if (block == null) return false;
+  try {
+    if (block.group == BlockGroup.units) return true;
+  } catch (e) {
+    // ignore
+  }
+  var name = "";
+  try {
+    name = String(block.name || "");
+  } catch (e2) {
+    name = "";
+  }
+  return name.indexOf("factory") >= 0 ||
+    name.indexOf("reconstructor") >= 0 ||
+    name.indexOf("assembler") >= 0 ||
+    name.indexOf("kiln") >= 0 ||
+    name.indexOf("press") >= 0 ||
+    name.indexOf("smelter") >= 0 ||
+    name.indexOf("mixer") >= 0 ||
+    name.indexOf("separator") >= 0 ||
+    name.indexOf("disassembler") >= 0 ||
+    name.indexOf("pulverizer") >= 0 ||
+    name.indexOf("centrifuge") >= 0 ||
+    name.indexOf("crucible") >= 0;
+}
+
+function countIndustryBlocks(team) {
+  return countBlocksByPredicate(team, function(b){
+    return isIndustryBlock(b.block);
   });
 }
 
@@ -3513,20 +3512,8 @@ function recordAction(name) {
 }
 
 function findBestOreNearCore(core) {
-  var team = getTeam();
-  var priority = priorityMineItems(core, team);
-  for (var p = 0; p < priority.length; p++) {
-    var preferred = findBestOreForItem(core, priority[p], config.priorityOreSearchRadius);
-    if (preferred != null) return preferred;
-  }
-  var cx = core.tile.x;
-  var cy = core.tile.y;
-  var ores = findOreTiles(cx, cy, config.oreSearchRadius, config.maxDrills);
-  for (var i = 0; i < ores.length; i++) {
-    var tile = tileAt(ores[i].x, ores[i].y);
-    if (tile != null && tile.block() == Blocks.air) return ores[i];
-  }
-  return null;
+  var plan = computeMiningPlan(core, getTeam());
+  return plan != null ? plan.ore : null;
 }
 
 function findLiquidHub(team) {
@@ -3597,398 +3584,7 @@ function findHeatSpot(core, team, thermalBlock) {
   return findPlaceForBlock(thermal, cx, cy, config.thermalSearchRadius, team);
 }
 
-function findBestOreForItem(core, item, radius) {
-  if (core == null || core.tile == null || item == null) return null;
-  var search = radius != null ? radius : (config.priorityOreSearchRadius != null ? config.priorityOreSearchRadius : config.oreSearchRadius);
-  var ores = findOreTilesByItem(core.tile.x, core.tile.y, search, item, config.priorityDrillCap);
-  return ores.length > 0 ? ores[0] : null;
-}
-
-function findExistingPumpForLiquid(team, liquid, nearX, nearY, radius) {
-  var best = null;
-  var bestDist = 999999;
-  Groups.build.each(function(b){
-    if (b == null || b.team != team || b.block == null || b.tile == null) return;
-    if (!isInstance(b.block, PumpBlock)) return;
-    var liq = null;
-    try {
-      if (b.tile.floor() != null) liq = b.tile.floor().liquidDrop;
-    } catch (e) {
-      liq = null;
-    }
-    if (liq != liquid) return;
-    var dx = b.tile.x - nearX;
-    var dy = b.tile.y - nearY;
-    var dist = dx * dx + dy * dy;
-    if (dist < bestDist && (radius == null || dist <= radius * radius)) {
-      best = b;
-      bestDist = dist;
-    }
-  });
-  return best;
-}
-
-function pushUniqueItem(list, item) {
-  if (item == null) return;
-  for (var i = 0; i < list.length; i++) {
-    if (list[i] == item) return;
-  }
-  list.push(item);
-}
-
-function pushUniqueValue(list, value) {
-  if (value == null) return;
-  for (var i = 0; i < list.length; i++) {
-    if (list[i] == value) return;
-  }
-  list.push(value);
-}
-
-function economyRoadmapSection(name) {
-  if (config.economyRoadmap != null && config.economyRoadmap[name] != null) return config.economyRoadmap[name];
-  return {};
-}
-
-function economyRoadmapValue(section, key, fallback) {
-  var data = economyRoadmapSection(section);
-  if (data != null && data[key] != null) return data[key];
-  return fallback;
-}
-
-function desiredDrillsForStage(stageInfo) {
-  if (stageInfo != null && stageInfo.stage >= 3) return economyRoadmapValue("assault", "drills", config.priorityDrillCap != null ? config.priorityDrillCap : config.maxDrills);
-  if (stageInfo != null && stageInfo.stage >= 2) return economyRoadmapValue("advanced", "drills", config.priorityDrillCap != null ? config.priorityDrillCap : config.maxDrills);
-  if (stageInfo != null && stageInfo.stage >= 1) return economyRoadmapValue("smelting", "drills", config.maxDrills);
-  return economyRoadmapValue("bootstrap", "drills", config.maxDrills);
-}
-
-function desiredTurretsForStage(stageInfo) {
-  if (stageInfo != null && stageInfo.stage >= 3) return economyRoadmapValue("assault", "turrets", config.maxTurrets);
-  return economyRoadmapValue("bootstrap", "turrets", Math.min(2, config.maxTurrets));
-}
-
-function desiredPowerForStage(stageInfo) {
-  if (stageInfo != null && stageInfo.stage >= 3) return economyRoadmapValue("assault", "power", config.maxPowerClusters);
-  if (stageInfo != null && stageInfo.stage >= 2) return economyRoadmapValue("advanced", "power", config.maxPowerClusters);
-  if (stageInfo != null && stageInfo.stage >= 1) return economyRoadmapValue("smelting", "power", 1);
-  return economyRoadmapValue("bootstrap", "power", 1);
-}
-
-function desiredLiquidForStage(stageInfo) {
-  if (stageInfo != null && stageInfo.stage >= 2) return economyRoadmapValue("advanced", "liquid", 1);
-  return 0;
-}
-
-function targetedDrillCapForItem(stageInfo, itemName) {
-  var fallback = config.maxTargetedDrillsPerItem != null ? config.maxTargetedDrillsPerItem : 2;
-  if (itemName == "copper") return stageInfo != null && stageInfo.stage >= 2 ? 3 : economyRoadmapValue("bootstrap", "copperDrills", fallback);
-  if (itemName == "lead") return stageInfo != null && stageInfo.stage >= 2 ? 3 : economyRoadmapValue("bootstrap", "leadDrills", fallback);
-  if (itemName == "coal") return stageInfo != null && stageInfo.stage >= 3 ? 2 : economyRoadmapValue("smelting", "coalDrills", 1);
-  if (itemName == "sand") return stageInfo != null && stageInfo.stage >= 3 ? 2 : economyRoadmapValue("smelting", "sandDrills", 1);
-  if (itemName == "titanium") return stageInfo != null && stageInfo.stage >= 3 ? 2 : economyRoadmapValue("advanced", "titaniumDrills", 1);
-  return fallback;
-}
-
-function economyStageInfo(core, team, unitsTotal) {
-  var totalUnits = unitsTotal;
-  if (totalUnits == null) {
-    totalUnits = 0;
-    if (team != null) {
-      var buckets = collectUnitBuckets(team);
-      totalUnits = buckets.ground.size + buckets.air.size + buckets.support.size;
-    }
-  }
-
-  var copper = coreItemCount(core, Items.copper);
-  var lead = coreItemCount(core, Items.lead);
-  var coal = coreItemCount(core, Items.coal);
-  var sand = coreItemCount(core, Items.sand);
-  var graphite = coreItemCount(core, Items.graphite);
-  var silicon = coreItemCount(core, Items.silicon);
-  var titanium = coreItemCount(core, Items.titanium);
-  var plastanium = coreItemCount(core, Items.plastanium);
-
-  var copperDrills = countDrillsForItem(team, Items.copper);
-  var leadDrills = countDrillsForItem(team, Items.lead);
-  var coalDrills = countDrillsForItem(team, Items.coal);
-  var sandDrills = countDrillsForItem(team, Items.sand);
-  var titaniumDrills = countDrillsForItem(team, Items.titanium);
-
-  var graphiteFactories = countIndustryFactories(team, "graphite");
-  var siliconFactories = countIndustryFactories(team, "silicon");
-  var plastaniumFactories = countIndustryFactories(team, "plastanium");
-  var industryFactories = graphiteFactories + siliconFactories + plastaniumFactories;
-
-  var bootstrapReady =
-    copperDrills >= economyRoadmapValue("bootstrap", "copperDrills", 2) &&
-    leadDrills >= economyRoadmapValue("bootstrap", "leadDrills", 2) &&
-    copper >= economyRoadmapValue("bootstrap", "copper", 220) &&
-    lead >= economyRoadmapValue("bootstrap", "lead", 180) &&
-    state.powerClusters >= economyRoadmapValue("bootstrap", "power", 1);
-
-  var smeltingReady =
-    bootstrapReady &&
-    coalDrills >= economyRoadmapValue("smelting", "coalDrills", 1) &&
-    sandDrills >= economyRoadmapValue("smelting", "sandDrills", 1) &&
-    graphiteFactories >= economyRoadmapValue("smelting", "graphiteFactories", 1) &&
-    siliconFactories >= economyRoadmapValue("smelting", "siliconFactories", 1) &&
-    graphite >= economyRoadmapValue("smelting", "graphite", 40) &&
-    silicon >= economyRoadmapValue("smelting", "silicon", 40);
-
-  var advancedReady =
-    smeltingReady &&
-    titaniumDrills >= economyRoadmapValue("advanced", "titaniumDrills", 1) &&
-    plastaniumFactories >= economyRoadmapValue("advanced", "plastaniumFactories", 1) &&
-    titanium >= economyRoadmapValue("advanced", "titanium", 80) &&
-    plastanium >= economyRoadmapValue("advanced", "plastanium", 20) &&
-    state.powerClusters >= economyRoadmapValue("advanced", "power", 2);
-
-  var assaultReady =
-    advancedReady &&
-    state.drillCount >= economyRoadmapValue("assault", "drills", 8) &&
-    state.turretCount >= economyRoadmapValue("assault", "turrets", 4) &&
-    state.powerClusters >= economyRoadmapValue("assault", "power", 2) &&
-    graphite >= economyRoadmapValue("assault", "graphite", 80) &&
-    silicon >= economyRoadmapValue("assault", "silicon", 80) &&
-    plastanium >= economyRoadmapValue("assault", "plastanium", 25) &&
-    totalUnits >= economyRoadmapValue("assault", "units", 12);
-
-  var stage = 0;
-  if (bootstrapReady) stage = 1;
-  if (smeltingReady) stage = 2;
-  if (advancedReady) stage = 3;
-  if (assaultReady) stage = 4;
-
-  return {
-    stage: stage,
-    focus: stage < 1 ? "bootstrap" : stage < 2 ? "smelting" : stage < 3 ? "advanced" : "assault",
-    unitsTotal: totalUnits,
-    copper: copper,
-    lead: lead,
-    coal: coal,
-    sand: sand,
-    graphite: graphite,
-    silicon: silicon,
-    titanium: titanium,
-    plastanium: plastanium,
-    copperDrills: copperDrills,
-    leadDrills: leadDrills,
-    coalDrills: coalDrills,
-    sandDrills: sandDrills,
-    titaniumDrills: titaniumDrills,
-    graphiteFactories: graphiteFactories,
-    siliconFactories: siliconFactories,
-    plastaniumFactories: plastaniumFactories,
-    industryFactories: industryFactories,
-    bootstrapReady: bootstrapReady,
-    smeltingReady: smeltingReady,
-    advancedReady: advancedReady,
-    assaultReady: assaultReady
-  };
-}
-
-function buildEconomyMiningOrder(stageInfo) {
-  var order = [];
-  if (stageInfo == null) return order;
-
-  if (stageInfo.copperDrills < economyRoadmapValue("bootstrap", "copperDrills", 2) || stageInfo.copper < economyRoadmapValue("bootstrap", "copper", 220)) {
-    pushUniqueValue(order, "copper");
-  }
-  if (stageInfo.leadDrills < economyRoadmapValue("bootstrap", "leadDrills", 2) || stageInfo.lead < economyRoadmapValue("bootstrap", "lead", 180)) {
-    pushUniqueValue(order, "lead");
-  }
-  if (stageInfo.stage < 2 || stageInfo.coalDrills < economyRoadmapValue("smelting", "coalDrills", 1) || stageInfo.coal < economyRoadmapValue("smelting", "graphite", 40) * 2) {
-    pushUniqueValue(order, "coal");
-  }
-  if (stageInfo.stage < 2 || stageInfo.sandDrills < economyRoadmapValue("smelting", "sandDrills", 1) || stageInfo.sand < economyRoadmapValue("smelting", "silicon", 40) * 2) {
-    pushUniqueValue(order, "sand");
-  }
-  if (stageInfo.stage >= 2 && (stageInfo.titaniumDrills < economyRoadmapValue("advanced", "titaniumDrills", 1) || stageInfo.titanium < economyRoadmapValue("advanced", "titanium", 80))) {
-    pushUniqueValue(order, "titanium");
-  }
-  return order;
-}
-
-function miningOrderDrillOverflow(stageInfo, team) {
-  var extra = 0;
-  var maxExtra = config.strategicDrillOverflow != null ? config.strategicDrillOverflow : 0;
-  if (maxExtra <= 0 || stageInfo == null || team == null) return 0;
-  var order = buildEconomyMiningOrder(stageInfo);
-  for (var i = 0; i < order.length; i++) {
-    if (extra >= maxExtra) break;
-    var itemName = order[i];
-    var item = itemByName(itemName);
-    if (item == null) continue;
-    if (countDrillsForItem(team, item) >= targetedDrillCapForItem(stageInfo, itemName)) continue;
-    extra++;
-  }
-  return extra;
-}
-
-function allowedDrillCapacity(stageInfo, team) {
-  return desiredDrillsForStage(stageInfo) + miningOrderDrillOverflow(stageInfo, team);
-}
-
-function buildEconomyIndustryOrder(stageInfo) {
-  var order = [];
-  if (stageInfo == null) return order;
-  if (stageInfo.graphiteFactories < economyRoadmapValue("smelting", "graphiteFactories", 1)) pushUniqueValue(order, "graphite");
-  if (stageInfo.graphiteFactories > 0 && stageInfo.siliconFactories < economyRoadmapValue("smelting", "siliconFactories", 1)) pushUniqueValue(order, "silicon");
-  if (stageInfo.siliconFactories > 0 && stageInfo.titaniumDrills >= economyRoadmapValue("advanced", "titaniumDrills", 1) && stageInfo.plastaniumFactories < economyRoadmapValue("advanced", "plastaniumFactories", 1)) {
-    pushUniqueValue(order, "plastanium");
-  }
-  return order;
-}
-
-function priorityMineItems(core, team) {
-  var list = [];
-  var stageInfo = economyStageInfo(core, team);
-  if (core != null && core.items != null) {
-    if (availableCoreItems(core, Items.copper) < config.attackMinCopper) pushUniqueItem(list, Items.copper);
-    if (availableCoreItems(core, Items.lead) < config.attackMinLead) pushUniqueItem(list, Items.lead);
-  }
-  var miningOrder = buildEconomyMiningOrder(stageInfo);
-  for (var i = 0; i < miningOrder.length; i++) {
-    pushUniqueItem(list, itemByName(miningOrder[i]));
-  }
-  for (var key in industryBlueprints) {
-    if (!industryBlueprints.hasOwnProperty(key)) continue;
-    var def = industryBlueprints[key];
-    var outputItem = itemByName(def.output);
-    var outputTarget = industryOutputTarget(key);
-    if (outputItem != null && countIndustryFactories(team, key) > 0 && coreItemCount(core, outputItem) >= outputTarget) continue;
-    for (var j = 0; j < def.inputs.length; j++) {
-      var input = def.inputs[j];
-      var item = itemByName(input.name);
-      if (item == null) continue;
-      var inputTarget = industryInputTarget(key, input.name);
-      if (countDrillsForItem(team, item) <= 0 || coreItemCount(core, item) < inputTarget) {
-        pushUniqueItem(list, item);
-      }
-    }
-  }
-  return list;
-}
-
-function ensureMiningForItem(core, itemName) {
-  var team = getTeam();
-  var item = itemByName(itemName);
-  if (item == null || core == null) return false;
-  var stageInfo = economyStageInfo(core, team);
-  var drill = pickDrillBlock(team, industryReserveIgnore);
-  if (drill == null || !coreHasItemsFor(drill, team, industryReserveIgnore)) return false;
-  var perItemCap = targetedDrillCapForItem(stageInfo, itemName);
-  var totalCap = allowedDrillCapacity(stageInfo, team);
-  if (countDrillsForItem(team, item) >= perItemCap) return false;
-  if (state.drillCount >= totalCap) return false;
-  var ore = findBestOreForItem(core, item, config.priorityOreSearchRadius);
-  if (ore == null) return false;
-  if (!placeBlock(drill, ore.x, ore.y, 0, team, industryReserveIgnore)) return false;
-  state.drillCount++;
-  var preferVertical = Math.abs(core.tile.y - ore.y) > Math.abs(core.tile.x - ore.x);
-  var step = stepTowardAxis(ore.x, ore.y, core.tile.x, core.tile.y, preferVertical);
-  placeConveyorPath(team, ore.x + step.dx, ore.y + step.dy, core.tile.x, core.tile.y, config.maxConveyorSteps, preferVertical, industryReserveIgnore);
-  return true;
-}
-
-function computeIndustryNeed(core, team, name) {
-  var def = industryBlueprints[name];
-  if (def == null) return null;
-  var outputItem = itemByName(def.output);
-  var outputTarget = industryOutputTarget(name);
-  var outputCount = coreItemCount(core, outputItem);
-  var outputPressure = outputTarget > 0 ? clamp01((outputTarget - outputCount) / outputTarget) : 0;
-  var inputPressure = 0;
-  for (var i = 0; i < def.inputs.length; i++) {
-    var input = def.inputs[i];
-    var item = itemByName(input.name);
-    if (item == null) continue;
-    var inputTarget = industryInputTarget(name, input.name);
-    if (inputTarget <= 0) continue;
-    var frac = clamp01((inputTarget - coreItemCount(core, item)) / inputTarget);
-    if (countDrillsForItem(team, item) <= 0) frac = Math.max(frac, 0.6);
-    if (frac > inputPressure) inputPressure = frac;
-  }
-  var count = countIndustryFactories(team, name);
-  var score = outputPressure * 100 + inputPressure * 45;
-  if ((outputPressure > 0 || inputPressure > 0) && count <= 0) score += 30;
-  return {
-    name: name,
-    def: def,
-    count: count,
-    outputCount: outputCount,
-    outputTarget: outputTarget,
-    pressure: clamp01(Math.max(outputPressure, inputPressure)),
-    score: score
-  };
-}
-
-function rankIndustryNeeds(core, team) {
-  var list = [];
-  for (var key in industryBlueprints) {
-    if (!industryBlueprints.hasOwnProperty(key)) continue;
-    var need = computeIndustryNeed(core, team, key);
-    if (need != null && need.score > 0) list.push(need);
-  }
-  list.sort(function(a, b){ return b.score - a.score; });
-  return list;
-}
-
-function industryPressure(core, team) {
-  var ranked = rankIndustryNeeds(core, team);
-  return ranked.length > 0 ? ranked[0].pressure : 0;
-}
-
-function economicPressure(core, team) {
-  var reserve = reservePressure(core);
-  var industry = industryPressure(core, team);
-  return reserve > industry ? reserve : industry;
-}
-
-function countUpgradeableDrills(team) {
-  var list = config.blockPrefs != null ? config.blockPrefs.drills : null;
-  var target = pickDrillBlock(team, industryReserveIgnore);
-  return countUpgradeableOrderedBuilds(team, list, target, function(b, targetBlock){
-    return b.block.group == BlockGroup.drills && b.tile != null && targetBlock != null;
-  });
-}
-
-function countUpgradeableConveyors(team) {
-  var list = config.blockPrefs != null ? config.blockPrefs.conveyors : null;
-  var target = pickConveyorBlock(team, industryReserveIgnore);
-  return countUpgradeableOrderedBuilds(team, list, target, function(b, targetBlock){
-    if (targetBlock == null) return false;
-    if (!(isInstance(b.block, Conveyor) || isInstance(b.block, Duct))) return false;
-    return true;
-  });
-}
-
-function upgradeEconomyScore(team) {
-  var drills = countUpgradeableDrills(team);
-  var conveyors = countUpgradeableConveyors(team);
-  var score = drills * 20 + conveyors * 4;
-  if (score > 80) score = 80;
-  return score;
-}
-
-function tryUpgradeEconomy(team) {
-  var drillTarget = pickDrillBlock(team, industryReserveIgnore);
-  var drillList = config.blockPrefs != null ? config.blockPrefs.drills : null;
-  if (tryUpgradeOrderedBuild(team, drillList, drillTarget, function(b, targetBlock){
-    return b.block.group == BlockGroup.drills && targetBlock != null;
-  }, industryReserveIgnore)) return true;
-
-  var convTarget = pickConveyorBlock(team, industryReserveIgnore);
-  var convList = config.blockPrefs != null ? config.blockPrefs.conveyors : null;
-  if (tryUpgradeOrderedBuild(team, convList, convTarget, function(b, targetBlock){
-    if (targetBlock == null) return false;
-    return isInstance(b.block, Conveyor) || isInstance(b.block, Duct);
-  }, industryReserveIgnore)) return true;
-
-  return false;
-}
-
-function actionMine(core) {
+function actionMine(core, plan) {
   var team = getTeam();
   var stageInfo = economyStageInfo(core, team);
   var priority = priorityMineItems(core, team);
@@ -4000,10 +3596,11 @@ function actionMine(core) {
   if (state.drillCount >= allowedDrillCapacity(stageInfo, team)) return false;
   var drill = pickDrillBlock(team, industryReserveIgnore);
   if (drill == null) return false;
-  if (!coreHasItemsFor(drill, team, industryReserveIgnore)) return false;
-  var ore = findBestOreNearCore(core);
-  if (ore == null) return false;
-  if (!placeBlock(drill, ore.x, ore.y, 0, team, industryReserveIgnore)) return false;
+  if (!coreHasItemsFor(drill, team)) return false;
+  var miningPlan = plan != null ? plan : computeMiningPlan(core, team);
+  if (miningPlan == null || miningPlan.ore == null) return false;
+  var ore = miningPlan.ore;
+  if (!placeBlock(drill, ore.x, ore.y, 0, team)) return false;
   state.drillCount++;
   var cx = core.tile.x;
   var cy = core.tile.y;
@@ -4407,6 +4004,7 @@ Events.on(WorldLoadEvent, function(){
   state.pumpCount = 0;
   state.liquidHubCount = 0;
   state.thermalCount = 0;
+  state.industryBlocks = 0;
   state.actionHistory = [];
   state.lastActionTicks = {};
   state.aiEnabled = config.aiEnabledDefault;
@@ -4566,6 +4164,7 @@ function runAiLogic() {
   state.pumpCount = countPumps(team2);
   state.liquidHubCount = countLiquidHubs(team2);
   state.thermalCount = countThermals(team2);
+  state.industryBlocks = countIndustryBlocks(team2);
 
   configureFactories(team2);
   ensureLogicControllers(core2, team2);
@@ -4595,22 +4194,7 @@ function runAiStep(core, team) {
   var canPump = pumpBlock != null && coreHasItemsFor(pumpBlock, team);
   var canLiquidHub = hubBlock != null && coreHasItemsFor(hubBlock, team);
   var canLiquid = canPump || findLiquidHub(team) != null || canLiquidHub;
-  var stageInfo = economyStageInfo(core, team, buckets.ground.size + buckets.air.size + buckets.support.size);
-  var desiredDrills = desiredDrillsForStage(stageInfo);
-  var desiredTurrets = desiredTurretsForStage(stageInfo);
-  var desiredPower = desiredPowerForStage(stageInfo);
-  var desiredLiquid = desiredLiquidForStage(stageInfo);
-  var bootstrapCopperNeed = stageInfo.copperDrills < economyRoadmapValue("bootstrap", "copperDrills", 2) || stageInfo.copper < economyRoadmapValue("bootstrap", "copper", 220);
-  var bootstrapLeadNeed = stageInfo.leadDrills < economyRoadmapValue("bootstrap", "leadDrills", 2) || stageInfo.lead < economyRoadmapValue("bootstrap", "lead", 180);
-  var smeltingMineNeed =
-    stageInfo.coalDrills < economyRoadmapValue("smelting", "coalDrills", 1) ||
-    stageInfo.sandDrills < economyRoadmapValue("smelting", "sandDrills", 1) ||
-    stageInfo.coal < economyRoadmapValue("smelting", "graphite", 40) * 2 ||
-    stageInfo.sand < economyRoadmapValue("smelting", "silicon", 40) * 2;
-  var advancedMineNeed = stageInfo.stage >= 2 && (
-    stageInfo.titaniumDrills < economyRoadmapValue("advanced", "titaniumDrills", 1) ||
-    stageInfo.titanium < economyRoadmapValue("advanced", "titanium", 80)
-  );
+  var miningPlan = computeMiningPlan(core, team);
   var powerStats = computePowerStatus(team);
   var powerNeedScore =
     powerStats.count == 0 ? 40 :
@@ -4658,8 +4242,7 @@ function runAiStep(core, team) {
   var actionHandlers = {
     attackWave: runEnemy(actionAttackWave),
     rally: runEnemy(actionRally),
-    mine: runCore(actionMine),
-    industry: runCore(actionIndustry),
+    mine: function(){ return actionMine(core, miningPlan); },
     defend: runCore(actionDefend),
     power: runCore(actionPower),
     noop: function(){ return true; }
@@ -4674,14 +4257,9 @@ function runAiStep(core, team) {
   var thermalScore = (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + (stageInfo.stage >= 2 ? 45 : 35)) : 0);
   thermalScore *= reservePenalty;
   addAction("thermal", thermalScore, runCore(actionThermal));
-  addAction("attackWave", attackPlan.canCommit ? (100 + stageInfo.stage * 8) : 0, actionHandlers.attackWave);
-  addAction("rally", attackPlan.shouldRally ? (110 + stageInfo.stage * 6) : 0, actionHandlers.rally);
-  var drillGap = Math.max(0, desiredDrills - state.drillCount);
-  var mineScore = canDrill ? 25 + drillGap * 18 : 0;
-  if (bootstrapCopperNeed) mineScore += 70;
-  if (bootstrapLeadNeed) mineScore += 65;
-  if (stageInfo.stage < 2 && smeltingMineNeed) mineScore += 45;
-  if (stageInfo.stage < 3 && advancedMineNeed) mineScore += 35;
+  addAction("attackWave", attackPlan.canCommit ? 100 : 0, actionHandlers.attackWave);
+  addAction("rally", attackPlan.shouldRally ? 120 : 0, actionHandlers.rally);
+  var mineScore = (canDrill && miningPlan != null ? miningPlan.score : 0);
   mineScore *= reserveBoost;
   addAction("mine", mineScore, actionHandlers.mine);
   var industryScore = (topIndustryNeed != null ? (45 + topIndustryNeed.score) : 0) + economyUpgradeScore;
@@ -4744,6 +4322,12 @@ function runAiStep(core, team) {
             continue;
           }
           act2.score = nnv;
+          if (act2.name == "mine" && shouldProtectEconomicMineScore(miningPlan)) {
+            var floor = config.rlNNEconomicGuardFloor != null ? config.rlNNEconomicGuardFloor : 1.0;
+            if (floor < 0) floor = 0;
+            var minScore = act2.baseScore * floor;
+            if (act2.score < minScore) act2.score = minScore;
+          }
         }
       }
     }
