@@ -18,6 +18,10 @@
       "bins": [0, 50, 100, 200, 400, 800]
     },
     {
+      "name": "titanium",
+      "bins": [0, 20, 40, 80, 160, 320]
+    },
+    {
       "name": "drills",
       "bins": [0, 1, 2, 3, 4, 5]
     },
@@ -36,6 +40,10 @@
     {
       "name": "unitsTotal",
       "bins": [0, 3, 6, 10, 20, 40]
+    },
+    {
+      "name": "industryBlocks",
+      "bins": [0, 1, 2, 4, 6, 10]
     },
     {
       "name": "coreHealthFrac",
@@ -57,11 +65,13 @@
   "norms": {
     "copper": 1000.0,
     "lead": 1000.0,
+    "titanium": 500.0,
     "drills": 10.0,
     "turrets": 10.0,
     "power": 5.0,
     "enemies": 50.0,
     "unitsTotal": 50.0,
+    "industryBlocks": 20.0,
     "coreHealthFrac": 1.0,
     "corePresent": 1.0,
     "enemyCore": 1.0,

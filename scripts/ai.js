@@ -142,6 +142,25 @@ var config = {
   resourceReserveSoftMargin: 0.5,
   resourceReservePenalty: 0.6,
   resourceReserveBoost: 0.8,
+  economicMiningRoadmap: [
+    { item: "copper", priority: 1.0, minDrills: 1, critical: false },
+    { item: "lead", priority: 1.05, minDrills: 1, critical: false },
+    { item: "graphite", priority: 1.1, minDrills: 0, critical: false },
+    { item: "metaglass", priority: 1.1, minDrills: 0, critical: false },
+    { item: "silicon", priority: 1.2, minDrills: 0, critical: false },
+    { item: "titanium", priority: 1.5, minDrills: 1, critical: true, bypassSlots: 2 },
+    { item: "thorium", priority: 1.35, minDrills: 1, critical: true, bypassSlots: 1 }
+  ],
+  mineRoadmapBaseScore: 35,
+  mineRoadmapPressureWeight: 120,
+  mineRoadmapPriorityWeight: 30,
+  mineRoadmapDistanceWeight: 1.5,
+  mineRoadmapUnderDrilledBonus: 28,
+  mineCriticalBypassSlots: 2,
+  mineCriticalPressureGate: 0.2,
+  rlNNEconomicGuard: true,
+  rlNNEconomicGuardFloor: 1.0,
+  rlNNEconomicGuardThreshold: 70,
   strategyMode: "auto",
   strategySwitchCooldown: 600,
   strategyAffectsRL: false,
@@ -259,6 +278,7 @@ var state = {
   pumpCount: 0,
   liquidHubCount: 0,
   thermalCount: 0,
+  industryBlocks: 0,
   actionHistory: [],
   lastActionTicks: {},
   aiEnabled: true,
@@ -502,12 +522,14 @@ function snapshotState(core, enemyCore, enemies, team) {
   var corePresent = core != null;
   var copper = 0;
   var lead = 0;
+  var titanium = 0;
   var coreItems = 0;
   var coreHealth = 0;
   var coreMax = 1;
   if (corePresent && core.items != null) {
     copper = core.items.get(Items.copper);
     lead = core.items.get(Items.lead);
+    titanium = core.items.get(Items.titanium);
     try {
       coreItems = core.items.total();
     } catch (e0) {
@@ -546,6 +568,7 @@ function snapshotState(core, enemyCore, enemies, team) {
     tick: state.tick,
     copper: copper,
     lead: lead,
+    titanium: titanium,
     drills: state.drillCount,
     turrets: state.turretCount,
     power: state.powerClusters,
@@ -563,7 +586,8 @@ function snapshotState(core, enemyCore, enemies, team) {
     unitsGround: unitsGround,
     unitsAir: unitsAir,
     unitsSupport: unitsSupport,
-    unitsTotal: unitsTotal
+    unitsTotal: unitsTotal,
+    industryBlocks: state.industryBlocks
   };
 }
 
@@ -1463,6 +1487,25 @@ function nnScoresForState(stateObj) {
   return scores;
 }
 
+function nnModelHasFeature(name) {
+  if (state.nnModel == null || state.nnModel.features == null || name == null) return false;
+  for (var i = 0; i < state.nnModel.features.length; i++) {
+    if (featureName(state.nnModel.features[i]) == name) return true;
+  }
+  return false;
+}
+
+function shouldProtectEconomicMineScore(plan) {
+  if (!config.rlNNEconomicGuard) return false;
+  if (plan == null) return false;
+  var threshold = config.rlNNEconomicGuardThreshold != null ? config.rlNNEconomicGuardThreshold : 0;
+  if (plan.score < threshold && !plan.missingEconomicSignal) return false;
+  if (!nnModelHasFeature("titanium")) return true;
+  if (!nnModelHasFeature("industryBlocks")) return true;
+  if (plan.itemName != null && !nnModelHasFeature(plan.itemName) && (plan.critical || plan.pressure > 0.5)) return true;
+  return false;
+}
+
 function nnUsesPolicySampling() {
   if (config.rlPolicyMode != "nn") return false;
   if (!config.rlPolicySample) return false;
@@ -1904,6 +1947,107 @@ function reservePressure(core) {
   return maxp;
 }
 
+function miningRoadmapEntry(item) {
+  if (item == null || config.economicMiningRoadmap == null) return null;
+  var name = null;
+  try {
+    name = item.name;
+  } catch (e) {
+    name = null;
+  }
+  if (name == null) return null;
+  for (var i = 0; i < config.economicMiningRoadmap.length; i++) {
+    var entry = config.economicMiningRoadmap[i];
+    if (entry != null && entry.item == name) return entry;
+  }
+  return null;
+}
+
+function miningBypassCap(entry) {
+  var extra = config.mineCriticalBypassSlots != null ? config.mineCriticalBypassSlots : 0;
+  if (entry != null && entry.bypassSlots != null) extra = entry.bypassSlots;
+  return config.maxDrills + Math.max(0, extra);
+}
+
+function countDrillsMiningItem(team, item) {
+  if (team == null || item == null) return 0;
+  return countBlocksByPredicate(team, function(b){
+    if (b.block == null || b.block.group != BlockGroup.drills || b.tile == null) return false;
+    var drop = null;
+    try {
+      drop = b.tile.drop();
+    } catch (e) {
+      drop = null;
+    }
+    if (drop == null) return false;
+    return drop == item || (drop.name != null && item.name != null && drop.name == item.name);
+  });
+}
+
+function computeMiningPlan(core, team) {
+  if (core == null) return null;
+  var cx = core.tile.x;
+  var cy = core.tile.y;
+  var ores = findOreTiles(cx, cy, config.oreSearchRadius, -1);
+  if (ores == null || ores.length == 0) return null;
+  var baseScore = config.mineRoadmapBaseScore != null ? config.mineRoadmapBaseScore : 0;
+  var pressureWeight = config.mineRoadmapPressureWeight != null ? config.mineRoadmapPressureWeight : 100;
+  var priorityWeight = config.mineRoadmapPriorityWeight != null ? config.mineRoadmapPriorityWeight : 30;
+  var distanceWeight = config.mineRoadmapDistanceWeight != null ? config.mineRoadmapDistanceWeight : 1;
+  var underDrilledBonus = config.mineRoadmapUnderDrilledBonus != null ? config.mineRoadmapUnderDrilledBonus : 25;
+  var criticalGate = config.mineCriticalPressureGate != null ? config.mineCriticalPressureGate : 0;
+  var best = null;
+  for (var i = 0; i < ores.length; i++) {
+    var ore = ores[i];
+    if (ore == null || ore.item == null) continue;
+    var tile = tileAt(ore.x, ore.y);
+    if (tile == null || tile.block() != Blocks.air) continue;
+    var entry = miningRoadmapEntry(ore.item);
+    var pressure = resourcePressure(core, ore.item);
+    var reserve = reserveFor(ore.item);
+    var total = core.items != null ? core.items.get(ore.item) : 0;
+    var deficit = reserve > total ? (reserve - total) : 0;
+    var priority = entry != null && entry.priority != null ? entry.priority : (reserve > 0 ? 1.0 : 0.6);
+    var itemDrills = countDrillsMiningItem(team, ore.item);
+    var minDrills = entry != null && entry.minDrills != null ? entry.minDrills : 0;
+    var underDrilled = itemDrills < minDrills;
+    var critical = entry != null && entry.critical === true;
+    var bypassCap = miningBypassCap(entry);
+    var canBypass = critical && pressure >= criticalGate && state.drillCount < bypassCap;
+    var underBaseCap = state.drillCount < config.maxDrills;
+    if (!underBaseCap && !canBypass) continue;
+    var score = baseScore;
+    score += pressure * pressureWeight;
+    score += priority * priorityWeight;
+    score += Math.min(deficit, reserve > 0 ? reserve : 100) * 0.15;
+    if (underDrilled) score += underDrilledBonus;
+    if (critical && pressure > 0) score += 18;
+    if (underBaseCap) score += 12;
+    else if (canBypass) score += 16;
+    score -= Math.sqrt(ore.dist2) * distanceWeight;
+    if (best == null || score > best.score) {
+      best = {
+        ore: ore,
+        item: ore.item,
+        itemName: ore.itemName,
+        score: score,
+        pressure: pressure,
+        reserve: reserve,
+        total: total,
+        deficit: deficit,
+        underDrilled: underDrilled,
+        itemDrills: itemDrills,
+        minDrills: minDrills,
+        critical: critical,
+        allowBypass: !underBaseCap && canBypass,
+        capped: !underBaseCap,
+        missingEconomicSignal: critical || pressure > 0.5 || underDrilled
+      };
+    }
+  }
+  return best;
+}
+
 function availableCoreItems(core, item) {
   if (core == null || core.items == null || item == null) return 0;
   var total = core.items.get(item);
@@ -2211,14 +2355,20 @@ function findOreTiles(cx, cy, radius, maxCount) {
     for (var dy = -radius; dy <= radius; dy++) {
       var tile = tileAt(cx + dx, cy + dy);
       if (tile == null) continue;
-      if (tile.drop() != null) {
+      var drop = null;
+      try {
+        drop = tile.drop();
+      } catch (e) {
+        drop = null;
+      }
+      if (drop != null) {
         var dist2 = dx * dx + dy * dy;
-        found.push({ x: tile.x, y: tile.y, dist2: dist2 });
+        found.push({ x: tile.x, y: tile.y, dist2: dist2, item: drop, itemName: drop.name });
       }
     }
   }
   found.sort(function(a, b){ return a.dist2 - b.dist2; });
-  if (found.length > maxCount) found.length = maxCount;
+  if (maxCount != null && maxCount >= 0 && found.length > maxCount) found.length = maxCount;
   return found;
 }
 
@@ -2533,6 +2683,39 @@ function countBlocksByPredicate(team, predicate) {
 function countBlocksByGroup(team, group) {
   return countBlocksByPredicate(team, function(b){
     return b.block.group == group;
+  });
+}
+
+function isIndustryBlock(block) {
+  if (block == null) return false;
+  try {
+    if (block.group == BlockGroup.units) return true;
+  } catch (e) {
+    // ignore
+  }
+  var name = "";
+  try {
+    name = String(block.name || "");
+  } catch (e2) {
+    name = "";
+  }
+  return name.indexOf("factory") >= 0 ||
+    name.indexOf("reconstructor") >= 0 ||
+    name.indexOf("assembler") >= 0 ||
+    name.indexOf("kiln") >= 0 ||
+    name.indexOf("press") >= 0 ||
+    name.indexOf("smelter") >= 0 ||
+    name.indexOf("mixer") >= 0 ||
+    name.indexOf("separator") >= 0 ||
+    name.indexOf("disassembler") >= 0 ||
+    name.indexOf("pulverizer") >= 0 ||
+    name.indexOf("centrifuge") >= 0 ||
+    name.indexOf("crucible") >= 0;
+}
+
+function countIndustryBlocks(team) {
+  return countBlocksByPredicate(team, function(b){
+    return isIndustryBlock(b.block);
   });
 }
 
@@ -3064,14 +3247,8 @@ function recordAction(name) {
 }
 
 function findBestOreNearCore(core) {
-  var cx = core.tile.x;
-  var cy = core.tile.y;
-  var ores = findOreTiles(cx, cy, config.oreSearchRadius, config.maxDrills);
-  for (var i = 0; i < ores.length; i++) {
-    var tile = tileAt(ores[i].x, ores[i].y);
-    if (tile != null && tile.block() == Blocks.air) return ores[i];
-  }
-  return null;
+  var plan = computeMiningPlan(core, getTeam());
+  return plan != null ? plan.ore : null;
 }
 
 function findLiquidHub(team) {
@@ -3142,13 +3319,14 @@ function findHeatSpot(core, team, thermalBlock) {
   return findPlaceForBlock(thermal, cx, cy, config.thermalSearchRadius, team);
 }
 
-function actionMine(core) {
+function actionMine(core, plan) {
   var team = getTeam();
   var drill = pickDrillBlock(team);
   if (drill == null) return false;
   if (!coreHasItemsFor(drill, team)) return false;
-  var ore = findBestOreNearCore(core);
-  if (ore == null) return false;
+  var miningPlan = plan != null ? plan : computeMiningPlan(core, team);
+  if (miningPlan == null || miningPlan.ore == null) return false;
+  var ore = miningPlan.ore;
   if (!placeBlock(drill, ore.x, ore.y, 0, team)) return false;
   state.drillCount++;
   var cx = core.tile.x;
@@ -3356,6 +3534,7 @@ Events.on(WorldLoadEvent, function(){
   state.pumpCount = 0;
   state.liquidHubCount = 0;
   state.thermalCount = 0;
+  state.industryBlocks = 0;
   state.actionHistory = [];
   state.lastActionTicks = {};
   state.aiEnabled = config.aiEnabledDefault;
@@ -3515,6 +3694,7 @@ function runAiLogic() {
   state.pumpCount = countPumps(team2);
   state.liquidHubCount = countLiquidHubs(team2);
   state.thermalCount = countThermals(team2);
+  state.industryBlocks = countIndustryBlocks(team2);
 
   configureFactories(team2);
   ensureLogicControllers(core2, team2);
@@ -3544,6 +3724,7 @@ function runAiStep(core, team) {
   var canPump = pumpBlock != null && coreHasItemsFor(pumpBlock, team);
   var canLiquidHub = hubBlock != null && coreHasItemsFor(hubBlock, team);
   var canLiquid = canPump || findLiquidHub(team) != null || canLiquidHub;
+  var miningPlan = computeMiningPlan(core, team);
   var powerStats = computePowerStatus(team);
   var powerNeedScore =
     powerStats.count == 0 ? 40 :
@@ -3588,7 +3769,7 @@ function runAiStep(core, team) {
   var actionHandlers = {
     attackWave: runEnemy(actionAttackWave),
     rally: runEnemy(actionRally),
-    mine: runCore(actionMine),
+    mine: function(){ return actionMine(core, miningPlan); },
     defend: runCore(actionDefend),
     power: runCore(actionPower),
     noop: function(){ return true; }
@@ -3605,7 +3786,7 @@ function runAiStep(core, team) {
   addAction("thermal", thermalScore, runCore(actionThermal));
   addAction("attackWave", attackPlan.canCommit ? 100 : 0, actionHandlers.attackWave);
   addAction("rally", attackPlan.shouldRally ? 120 : 0, actionHandlers.rally);
-  var mineScore = (canDrill ? (availCopper < 200 ? 120 : availCopper < 400 ? 90 : 50) + (state.drillCount < config.maxDrills ? 30 : 0) : 0);
+  var mineScore = (canDrill && miningPlan != null ? miningPlan.score : 0);
   mineScore *= reserveBoost;
   addAction("mine", mineScore, actionHandlers.mine);
   var defendScore = (canDuo ? (enemies > 0 ? 90 : 30) + (state.turretCount < config.maxTurrets ? 20 : 0) : 0);
@@ -3653,6 +3834,12 @@ function runAiStep(core, team) {
             continue;
           }
           act2.score = nnv;
+          if (act2.name == "mine" && shouldProtectEconomicMineScore(miningPlan)) {
+            var floor = config.rlNNEconomicGuardFloor != null ? config.rlNNEconomicGuardFloor : 1.0;
+            if (floor < 0) floor = 0;
+            var minScore = act2.baseScore * floor;
+            if (act2.score < minScore) act2.score = minScore;
+          }
         }
       }
     }
