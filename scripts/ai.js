@@ -143,10 +143,10 @@ var config = {
   autoDisableHudOnMobile: true,
   campaignSafeMode: true,
   warnInterval: 300,
-  aiControlPlayerUnit: false,
-  // When true, the local player unit is excluded from AI commands and the player retains direct control.
-  // Set to false so the AI can fully control the player's unit automatically.
-  observerMode: true,
+  // When true, enabling the AI allows it to take over the local player's unit.
+  aiControlPlayerUnit: true,
+  // When true, the AI only observes/commands other units and keeps the player's unit under manual control.
+  observerMode: false,
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
   controllerResetPenalty: -1,
   resourceReserve: {
