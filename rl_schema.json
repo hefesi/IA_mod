@@ -4,6 +4,7 @@
     "attackWave",
     "rally",
     "mine",
+    "industry",
     "defend",
     "power",
     "liquid",
@@ -44,6 +45,10 @@
         160,
         320
       ]
+    },
+    {
+      "name": "titanium",
+      "bins": [0, 20, 40, 80, 160, 320]
     },
     {
       "name": "drills",
@@ -128,6 +133,10 @@
         0.75,
         0.9
       ]
+    },
+    {
+      "name": "industryBlocks",
+      "bins": [0, 1, 2, 4, 6, 10]
     },
     {
       "name": "coreHealthFrac",
