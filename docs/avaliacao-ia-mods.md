@@ -10,6 +10,9 @@ O mod deixou de depender de `Q-learning/DQN simples` como caminho principal de p
 - `scripts/rl_export_nn_json.py` agora exporta a cabeca de policy de um checkpoint actor-critic para `nn_model.json`.
 - `rl_schema.json` centraliza `actions`, `features` e `norms` para o runtime JS e para os trainers Python.
 - `scripts/ai.js` passa a:
+  - usar um planejador dirigido por conteudo para derivar pressao economica e prioridades de mineracao/fabrica a partir dos blocos e planos de unidade desbloqueados;
+  - alinhar as acoes de runtime e RL com `liquid`, `thermal` e `industry`, evitando o descompasso entre schema e loop principal;
+  - configurar fabricas de forma dinamica com base nas opcoes reais de cada fabrica, em vez de depender apenas de `preferred*Unit`;
   - usar `nn` como modo RL padrao;
   - evitar bootstrap aleatorio quando `nn_model.json` nao existe;
   - cair de volta para heuristica se a policy nao estiver treinada;
