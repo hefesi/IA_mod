@@ -632,6 +632,13 @@ function snapshotState(core, enemyCore, enemies, team) {
     if (coreMax == null || coreMax <= 0) coreMax = coreHealth > 0 ? coreHealth : 1;
   }
   var coreHealthFrac = coreMax > 0 ? Math.round((coreHealth / coreMax) * 100) / 100 : 0;
+  var resourceProfile = collectCoreAbstractResources(core);
+  var ammoProfile = computeAmmoProfile(core, enemies, team);
+  var chainStatus = computeProductionChainStatus(core, team);
+  var factoryProfile = computeFactoryCapacityProfile(team);
+  var powerStats = computePowerStatus(team);
+  var liquidPressure = clamp01((Math.max(0, config.maxPumps - state.pumpCount) + Math.max(0, config.maxLiquidHubs - state.liquidHubCount)) / Math.max(1, config.maxPumps + config.maxLiquidHubs));
+  var defensePressure = clamp01((enemies + Math.max(0, desiredTurrets - state.turretCount) * 2) / Math.max(1, config.maxTurrets * 3));
 
   var unitsGround = 0;
   var unitsAir = 0;
@@ -658,6 +665,32 @@ function snapshotState(core, enemyCore, enemies, team) {
   var dist = enemyCore != null ? Math.round(Math.sqrt(dx * dx + dy * dy)) : -1;
   return {
     tick: state.tick,
+    resourceTier1: resourceProfile.tier1,
+    resourceTier2: resourceProfile.tier2,
+    resourceTier3: resourceProfile.tier3,
+    resourceTier4: resourceProfile.tier4,
+    resourceTier5: resourceProfile.tier5,
+    resourceBasic: resourceProfile.basic,
+    resourceIndustrial: resourceProfile.industrial,
+    resourceStrategic: resourceProfile.strategic,
+    combatStock: resourceProfile.combat,
+    ammoKinetic: ammoProfile.kineticStock,
+    ammoExplosive: ammoProfile.explosiveStock,
+    ammoEnergy: ammoProfile.energyStock,
+    ammoPressureKinetic: ammoProfile.kineticPressure,
+    ammoPressureExplosive: ammoProfile.explosivePressure,
+    ammoPressureEnergy: ammoProfile.energyPressure,
+    chainPressure: chainStatus.pressure,
+    chainCoverage: chainStatus.coverage,
+    factoryCapacity: factoryProfile.factoryCapacity,
+    upgradeCapacity: factoryProfile.upgradeCapacity,
+    factoryVariety: factoryProfile.factoryVariety,
+    mobilityCapacity: factoryProfile.mobilityCapacity,
+    supportCapacity: factoryProfile.supportCapacity,
+    unitCapacity: factoryProfile.unitCapacity,
+    defensePressure: Math.round(defensePressure * 100) / 100,
+    powerPressure: Math.round((1 - clamp01(powerStats.avg)) * 100) / 100,
+    liquidPressure: Math.round(liquidPressure * 100) / 100,
     copper: copper,
     lead: lead,
     titanium: titanium,
@@ -681,6 +714,8 @@ function snapshotState(core, enemyCore, enemies, team) {
     unitsTotal: unitsTotal,
     industryBlocks: state.industryBlocks,
     factoryBlocks: state.factoryBlocks,
+    industryFactories: industryFactories,
+    economyStage: economyStage,
     economicPressure: Math.round(reservePressure(core) * 100) / 100
   };
 }
@@ -1169,6 +1204,315 @@ function addRequirementsDemand(map, reqs, weight) {
     if (amount <= 0) amount = 1;
     addDemand(map, stack.item, amount * mul);
   });
+}
+
+function readContentStat(obj, key) {
+  if (obj == null || key == null) return 0;
+  try {
+    var value = obj[key];
+    if (value == null) return 0;
+    return typeof value === "number" ? value : Number(value);
+  } catch (e) {
+    return 0;
+  }
+}
+
+function clampValue(v, min, max) {
+  if (v == null || !(v >= min)) return min;
+  if (v > max) return max;
+  return v;
+}
+
+function itemTierFor(item) {
+  if (item == null) return 1;
+  var hardness = readContentStat(item, "hardness");
+  var cost = readContentStat(item, "cost");
+  var explosiveness = readContentStat(item, "explosiveness");
+  var flammability = readContentStat(item, "flammability");
+  var charge = readContentStat(item, "charge");
+  var radioactivity = readContentStat(item, "radioactivity");
+  var score = hardness * 1.4 + cost * 0.8 + explosiveness * 1.0 + flammability * 0.5 + charge * 2.2 + radioactivity * 2.6;
+  var name = readContentName(item);
+  if (name.indexOf("surge") >= 0 || name.indexOf("phase") >= 0 || name.indexOf("carbide") >= 0 || name.indexOf("fissile") >= 0) score += 2.5;
+  else if (name.indexOf("thorium") >= 0 || name.indexOf("oxide") >= 0 || name.indexOf("plastanium") >= 0 || name.indexOf("blast") >= 0) score += 1.5;
+  else if (name.indexOf("titanium") >= 0 || name.indexOf("silicon") >= 0 || name.indexOf("graphite") >= 0 || name.indexOf("metaglass") >= 0) score += 0.6;
+  if (score >= 8) return 5;
+  if (score >= 5.5) return 4;
+  if (score >= 3.2) return 3;
+  if (score >= 1.4) return 2;
+  return 1;
+}
+
+function resourceCategoryForItem(item) {
+  if (item == null) return "basic";
+  var tier = itemTierFor(item);
+  var charge = readContentStat(item, "charge");
+  var radioactivity = readContentStat(item, "radioactivity");
+  var explosiveness = readContentStat(item, "explosiveness");
+  var flammability = readContentStat(item, "flammability");
+  if (tier >= 4 || charge > 0.55 || radioactivity > 0.35) return "strategic";
+  if (explosiveness > 0.4 || flammability > 0.45) return "combat";
+  if (tier >= 2) return "industrial";
+  return "basic";
+}
+
+function ammoFamilyForItem(item) {
+  if (item == null) return "kinetic";
+  var charge = readContentStat(item, "charge");
+  var radioactivity = readContentStat(item, "radioactivity");
+  var explosiveness = readContentStat(item, "explosiveness");
+  var flammability = readContentStat(item, "flammability");
+  if (charge > 0.45 || radioactivity > 0.3) return "energy";
+  if (explosiveness > 0.4 || flammability > 0.45) return "explosive";
+  return "kinetic";
+}
+
+function unitCapabilityScore(unit) {
+  if (unit == null) return 0;
+  return unitCombatValue(unit) * 1.0 + unitEconomicValue(unit) * 0.75 + unitSupportValue(unit) * 0.45;
+}
+
+function collectCoreAbstractResources(core) {
+  var profile = {
+    tier1: 0,
+    tier2: 0,
+    tier3: 0,
+    tier4: 0,
+    tier5: 0,
+    basic: 0,
+    industrial: 0,
+    strategic: 0,
+    combat: 0,
+    ammoKinetic: 0,
+    ammoExplosive: 0,
+    ammoEnergy: 0
+  };
+  if (core == null || core.items == null) return profile;
+  try {
+    Vars.content.items().each(function(item){
+      if (item == null) return;
+      var total = 0;
+      try {
+        total = core.items.get(item);
+      } catch (e) {
+        total = 0;
+      }
+      if (!(total > 0)) return;
+      var tier = itemTierFor(item);
+      if (tier <= 1) profile.tier1 += total;
+      else if (tier == 2) profile.tier2 += total;
+      else if (tier == 3) profile.tier3 += total;
+      else if (tier == 4) profile.tier4 += total;
+      else profile.tier5 += total;
+      var category = resourceCategoryForItem(item);
+      if (category == "basic") profile.basic += total;
+      else if (category == "industrial") profile.industrial += total;
+      else if (category == "strategic") profile.strategic += total;
+      else profile.combat += total;
+      var ammoFamily = ammoFamilyForItem(item);
+      if (ammoFamily == "explosive") profile.ammoExplosive += total;
+      else if (ammoFamily == "energy") profile.ammoEnergy += total;
+      else profile.ammoKinetic += total;
+    });
+  } catch (e2) {
+    // ignore
+  }
+  return profile;
+}
+
+function blockOutputItems(block) {
+  var out = [];
+  if (block == null) return out;
+  try {
+    if (block.outputItem != null && block.outputItem.item != null) {
+      out.push({ item: block.outputItem.item, amount: block.outputItem.amount != null ? block.outputItem.amount : 1 });
+    }
+  } catch (e) {
+    // ignore
+  }
+  try {
+    eachSeq(block.outputItems, function(stack){
+      if (stack == null || stack.item == null) return;
+      out.push({ item: stack.item, amount: stack.amount != null ? stack.amount : 1 });
+    });
+  } catch (e2) {
+    // ignore
+  }
+  return out;
+}
+
+function blockProducesItem(block, item) {
+  if (block == null || item == null) return false;
+  var outputs = blockOutputItems(block);
+  for (var i = 0; i < outputs.length; i++) {
+    var stack = outputs[i];
+    if (stack == null || stack.item == null) continue;
+    if (stack.item == item) return true;
+    if (stack.item.name != null && item.name != null && stack.item.name == item.name) return true;
+  }
+  return false;
+}
+
+function countProducerBlocks(team, item) {
+  if (team == null || item == null) return 0;
+  return countBlocksByPredicate(team, function(b){
+    return blockProducesItem(b.block, item);
+  });
+}
+
+function unlockedProducerCount(item) {
+  if (item == null) return 0;
+  var count = 0;
+  try {
+    Vars.content.blocks().each(function(block){
+      if (block == null || !blockUnlocked(block) || !isIndustryBlock(block)) return;
+      if (blockProducesItem(block, item)) count++;
+    });
+  } catch (e) {
+    // ignore
+  }
+  return count;
+}
+
+function augmentDemandWithProductionChain(team, demand) {
+  if (demand == null) return demand;
+  var chain = {};
+  for (var key in demand) {
+    if (!demand.hasOwnProperty(key)) continue;
+    var weight = demand[key];
+    if (!(weight > 0)) continue;
+    var item = itemByName(key);
+    if (item == null) continue;
+    try {
+      Vars.content.blocks().each(function(block){
+        if (block == null || !blockUnlocked(block) || !isIndustryBlock(block)) return;
+        if (!blockProducesItem(block, item)) return;
+        addRequirementsDemand(chain, block.requirements, Math.min(24, weight) * 0.18);
+      });
+    } catch (e) {
+      // ignore
+    }
+  }
+  for (var ckey in chain) {
+    if (!chain.hasOwnProperty(ckey)) continue;
+    if (demand[ckey] == null) demand[ckey] = 0;
+    demand[ckey] += chain[ckey];
+  }
+  return demand;
+}
+
+function computeProductionChainStatus(core, team) {
+  var demand = getContentDemand(team);
+  var totalWeight = 0;
+  var coveredWeight = 0;
+  var pressure = 0;
+  if (demand == null) {
+    return { pressure: 0, coverage: 1, bottleneck: 0 };
+  }
+  for (var key in demand) {
+    if (!demand.hasOwnProperty(key)) continue;
+    var item = itemByName(key);
+    if (item == null) continue;
+    var weight = demand[key];
+    if (!(weight > 0)) continue;
+    var limited = Math.min(40, weight);
+    totalWeight += limited;
+    var built = countProducerBlocks(team, item);
+    var unlocked = unlockedProducerCount(item);
+    var stock = 0;
+    if (core != null && core.items != null) {
+      try {
+        stock = core.items.get(item);
+      } catch (e) {
+        stock = 0;
+      }
+    }
+    var shortage = stock <= 0 ? 1 : (stock < limited ? 0.5 : 0);
+    var tier = itemTierFor(item);
+    if (built > 0) coveredWeight += limited;
+    else if (unlocked > 0) coveredWeight += limited * 0.35;
+    var gapFactor = built > 0 ? (0.3 / (1 + built)) : (unlocked > 0 ? 0.85 : 1.15);
+    pressure += limited * (gapFactor + shortage * 0.55 + (tier - 1) * 0.08);
+  }
+  if (totalWeight <= 0) {
+    return { pressure: 0, coverage: 1, bottleneck: 0 };
+  }
+  return {
+    pressure: Math.round((pressure / totalWeight) * 100) / 100,
+    coverage: Math.round((coveredWeight / totalWeight) * 100) / 100,
+    bottleneck: Math.round((pressure - coveredWeight / totalWeight) * 100) / 100
+  };
+}
+
+function computeFactoryCapacityProfile(team) {
+  var profile = {
+    factoryCapacity: 0,
+    upgradeCapacity: 0,
+    factoryVariety: 0,
+    mobilityCapacity: 0,
+    supportCapacity: 0,
+    unitCapacity: 0
+  };
+  if (team == null) return profile;
+  Groups.build.each(function(b){
+    if (b == null || b.team != team || b.block == null || !isFactoryBlock(b.block)) return;
+    var role = factoryRoleForBlock(b.block);
+    var options = collectFactoryPlanOptions(b.block);
+    var variety = options.length;
+    var bestCapability = 0;
+    var support = 0;
+    for (var i = 0; i < options.length; i++) {
+      var option = options[i];
+      if (option == null || option.unit == null) continue;
+      var capability = unitCapabilityScore(option.unit);
+      if (capability > bestCapability) bestCapability = capability;
+      support += unitSupportValue(option.unit);
+    }
+    var base = 1 + variety * 0.35 + bestCapability * 0.03;
+    profile.factoryCapacity += base;
+    profile.factoryVariety += variety;
+    profile.unitCapacity += bestCapability;
+    profile.supportCapacity += support * 0.05;
+    if (role == "air" || role == "naval") profile.mobilityCapacity += base;
+    var name = readContentName(b.block);
+    if (name.indexOf("reconstructor") >= 0 || name.indexOf("assembler") >= 0) {
+      profile.upgradeCapacity += 1.5 + variety * 0.25 + bestCapability * 0.02;
+    }
+  });
+  profile.factoryCapacity = Math.round(profile.factoryCapacity * 100) / 100;
+  profile.upgradeCapacity = Math.round(profile.upgradeCapacity * 100) / 100;
+  profile.factoryVariety = Math.round(profile.factoryVariety * 100) / 100;
+  profile.mobilityCapacity = Math.round(profile.mobilityCapacity * 100) / 100;
+  profile.supportCapacity = Math.round(profile.supportCapacity * 100) / 100;
+  profile.unitCapacity = Math.round(profile.unitCapacity * 100) / 100;
+  return profile;
+}
+
+function computeAmmoProfile(core, enemies, team) {
+  var totals = collectCoreAbstractResources(core);
+  var intensity = enemies > 0 ? Math.min(1.5, enemies / 8) : 0.25;
+  var demand = getContentDemand(team);
+  var combatDemand = 0;
+  if (demand != null) {
+    for (var key in demand) {
+      if (!demand.hasOwnProperty(key)) continue;
+      var item = itemByName(key);
+      if (item == null) continue;
+      if (resourceCategoryForItem(item) == "combat") combatDemand += Math.min(20, demand[key]);
+    }
+  }
+  var desiredBase = 80 + combatDemand * 0.6 + state.turretCount * 12 + intensity * 35;
+  var kineticPressure = clamp01((desiredBase - totals.ammoKinetic) / Math.max(1, desiredBase));
+  var explosivePressure = clamp01(((desiredBase * 0.55) - totals.ammoExplosive) / Math.max(1, desiredBase * 0.55));
+  var energyPressure = clamp01(((desiredBase * 0.45) - totals.ammoEnergy) / Math.max(1, desiredBase * 0.45));
+  return {
+    kineticStock: totals.ammoKinetic,
+    explosiveStock: totals.ammoExplosive,
+    energyStock: totals.ammoEnergy,
+    kineticPressure: Math.round(kineticPressure * 100) / 100,
+    explosivePressure: Math.round(explosivePressure * 100) / 100,
+    energyPressure: Math.round(energyPressure * 100) / 100
+  };
 }
 
 function unitWeaponCount(unit) {
@@ -1862,20 +2206,20 @@ function shouldKeepHeuristicNNScore(actionName, stageInfo, smeltingMineNeed, adv
   if (actionName != "mine") return false;
 
   if (advancedMineNeed) {
-    if (!nnModelHasFeature("titanium")) return true;
-    if (!nnModelHasFeature("economyStage")) return true;
-    if (!nnModelHasFeature("industryFactories")) return true;
+    if (!nnModelHasFeature("resourceTier3")) return true;
+    if (!nnModelHasFeature("resourceStrategic")) return true;
+    if (!nnModelHasFeature("chainPressure")) return true;
     if (!nnModelHasAction("industry")) return true;
   }
 
   if (smeltingMineNeed) {
-    if (!nnModelHasFeature("coal")) return true;
-    if (!nnModelHasFeature("sand")) return true;
-    if (!nnModelHasFeature("economyStage")) return true;
+    if (!nnModelHasFeature("resourceIndustrial")) return true;
+    if (!nnModelHasFeature("chainCoverage")) return true;
+    if (!nnModelHasFeature("factoryCapacity")) return true;
   }
 
   if (stageInfo != null && stageInfo.stage < 1) {
-    if (!nnModelHasFeature("lead")) return true;
+    if (!nnModelHasFeature("resourceTier1")) return true;
   }
 
   return false;
@@ -1980,9 +2324,9 @@ function shouldProtectEconomicMineScore(plan) {
   if (plan == null) return false;
   var threshold = config.rlNNEconomicGuardThreshold != null ? config.rlNNEconomicGuardThreshold : 0;
   if (plan.score < threshold && !plan.missingEconomicSignal) return false;
-  if (!nnModelHasFeature("titanium")) return true;
-  if (!nnModelHasFeature("industryBlocks")) return true;
-  if (plan.itemName != null && !nnModelHasFeature(plan.itemName) && (plan.critical || plan.pressure > 0.5)) return true;
+  if (!nnModelHasFeature("resourceTier3")) return true;
+  if (!nnModelHasFeature("chainPressure")) return true;
+  if (!nnModelHasFeature("resourceStrategic") && (plan.critical || plan.pressure > 0.5)) return true;
   return false;
 }
 
@@ -2225,12 +2569,15 @@ function computeReward(prevState, actionName, nextState, info) {
   var reward = 0;
   reward += (nextState.copper - prevState.copper) * config.rlRewardCopper;
   reward += (nextState.lead - prevState.lead) * config.rlRewardLead;
-  reward += (nextState.coal - prevState.coal) * config.rlRewardCoal;
-  reward += (nextState.sand - prevState.sand) * config.rlRewardSand;
-  reward += (nextState.graphite - prevState.graphite) * config.rlRewardGraphite;
-  reward += (nextState.silicon - prevState.silicon) * config.rlRewardSilicon;
   reward += (nextState.titanium - prevState.titanium) * config.rlRewardTitanium;
-  reward += (nextState.plastanium - prevState.plastanium) * config.rlRewardPlastanium;
+  reward += (nextState.resourceTier1 - prevState.resourceTier1) * 0.004;
+  reward += (nextState.resourceTier2 - prevState.resourceTier2) * 0.006;
+  reward += (nextState.resourceTier3 - prevState.resourceTier3) * 0.01;
+  reward += (nextState.resourceTier4 - prevState.resourceTier4) * 0.014;
+  reward += (nextState.resourceTier5 - prevState.resourceTier5) * 0.018;
+  reward += (nextState.resourceIndustrial - prevState.resourceIndustrial) * 0.005;
+  reward += (nextState.resourceStrategic - prevState.resourceStrategic) * 0.008;
+  reward += (nextState.combatStock - prevState.combatStock) * 0.004;
   reward += (nextState.industryFactories - prevState.industryFactories) * config.rlRewardIndustryFactory;
   reward += (nextState.economyStage - prevState.economyStage) * config.rlRewardEconomyStage;
   reward += (nextState.drills - prevState.drills) * config.rlRewardDrill;
@@ -2240,6 +2587,18 @@ function computeReward(prevState, actionName, nextState, info) {
   reward += (nextState.liquidHubs - prevState.liquidHubs) * config.rlRewardLiquidHub;
   reward += (nextState.thermals - prevState.thermals) * config.rlRewardThermal;
   reward += (nextState.unitsTotal - prevState.unitsTotal) * config.rlRewardUnit;
+  reward += (nextState.factoryCapacity - prevState.factoryCapacity) * 1.5;
+  reward += (nextState.upgradeCapacity - prevState.upgradeCapacity) * 1.8;
+  reward += (nextState.factoryVariety - prevState.factoryVariety) * 0.4;
+  reward += (nextState.unitCapacity - prevState.unitCapacity) * 0.08;
+  reward += (nextState.chainCoverage - prevState.chainCoverage) * 25;
+  reward -= (nextState.chainPressure - prevState.chainPressure) * 18;
+  reward -= (nextState.powerPressure - prevState.powerPressure) * 14;
+  reward -= (nextState.defensePressure - prevState.defensePressure) * 12;
+  reward -= (nextState.liquidPressure - prevState.liquidPressure) * 8;
+  reward -= (nextState.ammoPressureKinetic - prevState.ammoPressureKinetic) * 8;
+  reward -= (nextState.ammoPressureExplosive - prevState.ammoPressureExplosive) * 9;
+  reward -= (nextState.ammoPressureEnergy - prevState.ammoPressureEnergy) * 9;
 
   var dCore = nextState.coreHealthFrac - prevState.coreHealthFrac;
   reward += dCore * config.rlRewardCoreDamageScale;
@@ -2416,6 +2775,7 @@ function scanContentDemand(team) {
   } catch (e) {
     // ignore
   }
+  augmentDemandWithProductionChain(team, demand);
   state.contentDemand = demand;
   state.contentDemandTick = state.tick;
   return demand;
@@ -3066,6 +3426,26 @@ function scoreIndustryBlock(block, team, core, strategyName) {
   if (role == "ground") score += 10;
   if (readContentName(block).indexOf("reconstructor") >= 0) score += strat == "economic" ? 12 : 8;
   if (readContentName(block).indexOf("assembler") >= 0) score += 10;
+  var options = collectFactoryPlanOptions(block);
+  var bestCapability = 0;
+  for (var i = 0; i < options.length; i++) {
+    var option = options[i];
+    if (option == null || option.unit == null) continue;
+    var capability = unitCapabilityScore(option.unit);
+    if (capability > bestCapability) bestCapability = capability;
+  }
+  score += Math.min(40, options.length * 4 + bestCapability * 0.08);
+  var outputs = blockOutputItems(block);
+  for (var j = 0; j < outputs.length; j++) {
+    var output = outputs[j];
+    if (output == null || output.item == null) continue;
+    var demand = contentDemandForItem(team, output.item);
+    var builtProducers = countProducerBlocks(team, output.item);
+    score += Math.min(55, demand * (builtProducers <= 0 ? 1.2 : (0.45 / (1 + builtProducers))));
+  }
+  var chainStatus = computeProductionChainStatus(core, team);
+  score += chainStatus.pressure * 10;
+  score += Math.max(0, 1 - chainStatus.coverage) * 20;
   score -= blockCost(block) * 0.12;
   score += contentDemandForItem(team, Items.silicon) * 0.25;
   if (core != null && reservePressure(core) > 0.55) score -= 12;
@@ -4679,6 +5059,14 @@ function runAiStep(core, team) {
   var canLiquid = canPump || findLiquidHub(team) != null || canLiquidHub;
   var miningPlan = computeMiningPlan(core, team);
   var powerStats = computePowerStatus(team);
+  var stageInfo = economyStageInfo(core, team, buckets.ground.size + buckets.air.size + buckets.support.size);
+  if (stageInfo == null) stageInfo = { stage: 0, industryFactories: state.factoryBlocks };
+  var chainStatus = computeProductionChainStatus(core, team);
+  var ammoProfile = computeAmmoProfile(core, enemies, team);
+  var miningTier = miningPlan != null && miningPlan.item != null ? itemTierFor(miningPlan.item) : 1;
+  var advancedMineNeed = miningPlan != null && (miningTier >= 3 || miningPlan.critical === true);
+  var miningCategory = miningPlan != null && miningPlan.item != null ? resourceCategoryForItem(miningPlan.item) : "basic";
+  var smeltingMineNeed = miningPlan != null && (miningCategory == "industrial" || miningCategory == "combat");
   var powerNeedScore =
     powerStats.count == 0 ? 40 :
     (powerStats.avg < 0.4 || powerStats.min < 0.25) ? 45 :
@@ -4748,16 +5136,11 @@ function runAiStep(core, team) {
   addAction("attackWave", attackPlan.canCommit ? 100 : 0, actionHandlers.attackWave);
   addAction("rally", attackPlan.shouldRally ? 120 : 0, actionHandlers.rally);
   var mineScore = (canDrill && miningPlan != null ? miningPlan.score : 0);
+  mineScore += chainStatus.pressure * 18;
   mineScore *= reserveBoost;
   addAction("mine", mineScore, actionHandlers.mine);
-  var industryScore = (topIndustryNeed != null ? (45 + topIndustryNeed.score) : 0) + economyUpgradeScore;
-  if (stageInfo.stage < 1) industryScore += 30;
-  else if (stageInfo.stage < 2) industryScore += 60;
-  else if (stageInfo.stage < 3) industryScore += 55;
-  else industryScore += 20;
-  industryScore *= reserveBoost;
-  addAction("industry", industryScore, actionHandlers.industry);
   var defendScore = (canDuo ? (enemies > 0 ? 90 : 25) + (state.turretCount < desiredTurrets ? 30 : state.turretCount < config.maxTurrets ? 12 : 0) : 0);
+  defendScore += (ammoProfile.kineticPressure + ammoProfile.explosivePressure + ammoProfile.energyPressure) * 8;
   if (enemyCore != null && !wantsAttack && attackPlan.enemyTurrets >= config.attackMaxEnemyTurrets) defendScore += 20;
   defendScore *= reservePenalty;
   addAction("defend", defendScore, actionHandlers.defend);
@@ -4772,11 +5155,18 @@ function runAiStep(core, team) {
   }
   liquidScore *= reservePenalty;
   addAction("liquid", liquidScore, actionHandlers.liquid);
-  var industryScore = industryPlan != null ? industryPlan.score : 0;
+  var industryScore = (topIndustryNeed != null ? (45 + topIndustryNeed.score) : 0) + economyUpgradeScore + (industryPlan != null ? industryPlan.score : 0);
+  if (stageInfo.stage < 1) industryScore += 30;
+  else if (stageInfo.stage < 2) industryScore += 60;
+  else if (stageInfo.stage < 3) industryScore += 55;
+  else industryScore += 20;
+  industryScore += chainStatus.pressure * 22;
+  industryScore += Math.max(0, 1 - chainStatus.coverage) * 35;
   if (industryPlan != null && reserveP < 0.85) {
     industryScore += strategy == "aggressive" ? 12 : (strategy == "economic" ? 24 : 16);
     if (beforeState.unitsTotal < config.attackMinForce) industryScore += 10;
   }
+  industryScore *= reserveBoost;
   addAction("industry", industryScore, actionHandlers.industry);
   addAction("noop", 0, actionHandlers.noop);
 
