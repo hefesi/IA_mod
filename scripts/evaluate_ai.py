@@ -11,6 +11,7 @@ AI_JS = ROOT / "scripts" / "ai.js"
 MAIN_JS = ROOT / "scripts" / "main.js"
 MOD_JSON = ROOT / "mod.json"
 SCHEMA_JSON = ROOT / "rl_schema.json"
+NN_MODEL_JSON = ROOT / "nn_model.json"
 
 
 class CheckResult:
@@ -57,7 +58,7 @@ def check_real_log(log_path):
     return CheckResult("log real parseavel", ok, detail)
 
 
-def evaluate(log_path):
+def evaluate(log_path, strict_model=False, min_real_actions=1):
     checks = []
 
     mod_data = read_json(MOD_JSON) or {}
@@ -79,6 +80,19 @@ def evaluate(log_path):
     checks.append(CheckResult("modo RL padrao e nn", 'rlPolicyMode: "nn"' in ai_text, "scripts/ai.js"))
     uses_shared_schema = 'rlSchemaFile: "rl_schema.json"' in ai_text and "loadRLSchema(" in ai_text
     checks.append(CheckResult("runtime JS usa schema compartilhado", uses_shared_schema, "scripts/ai.js -> rl_schema.json"))
+
+    current_nn = read_json(NN_MODEL_JSON)
+    nn_exists = current_nn is not None
+    checks.append(CheckResult("nn_model.json valido", nn_exists or not strict_model, str(NN_MODEL_JSON)))
+    if nn_exists and schema_exists:
+        nn_actions = current_nn.get("actions", [])
+        nn_features = current_nn.get("features", [])
+        schema_actions_set = set(schema_actions)
+        nn_actions_set = set(nn_actions) if isinstance(nn_actions, list) else set()
+        action_ok = nn_actions_set == schema_actions_set
+        feature_ok = len(nn_features) >= 0.7 * len(schema_features)
+        checks.append(CheckResult("modelo atual cobre todas as acoes do schema", action_ok or not strict_model, f"schema={sorted(schema_actions_set)} model={sorted(nn_actions_set)} strict={strict_model}"))
+        checks.append(CheckResult("modelo atual cobre features principais do schema", feature_ok or not strict_model, f"schema_features={len(schema_features)} model_features={len(nn_features)} strict={strict_model}"))
 
     sample = [
         {
@@ -151,6 +165,12 @@ def evaluate(log_path):
             checks.append(CheckResult("adaptabilidade: acao custom entra na policy", has_custom, "customModAction em actions"))
 
     checks.append(check_real_log(log_path))
+    if log_path.exists():
+        real_actions = set()
+        for tr in iter_transitions(log_path):
+            real_actions.add(tr.get("a", "noop"))
+        required_real_actions = max(1, int(min_real_actions))
+        checks.append(CheckResult("log real tem diversidade minima de acoes", len(real_actions) >= required_real_actions, f"unique_actions={sorted(real_actions)} required={required_real_actions}"))
 
     failed = [c for c in checks if not c.ok]
 
@@ -165,9 +185,11 @@ def evaluate(log_path):
 def main():
     parser = argparse.ArgumentParser(description="Avaliacao automatica da IA do mod Mindustry.")
     parser.add_argument("--log", default="rl_socket.log", help="Log RL real para checagem opcional de parse.")
+    parser.add_argument("--strict-model", action="store_true", help="Faz falhar quando nn_model.json estiver desalinhado com o schema.")
+    parser.add_argument("--min-real-actions", type=int, default=1, help="Quantidade minima de acoes unicas exigidas no log real.")
     args = parser.parse_args()
 
-    raise SystemExit(evaluate(ROOT / args.log))
+    raise SystemExit(evaluate(ROOT / args.log, strict_model=args.strict_model, min_real_actions=args.min_real_actions))
 
 
 if __name__ == "__main__":
