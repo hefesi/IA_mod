@@ -3687,7 +3687,7 @@ function placeBlock(block, x, y, rotation, team, ignoreReserveItems) {
     return false;
   }
   if (player != null) {
-    Call.constructFinish(player, block, x, y, rotation || 0, team, false);
+    Call.constructFinish(tile, block, player.unit(), rotation || 0, team, null);
   } else {
     try {
       if (tile.setNet != null) {
