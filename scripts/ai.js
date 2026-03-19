@@ -651,6 +651,7 @@ function snapshotState(core, enemyCore, enemies, team) {
   var factoryProfile = computeFactoryCapacityProfile(team);
   var powerStats = computePowerStatus(team);
   var liquidPressure = clamp01((Math.max(0, config.maxPumps - state.pumpCount) + Math.max(0, config.maxLiquidHubs - state.liquidHubCount)) / Math.max(1, config.maxPumps + config.maxLiquidHubs));
+  var desiredTurrets = Math.min(config.maxTurrets, enemies > 0 ? 4 : 2);
   var defensePressure = clamp01((enemies + Math.max(0, desiredTurrets - state.turretCount) * 2) / Math.max(1, config.maxTurrets * 3));
 
   var unitsGround = 0;
@@ -6689,6 +6690,9 @@ function runAiStep(core, team) {
     var s = applyStrategyNow ? applyStrategyScore(name, score, strategy) : score;
     actions.push({ name: name, baseScore: s, score: s, run: run });
   };
+  var desiredTurrets = Math.min(config.maxTurrets, Math.max(2, 2 + Math.min(2, stageInfo.stage) + (enemies > 3 ? 1 : 0)));
+  var desiredPower = Math.min(config.maxPowerClusters, stageInfo.stage >= 3 ? 2 : (stageInfo.stage >= 1 ? 1 : 0));
+  var desiredLiquid = stageInfo.stage >= 2 ? 1 : 0;
   var thermalScore = (state.thermalCount < config.maxThermals && canThermal ? (powerNeedScore + (stageInfo.stage >= 2 ? 45 : 35)) : 0);
   thermalScore *= reservePenalty;
   addAction("thermal", thermalScore, actionHandlers.thermal);
