@@ -9,6 +9,7 @@ var Core = Packages.arc.Core;
 var Build = Packages.mindustry.world.Build;
 var BlockGroup = Packages.mindustry.world.meta.BlockGroup;
 var BlockFlag = Packages.mindustry.world.meta.BlockFlag;
+var BuildVisibility = Packages.mindustry.world.meta.BuildVisibility;
 var Conveyor = Packages.mindustry.world.blocks.distribution.Conveyor;
 var Duct = Packages.mindustry.world.blocks.distribution.Duct;
 var Conduit = Packages.mindustry.world.blocks.liquid.Conduit;
@@ -68,7 +69,7 @@ var config = {
   actionCooldown: 180,
   modName: "auto-game",
   rlLogEnabled: true,
-  rlSocketEnabled: true,
+  rlSocketEnabled: false,
   rlSocketHost: "127.0.0.1",
   rlSocketPort: 4567,
   rlSocketReconnectTicks: 300,
@@ -3314,8 +3315,16 @@ function canPlaceBlock(block, x, y, rotation, team, ignoreReserveItems) {
 }
 
 function blockUnlocked(block) {
-  if (!config.campaignSafeMode) return true;
   if (block == null) return false;
+  try {
+    if (BuildVisibility != null) {
+      if (block.buildVisibility == BuildVisibility.sandboxOnly) return false;
+      if (block.buildVisibility == BuildVisibility.hidden) return false;
+    }
+  } catch (e0) {
+    // ignore
+  }
+  if (!config.campaignSafeMode) return true;
   try {
     return block.unlockedNow();
   } catch (e) {
