@@ -3476,7 +3476,7 @@ function computeMiningPlan(core, team) {
   return best;
 }
 
-function availableCoreItems(core, item) {
+function availableCoreItems(core, item, ignoreReserveItems) {
   if (core == null || core.items == null || item == null) return 0;
   var total = core.items.get(item);
   var reserve = shouldIgnoreReserve(ignoreReserveItems, item) ? 0 : reserveFor(item);
