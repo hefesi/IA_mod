@@ -4317,6 +4317,363 @@ function countDrillsForItem(team, item) {
   });
 }
 
+function economyIndustryStageRequirement(name) {
+  if (name == "plastanium") return 2;
+  if (name == "silicon") return 1;
+  return 0;
+}
+
+function economyItemStageRequirement(name) {
+  if (name == "thorium" || name == "plastanium") return 3;
+  if (name == "titanium") return 2;
+  if (name == "graphite" || name == "silicon" || name == "metaglass") return 1;
+  return 0;
+}
+
+function industryBlueprintByOutput(itemName) {
+  if (itemName == null) return null;
+  for (var key in industryBlueprints) {
+    if (!industryBlueprints.hasOwnProperty(key)) continue;
+    var def = industryBlueprints[key];
+    if (def == null || def.output == null) continue;
+    if (def.output == itemName) return def;
+  }
+  return null;
+}
+
+function pushUniqueName(list, seen, name) {
+  if (name == null || name == "") return;
+  if (seen[name] === true) return;
+  seen[name] = true;
+  list.push(name);
+}
+
+function economyStageInfo(core, team, unitsTotal) {
+  var t = team != null ? team : getTeam();
+  var totalUnits = unitsTotal != null ? unitsTotal : 0;
+  var graphiteFactories = t != null ? countIndustryFactories(t, "graphite") : 0;
+  var siliconFactories = t != null ? countIndustryFactories(t, "silicon") : 0;
+  var plastaniumFactories = t != null ? countIndustryFactories(t, "plastanium") : 0;
+  var industryFactories = graphiteFactories + siliconFactories + plastaniumFactories;
+  var factoryBlocks = t != null ? countFactoryBlocks(t) : state.factoryBlocks;
+  var factoryProfile = t != null ? computeFactoryCapacityProfile(t) : {
+    factoryCapacity: 0,
+    upgradeCapacity: 0,
+    factoryVariety: 0,
+    mobilityCapacity: 0,
+    supportCapacity: 0,
+    unitCapacity: 0
+  };
+  var graphite = coreItemCount(core, itemByName("graphite"));
+  var silicon = coreItemCount(core, itemByName("silicon"));
+  var titanium = coreItemCount(core, itemByName("titanium"));
+  var plastanium = coreItemCount(core, itemByName("plastanium"));
+  var thorium = coreItemCount(core, itemByName("thorium"));
+  var drills = state.drillCount;
+  var stage = 0;
+
+  if (
+    drills >= Math.min(2, config.maxDrills) ||
+    graphiteFactories > 0 ||
+    siliconFactories > 0 ||
+    graphite >= 40 ||
+    silicon >= 30
+  ) {
+    stage = 1;
+  }
+
+  if (
+    siliconFactories > 0 ||
+    factoryBlocks > 0 ||
+    titanium >= 50 ||
+    (graphiteFactories > 0 && silicon >= 50) ||
+    factoryProfile.factoryCapacity >= 1.5
+  ) {
+    stage = 2;
+  }
+
+  if (
+    plastaniumFactories > 0 ||
+    factoryBlocks >= 2 ||
+    factoryProfile.upgradeCapacity >= 1.5 ||
+    (siliconFactories > 0 && titanium >= 80) ||
+    (factoryProfile.factoryCapacity >= 2.2 && totalUnits >= Math.max(6, Math.floor(config.attackMinForce * 0.7)))
+  ) {
+    stage = 3;
+  }
+
+  if (
+    (plastaniumFactories > 0 && factoryBlocks >= 2) ||
+    plastanium >= 50 ||
+    thorium >= 60 ||
+    factoryProfile.upgradeCapacity >= 3.5
+  ) {
+    stage = 4;
+  }
+
+  return {
+    stage: stage,
+    industryFactories: industryFactories,
+    graphiteFactories: graphiteFactories,
+    siliconFactories: siliconFactories,
+    plastaniumFactories: plastaniumFactories,
+    factoryBlocks: factoryBlocks,
+    unitsTotal: totalUnits
+  };
+}
+
+function allowedDrillCapacity(stageInfo, team) {
+  var base = config.maxDrills != null ? config.maxDrills : 5;
+  var softCap = config.priorityDrillCap != null ? Math.max(base, config.priorityDrillCap) : base;
+  var stage = stageInfo != null && stageInfo.stage != null ? stageInfo.stage : 0;
+  var cap = base + Math.max(0, stage);
+  if (team != null && countIndustryFactories(team, "plastanium") > 0) cap += 1;
+  if (cap < base) cap = base;
+  if (cap > softCap) cap = softCap;
+  return cap;
+}
+
+function buildEconomyIndustryOrder(stageInfo) {
+  var stage = stageInfo != null && stageInfo.stage != null ? stageInfo.stage : 0;
+  var order = [];
+  var seen = {};
+  pushUniqueName(order, seen, "graphite");
+  if (stage >= 1) pushUniqueName(order, seen, "silicon");
+  if (stage >= 2) pushUniqueName(order, seen, "plastanium");
+  return order;
+}
+
+function buildEconomyMiningOrder(stageInfo) {
+  var stage = stageInfo != null && stageInfo.stage != null ? stageInfo.stage : 0;
+  var order = [];
+  var seen = {};
+  if (config.economicMiningRoadmap != null) {
+    for (var i = 0; i < config.economicMiningRoadmap.length; i++) {
+      var entry = config.economicMiningRoadmap[i];
+      if (entry == null || entry.item == null) continue;
+      if (stage < economyItemStageRequirement(entry.item)) continue;
+      pushUniqueName(order, seen, entry.item);
+    }
+  }
+  var modules = buildEconomyIndustryOrder(stageInfo);
+  for (var m = 0; m < modules.length; m++) {
+    var def = industryBlueprints[modules[m]];
+    if (def == null || def.inputs == null) continue;
+    for (var j = 0; j < def.inputs.length; j++) {
+      var input = def.inputs[j];
+      if (input == null || input.name == null) continue;
+      pushUniqueName(order, seen, input.name);
+    }
+  }
+  return order;
+}
+
+function rankIndustryNeeds(core, team) {
+  var t = team != null ? team : getTeam();
+  var stageInfo = economyStageInfo(core, t);
+  var stage = stageInfo != null && stageInfo.stage != null ? stageInfo.stage : 0;
+  var needs = [];
+  for (var key in industryBlueprints) {
+    if (!industryBlueprints.hasOwnProperty(key)) continue;
+    var def = industryBlueprints[key];
+    if (def == null) continue;
+    var count = countIndustryFactories(t, key);
+    var maxFactories = def.maxFactories != null ? def.maxFactories : 1;
+    var outputItem = itemByName(def.output);
+    var outputEntry = outputItem != null ? getDemandProfileEntry(t, core, outputItem) : null;
+    var outputTarget = industryOutputTarget(key);
+    var outputStock = outputItem != null ? coreItemCount(core, outputItem) : 0;
+    var outputPressure = outputTarget > 0 ? clamp01((outputTarget - outputStock) / Math.max(1, outputTarget)) : 0;
+    if (outputEntry != null) outputPressure = Math.max(outputPressure, outputEntry.scarcity != null ? outputEntry.scarcity : 0);
+    var inputPressure = 0;
+    var missingInputs = 0;
+    if (def.inputs != null) {
+      for (var i = 0; i < def.inputs.length; i++) {
+        var input = def.inputs[i];
+        if (input == null || input.name == null) continue;
+        var inputItem = itemByName(input.name);
+        if (inputItem == null) continue;
+        var inputEntry = getDemandProfileEntry(t, core, inputItem);
+        var inputTarget = industryInputTarget(key, input.name);
+        var reserve = inputTarget > 0 ? inputTarget : reserveFor(inputItem, t, core, inputEntry);
+        var inputStock = coreItemCount(core, inputItem);
+        var pressure = reserve > 0 ? clamp01((reserve - inputStock) / Math.max(1, reserve)) : 0;
+        pressure = Math.max(pressure, resourcePressure(core, inputItem, t, inputEntry));
+        if (countDrillsForItem(t, inputItem) <= 0) {
+          pressure += 0.2;
+          missingInputs++;
+        }
+        if (pressure > inputPressure) inputPressure = pressure;
+      }
+    }
+    if (inputPressure > 1) inputPressure = 1;
+    var stagePenalty = stage < economyIndustryStageRequirement(key) ? (economyIndustryStageRequirement(key) - stage) * 22 : 0;
+    var demandScore = 0;
+    if (outputEntry != null) {
+      demandScore += outputEntry.criticality != null ? outputEntry.criticality * 0.7 : 0;
+      demandScore += outputEntry.scarcity != null ? outputEntry.scarcity * 30 : 0;
+      demandScore += outputEntry.chainDemand != null ? outputEntry.chainDemand * 2 : 0;
+    }
+    var score = outputPressure * 80 + inputPressure * 35 + demandScore;
+    if (count < maxFactories) score += (maxFactories - count) * 18;
+    if (count <= 0) score += 12;
+    score += missingInputs * 10;
+    score -= count * 10;
+    score -= stagePenalty;
+    if (count >= maxFactories && outputPressure <= 0.05 && inputPressure <= 0.05) score -= 15;
+    needs.push({
+      name: key,
+      def: def,
+      count: count,
+      pressure: Math.max(outputPressure, inputPressure),
+      outputPressure: outputPressure,
+      inputPressure: inputPressure,
+      score: Math.round(score * 100) / 100
+    });
+  }
+  needs.sort(function(a, b){ return b.score - a.score; });
+  return needs;
+}
+
+function upgradeEconomyScore(team) {
+  var t = team != null ? team : getTeam();
+  var score = 0;
+  var drill = pickDrillBlock(t, industryReserveIgnore);
+  var powerNode = pickPowerNodeBlock(t, industryReserveIgnore);
+  var pump = pickPumpBlock(t, industryReserveIgnore);
+  var conveyor = pickConveyorBlock(t, industryReserveIgnore);
+  var conduit = pickConduitBlock(t, industryReserveIgnore);
+  score += countUpgradeableOrderedBuilds(t, config.blockPrefs != null ? config.blockPrefs.drills : null, drill, null) * 18;
+  score += countUpgradeableOrderedBuilds(t, config.blockPrefs != null ? config.blockPrefs.powerNodes : null, powerNode, null) * 10;
+  score += countUpgradeableOrderedBuilds(t, config.blockPrefs != null ? config.blockPrefs.pumps : null, pump, null) * 8;
+  score += countUpgradeableOrderedBuilds(t, config.blockPrefs != null ? config.blockPrefs.conveyors : null, conveyor, null) * 6;
+  score += countUpgradeableOrderedBuilds(t, config.blockPrefs != null ? config.blockPrefs.conduits : null, conduit, null) * 5;
+  return score;
+}
+
+function tryUpgradeEconomy(team) {
+  var t = team != null ? team : getTeam();
+  var drill = pickDrillBlock(t, industryReserveIgnore);
+  if (tryUpgradeOrderedBuild(t, config.blockPrefs != null ? config.blockPrefs.drills : null, drill, null, industryReserveIgnore)) return true;
+  var powerNode = pickPowerNodeBlock(t, industryReserveIgnore);
+  if (tryUpgradeOrderedBuild(t, config.blockPrefs != null ? config.blockPrefs.powerNodes : null, powerNode, null, industryReserveIgnore)) return true;
+  var pump = pickPumpBlock(t, industryReserveIgnore);
+  if (tryUpgradeOrderedBuild(t, config.blockPrefs != null ? config.blockPrefs.pumps : null, pump, null, industryReserveIgnore)) return true;
+  var conveyor = pickConveyorBlock(t, industryReserveIgnore);
+  if (tryUpgradeOrderedBuild(t, config.blockPrefs != null ? config.blockPrefs.conveyors : null, conveyor, null, industryReserveIgnore)) return true;
+  var conduit = pickConduitBlock(t, industryReserveIgnore);
+  if (tryUpgradeOrderedBuild(t, config.blockPrefs != null ? config.blockPrefs.conduits : null, conduit, null, industryReserveIgnore)) return true;
+  return false;
+}
+
+function computeMiningPlanForItem(core, team, item) {
+  if (core == null || item == null) return null;
+  var cx = core.tile.x;
+  var cy = core.tile.y;
+  var radius = config.priorityOreSearchRadius != null ? Math.max(config.oreSearchRadius, config.priorityOreSearchRadius) : config.oreSearchRadius;
+  var ores = findOreTiles(cx, cy, radius, -1);
+  if (ores == null || ores.length == 0) return null;
+  var entry = miningRoadmapEntry(item, core, team);
+  var profileEntry = getDemandProfileEntry(team, core, item);
+  var reserve = reserveFor(item, team, core, profileEntry);
+  var reservePressureValue = resourcePressure(core, item, team, profileEntry);
+  var demand = entry != null && entry.demand != null ? entry.demand : (profileEntry != null ? profileEntry.total : contentDemandForItem(team, item));
+  var priority = entry != null && entry.priority != null ? entry.priority : (reserve > 0 ? 1.0 : 0.6);
+  var criticality = entry != null && entry.criticality != null ? entry.criticality : (profileEntry != null ? profileEntry.criticality : 0);
+  var scarcity = entry != null && entry.scarcity != null ? entry.scarcity : (profileEntry != null ? profileEntry.scarcity : 0);
+  var itemDrills = countDrillsMiningItem(team, item);
+  var minDrills = entry != null && entry.minDrills != null ? entry.minDrills : 0;
+  var underDrilled = itemDrills < minDrills;
+  var critical = entry != null && entry.critical === true;
+  var criticalGate = config.mineCriticalPressureGate != null ? config.mineCriticalPressureGate : 0;
+  var bypassCap = miningBypassCap(entry);
+  var canBypass = critical && reservePressureValue >= criticalGate && state.drillCount < bypassCap;
+  var underBaseCap = state.drillCount < config.maxDrills;
+  if (!underBaseCap && !canBypass) return null;
+  var baseScore = config.mineRoadmapBaseScore != null ? config.mineRoadmapBaseScore : 0;
+  var distanceWeight = config.mineRoadmapDistanceWeight != null ? config.mineRoadmapDistanceWeight : 1;
+  var best = null;
+  for (var i = 0; i < ores.length; i++) {
+    var ore = ores[i];
+    if (ore == null || ore.item == null) continue;
+    if (ore.item != item && (ore.item.name == null || item.name == null || ore.item.name != item.name)) continue;
+    var tile = tileAt(ore.x, ore.y);
+    if (tile == null || tile.block() != Blocks.air) continue;
+    var score = baseScore;
+    score += reservePressureValue * 100;
+    score += priority * 30;
+    score += Math.min(demand, 24) * 8;
+    score += criticality * 1.2;
+    score += scarcity * 40;
+    if (underDrilled) score += config.mineRoadmapUnderDrilledBonus != null ? config.mineRoadmapUnderDrilledBonus : 25;
+    if (itemDrills <= 0) score += 18;
+    score -= Math.sqrt(ore.dist2) * distanceWeight;
+    if (best == null || score > best.score) {
+      best = {
+        ore: ore,
+        item: item,
+        itemName: item.name,
+        score: score,
+        pressure: reservePressureValue,
+        reservePressure: reservePressureValue,
+        reserve: reserve,
+        demand: demand,
+        criticality: criticality,
+        scarcity: scarcity,
+        allowBypass: !underBaseCap && canBypass
+      };
+    }
+  }
+  return best;
+}
+
+function ensureMiningForItem(core, itemName, seen) {
+  if (core == null || itemName == null || itemName == "") return false;
+  var loopGuard = seen != null ? seen : {};
+  if (loopGuard[itemName] === true) return false;
+  loopGuard[itemName] = true;
+  var team = getTeam();
+  var item = itemByName(itemName);
+  if (item != null) {
+    var directPlan = computeMiningPlanForItem(core, team, item);
+    if (directPlan != null && directPlan.ore != null) {
+      var stageInfo = economyStageInfo(core, team);
+      if (state.drillCount >= allowedDrillCapacity(stageInfo, team) && directPlan.allowBypass !== true) return false;
+      var drill = pickDrillBlock(team, industryReserveIgnore);
+      if (drill == null || !coreHasItemsFor(drill, team)) return false;
+      if (!placeBlock(drill, directPlan.ore.x, directPlan.ore.y, 0, team)) return false;
+      state.drillCount++;
+      var step = stepToward(directPlan.ore.x, directPlan.ore.y, core.tile.x, core.tile.y);
+      placeConveyorPath(team, directPlan.ore.x + step.dx, directPlan.ore.y + step.dy, core.tile.x, core.tile.y, config.maxConveyorSteps, null, industryReserveIgnore);
+      return true;
+    }
+  }
+  var blueprint = industryBlueprintByOutput(itemName);
+  if (blueprint == null || blueprint.inputs == null || blueprint.inputs.length == 0) return false;
+  var bestInput = null;
+  var bestScore = -999999;
+  for (var i = 0; i < blueprint.inputs.length; i++) {
+    var input = blueprint.inputs[i];
+    if (input == null || input.name == null || loopGuard[input.name] === true) continue;
+    var inputItem = itemByName(input.name);
+    if (inputItem == null) continue;
+    var inputEntry = getDemandProfileEntry(team, core, inputItem);
+    var inputTarget = industryInputTarget(blueprint.name, input.name);
+    var reserve = inputTarget > 0 ? inputTarget : reserveFor(inputItem, team, core, inputEntry);
+    var inputStock = coreItemCount(core, inputItem);
+    var pressure = reserve > 0 ? clamp01((reserve - inputStock) / Math.max(1, reserve)) : 0;
+    pressure = Math.max(pressure, resourcePressure(core, inputItem, team, inputEntry));
+    var score = pressure * 100;
+    if (countDrillsForItem(team, inputItem) <= 0) score += 20;
+    if (inputStock < inputTarget) score += (inputTarget - inputStock) * 0.1;
+    if (score > bestScore) {
+      bestScore = score;
+      bestInput = input.name;
+    }
+  }
+  return bestInput != null ? ensureMiningForItem(core, bestInput, loopGuard) : false;
+}
+
 function countUpgradeableOrderedBuilds(team, list, targetBlock, predicate) {
   if (team == null || targetBlock == null || list == null || list.length == null) return 0;
   var targetIndex = blockOrderIndex(targetBlock, list);
