@@ -21,8 +21,16 @@ Requirements:
 param(
     [int]$Timeout = 0,
     [int]$MaxTransitions = 0,
-    [switch]$NoWait
+    [switch]$NoWait,
+    [switch]$BindPublic,
+    [string]$Token = ""
 )
+
+# Guard: -NoWait cannot be used without explicit timeout/transitions
+if ($NoWait -and $Timeout -eq 0 -and $MaxTransitions -eq 0) {
+    Write-Error "Use -Timeout ou -MaxTransitions junto com -NoWait para evitar coleta infinita."
+    exit 1
+}
 
 function Get-PythonCommand {
     foreach ($cmd in @("python", "py", "python3", "python3.13")) {
@@ -50,6 +58,7 @@ $epochs = 5
 $outModel = "ppo_model.pt"
 $outMeta = "ppo_meta.json"
 $outNNJson = "nn_model.json"
+$bindHost = if ($BindPublic) { "0.0.0.0" } else { "127.0.0.1" }
 
 # Detecta os IPs locais para instruir o celular sobre para onde enviar os logs.
 function Get-LocalIPv4s {
@@ -78,16 +87,29 @@ Write-Host "Usando Python: $python"
 Write-Host "Iniciando socket server (porta $port)." -ForegroundColor Cyan
 
 $job = Start-Job -Name "RL-Socket" -ScriptBlock {
-    param($python, $port, $logFile, $timeout, $maxTrans)
-    $args = @("--host", "0.0.0.0", "--port", $port, "--out", $logFile, "--verbose")
+    param($python, $host, $port, $logFile, $timeout, $maxTrans, $token)
+    $args = @("--host", $host, "--port", $port, "--out", $logFile, "--verbose")
     if ($timeout -gt 0) { $args += @("--timeout", $timeout) }
     if ($maxTrans -gt 0) { $args += @("--max-transitions", $maxTrans) }
+    if ($token) { $args += @("--token", $token) }
     & $python scripts/rl_socket_server.py @args
-} -ArgumentList $python, $port, $logFile, $Timeout, $MaxTransitions
+} -ArgumentList $python, $bindHost, $port, $logFile, $Timeout, $MaxTransitions, $Token
 
 Write-Host "Socket server em execução como job 'RL-Socket'." -ForegroundColor Green
+if ($BindPublic) {
+    Write-Host "Aviso: Socket server ligado em 0.0.0.0 (permite conexões externas). Use apenas em redes confiáveis!" -ForegroundColor Yellow
+} else {
+    Write-Host "Socket server ligado em 127.0.0.1 (loopback, apenas local). Use -BindPublic para permitir conexões externas." -ForegroundColor Green
+}
+if ($Token) {
+    Write-Host "Autenticação por token ativada. O cliente deve incluir token=\"$Token\" no payload." -ForegroundColor Green
+}
 
-$ipHint = if ($localIPs -and $localIPs.Count -gt 0) { $localIPs -join ", " } else { "<IP-do-PC>" }
+$ipHint = if ($BindPublic) {
+    if ($localIPs -and $localIPs.Count -gt 0) { $localIPs -join ", " } else { "<IP-do-PC>" }
+} else {
+    "127.0.0.1 (local only)"
+}
 Write-Host "
 Ação necessária:
  1) No celular, configure ai.js com:
@@ -108,6 +130,11 @@ if (-not $NoWait -and $Timeout -eq 0 -and $MaxTransitions -eq 0) {
     if ($MaxTransitions -gt 0) {
         Write-Host "Servidor irá parar automaticamente após $MaxTransitions transições." -ForegroundColor Yellow
     }
+    
+    # Wait for the socket job to complete when auto-stop limits are set
+    while ((Get-Job -Name "RL-Socket" -ErrorAction SilentlyContinue).State -eq "Running") {
+        Start-Sleep -Milliseconds 400
+    }
 }
 
 Write-Host "Parando socket server..." -ForegroundColor Cyan
@@ -122,7 +149,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Exportando policy para nn_model.json..." -ForegroundColor Cyan
-& $python scripts/rl_export_nn_json.py --model $outModel --meta $outMeta --out $outNNJson
+& $python scripts/rl_export_nn_json.py --model $outModel --meta $outMeta --out $outNNJson --export-activation tanh
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Falha ao executar rl_export_nn_json.py"
     exit 1

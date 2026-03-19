@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import sys
 from collections import OrderedDict
 from pathlib import Path
 
@@ -157,7 +158,7 @@ def main():
         print("sb3_dependencies_missing={}".format(exc))
         print("rl_env={}".format(missing_dependency_message()))
         print("install='pip install stable-baselines3 gymnasium numpy torch'")
-        return
+        sys.exit(1)
 
     action_list = list(DEFAULT_ACTIONS)
     dataset_size = 0
@@ -168,13 +169,13 @@ def main():
         dataset_size = len(transitions)
         if not transitions:
             print("no_transitions_found")
-            return
+            sys.exit(1)
         if args.parquet_out:
             try:
                 stats = convert_log_to_parquet(args.log, args.parquet_out, limit=args.limit, transition_type="any")
             except Exception as exc:
                 print("parquet_export_failed={}".format(exc))
-                return
+                sys.exit(1)
             print("parquet_rows={rows} parquet_columns={columns} parquet_out={out_path}".format(**stats))
     else:
         payload = json.loads(Path(args.scenarios).read_text(encoding="utf-8"))
@@ -182,7 +183,7 @@ def main():
         scenario_count = len(payload.get("scenarios") or [])
         if scenario_count == 0:
             print("no_scenarios_found")
-            return
+            sys.exit(1)
 
     set_global_seed(args.seed, np_module=np, torch_module=torch)
     env_factory = build_env_factory(env_mode, args, action_list)
@@ -253,6 +254,7 @@ def main():
         "output": "logits",
         "policy_prefix": "policy_net",
         "value_prefix": "value_net",
+        "hidden_activation": "tanh",
         "actions": action_list,
         "features": FEATURES,
         "norms": NORMS,

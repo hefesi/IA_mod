@@ -28,6 +28,9 @@ var OutputStreamWriter = Packages.java.io.OutputStreamWriter;
 var BufferedWriter = Packages.java.io.BufferedWriter;
 var PrintWriter = Packages.java.io.PrintWriter;
 var Fi = Packages.arc.files.Fi;
+var Thread = Packages.java.lang.Thread;
+var ConcurrentLinkedQueue = Packages.java.util.concurrent.ConcurrentLinkedQueue;
+var Executors = Packages.java.util.concurrent.Executors;
 
 var config = {
   buildDelay: 30,
@@ -72,6 +75,7 @@ var config = {
   rlSocketEnabled: false,
   rlSocketHost: "127.0.0.1",
   rlSocketPort: 4567,
+  rlSocketToken: "",
   rlSocketReconnectTicks: 300,
   rlSocketTimeoutMs: 200,
   rlSocketQueueMax: 200,
@@ -395,6 +399,7 @@ var state = {
   currentStrategy: "balanced",
   lastStrategyTick: -9999,
   playerControlledUnitId: -1,
+  playerControllerMode: null,
   playerControllerSet: false,
   // Tick when we last attempted to change the player unit controller.
   lastControllerAttemptTick: -9999,
@@ -444,7 +449,10 @@ var rlSocket = {
   out: null,
   lastConnectTick: -9999,
   lastErrorTick: -9999,
-  queue: []
+  queue: null,  // ConcurrentLinkedQueue initialized on first use
+  backgroundThread: null,
+  stopRequested: false,
+  threadLock: new java.lang.Object()
 };
 
 var rlSchemaLastLoadTick = -9999;
@@ -818,6 +826,19 @@ function rlSocketClose() {
   rlSocket.out = null;
 }
 
+function rlSocketStopBackgroundThread() {
+  if (rlSocket.backgroundThread != null) {
+    rlSocket.stopRequested = true;
+    try {
+      rlSocket.backgroundThread.join(5000);  // Wait up to 5 seconds
+    } catch (e) {
+      // ignore
+    }
+    rlSocket.backgroundThread = null;
+    rlSocket.stopRequested = false;
+  }
+}
+
 function rlSocketConnect() {
   if (!config.rlSocketEnabled) return false;
   if (rlSocketConnected()) return true;
@@ -843,25 +864,98 @@ function rlSocketConnect() {
   }
 }
 
-function rlSocketQueue(line) {
-  rlSocket.queue.push(line);
-  while (rlSocket.queue.length > config.rlSocketQueueMax) {
-    rlSocket.queue.shift();
+function rlSocketBackgroundWorker() {
+  // This function runs on the background thread
+  var queueDrainLimit = 50;  // Process up to 50 items per cycle to avoid blocking
+  var sleepMs = 50;  // Sleep between queue drain cycles
+  
+  while (!rlSocket.stopRequested) {
+    try {
+      Thread.sleep(sleepMs);
+      
+      // Attempt to connect and drain queue
+      if (!config.rlSocketEnabled) continue;
+      
+      if (!rlSocketConnected()) {
+        if (!rlSocketConnect()) continue;
+      }
+      
+      if (!rlSocketConnected()) continue;
+      
+      // Drain queue items
+      var count = 0;
+      while (count < queueDrainLimit && rlSocket.queue != null && rlSocket.queue.size() > 0) {
+        try {
+          var line = rlSocket.queue.poll();
+          if (line != null && rlSocket.out != null) {
+            rlSocket.out.println(line);
+          }
+          count++;
+        } catch (e) {
+          Log.info("[RL] Error sending via socket: " + e);
+          rlSocketClose();
+          break;
+        }
+      }
+    } catch (e) {
+      Log.info("[RL] Background thread error: " + e);
+    }
+  }
+  
+  // Clean up on exit
+  rlSocketClose();
+}
+
+function rlSocketEnsureBackground() {
+  if (!config.rlSocketEnabled) return;
+  if (rlSocket.backgroundThread != null) return;
+  
+  // Initialize concurrent queue if needed
+  if (rlSocket.queue == null) {
+    rlSocket.queue = new ConcurrentLinkedQueue();
+  }
+  
+  // Start background thread
+  try {
+    var th = new Thread(function() {
+      rlSocketBackgroundWorker();
+    });
+    th.setName("RL-Socket-Worker");
+    th.setDaemon(true);
+    th.start();
+    rlSocket.backgroundThread = th;
+    Log.info("[RL] Background socket worker thread started.");
+  } catch (e) {
+    Log.info("[RL] Failed to start background socket thread: " + e);
   }
 }
 
-function rlSocketFlush() {
-  if (!rlSocketConnect()) return false;
-  if (!rlSocketConnected()) return false;
-  try {
-    while (rlSocket.queue.length > 0) {
-      rlSocket.out.println(rlSocket.queue.shift());
-    }
-    return true;
-  } catch (e) {
-    rlSocketClose();
-    return false;
+function rlSocketQueue(line) {
+  if (!config.rlSocketEnabled) return;
+  
+  // Initialize concurrent queue if needed
+  if (rlSocket.queue == null) {
+    rlSocket.queue = new ConcurrentLinkedQueue();
   }
+  
+  // Apply queue size limit: drop oldest if at max
+  if (rlSocket.queue.size() >= config.rlSocketQueueMax) {
+    rlSocket.queue.poll();
+  }
+  
+  // Add to queue
+  rlSocket.queue.add(line);
+  
+  // Ensure background thread is running
+  rlSocketEnsureBackground();
+}
+
+function rlSocketFlush() {
+  // With background thread, just ensure the thread is running
+  // The actual flushing happens asynchronously on the background thread
+  if (!config.rlSocketEnabled) return true;
+  rlSocketEnsureBackground();
+  return true;
 }
 
 function rlSocketSend(line) {
@@ -990,6 +1084,9 @@ function snapshotState(core, enemyCore, enemies, team) {
 
 function emitTransition(prevState, actionName, nextState, info) {
   var payload = { type: "transition", s: prevState, a: actionName, s2: nextState, info: info, t: state.tick };
+  if (config.rlSocketToken && config.rlSocketToken.length > 0) {
+    payload.token = config.rlSocketToken;
+  }
   var line = JSON.stringify(payload);
   if (config.rlLogEnabled) Log.info("[RL]" + line);
   rlSocketSend(line);
@@ -1005,6 +1102,9 @@ function emitMicroTransition(prevState, policyName, decisionName, nextState, inf
     info: info != null ? info : {},
     t: state.tick
   };
+  if (config.rlSocketToken && config.rlSocketToken.length > 0) {
+    payload.token = config.rlSocketToken;
+  }
   var line = JSON.stringify(payload);
   if (config.rlLogEnabled) Log.info("[RL]" + line);
   rlSocketSend(line);
@@ -2252,7 +2352,6 @@ function pickLiquidHubBlock(core) {
   var fromList = pickBlockFromNames(config.blockPrefs != null ? config.blockPrefs.liquidHubs : null, team);
   if (fromList != null) return fromList;
   if (config.autoBlockSelection) {
-    var minCap = config.liquidHubMinCapacity != null ? config.liquidHubMinCapacity : 100;
     var best = null;
     var bestCap = -1;
     var bestCost = 999999;
@@ -2821,10 +2920,6 @@ function modelHasNamedEntry(list, name) {
   return false;
 }
 
-function nnModelHasFeature(name) {
-  return state.nnModel != null && modelHasNamedEntry(state.nnModel.features, name);
-}
-
 function nnModelHasAction(name) {
   return state.nnModel != null && modelHasNamedEntry(state.nnModel.actions, name);
 }
@@ -2890,7 +2985,7 @@ function clampMetric(v) {
   return v;
 }
 
-function buildMicroPolicyState(actionName, ctx, decisions) {
+function buildMicroPolicyState(ctx, decisions) {
   var snap = ctx != null ? ctx.beforeState : null;
   var out = {
     enemyCount: clampMetric((snap != null ? snap.enemies : 0) / 20),
@@ -2918,7 +3013,7 @@ function buildMicroPolicyState(actionName, ctx, decisions) {
 function microPolicyScores(actionName, ctx, decisions) {
   var model = loadMicroPolicyModel(actionName);
   if (model == null || model.features == null || model.actions == null || decisions == null || decisions.length == 0) return null;
-  var stateObj = buildMicroPolicyState(actionName, ctx, decisions);
+  var stateObj = buildMicroPolicyState(ctx, decisions);
   var prev = state.nnModel;
   state.nnModel = model;
   var fwd = nnForward(stateObj);
@@ -3352,7 +3447,7 @@ function maxArray(arr) {
   return max;
 }
 
-function computeReward(prevState, actionName, nextState, info) {
+function computeReward(prevState, nextState, info) {
   if (prevState == null || nextState == null) return 0;
   var reward = 0;
   reward += (nextState.copper - prevState.copper) * config.rlRewardCopper;
@@ -3391,9 +3486,6 @@ function computeReward(prevState, actionName, nextState, info) {
   var dCore = nextState.coreHealthFrac - prevState.coreHealthFrac;
   reward += dCore * config.rlRewardCoreDamageScale;
 
-  if (prevState.corePresent == 1 && nextState.corePresent == 0) reward += config.rlRewardCoreLost;
-  if (prevState.enemyCore == 1 && nextState.enemyCore == 0) reward += config.rlRewardWin;
-
   if (info != null && info.ok === false) reward += config.rlRewardFail;
 
   // Penalize controller resets (AI switching control mid-game).
@@ -3402,11 +3494,17 @@ function computeReward(prevState, actionName, nextState, info) {
     state.controllerResetPenalty = 0;
   }
 
+  // Apply clamp only to the incremental part (before terminal bonuses)
   var clamp = config.rlRewardClamp;
   if (clamp != null && clamp > 0) {
     if (reward > clamp) reward = clamp;
     if (reward < -clamp) reward = -clamp;
   }
+
+  // Add terminal bonuses after clamping to preserve full magnitude of terminal signal
+  if (prevState.corePresent == 1 && nextState.corePresent == 0) reward += config.rlRewardCoreLost;
+  if (prevState.enemyCore == 1 && nextState.enemyCore == 0) reward += config.rlRewardWin;
+
   return reward;
 }
 
@@ -4079,7 +4177,26 @@ function placeBlock(block, x, y, rotation, team, ignoreReserveItems) {
     }
   }
   if (player != null && isUnitUsable(builderUnit)) {
-    Call.constructFinish(tile, block, builderUnit, rotation || 0, team, null);
+    try {
+      Call.constructFinish(tile, block, builderUnit, rotation || 0, team, null);
+    } catch (e) {
+      if (config.aiDebugHud) state.lastPlaceFail = "construct-fail:" + block.name;
+      // Attempt rollback: restore consumed resources
+      var requirements = block.requirements;
+      if (requirements != null && requirements.length > 0) {
+        var rollbackMult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
+        var core = getCore(team);
+        if (core != null && core.items != null) {
+          for (var ri = 0; ri < requirements.length; ri++) {
+            var requirement = requirements[ri];
+            if (requirement != null && requirement.item != null && requirement.amount != null) {
+              core.items.add(requirement.item, Math.ceil(requirement.amount * rollbackMult));
+            }
+          }
+        }
+      }
+      return false;
+    }
   } else {
     try {
       if (tile.setNet != null) {
@@ -4089,6 +4206,20 @@ function placeBlock(block, x, y, rotation, team, ignoreReserveItems) {
       }
     } catch (e) {
       if (config.aiDebugHud) state.lastPlaceFail = "place-fail:" + block.name;
+      // Attempt rollback: restore consumed resources
+      var requirements = block.requirements;
+      if (requirements != null && requirements.length > 0) {
+        var rollbackMult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
+        var core = getCore(team);
+        if (core != null && core.items != null) {
+          for (var ri = 0; ri < requirements.length; ri++) {
+            var requirement = requirements[ri];
+            if (requirement != null && requirement.item != null && requirement.amount != null) {
+              core.items.add(requirement.item, Math.ceil(requirement.amount * rollbackMult));
+            }
+          }
+        }
+      }
       return false;
     }
   }
@@ -5825,39 +5956,6 @@ function ensureIndustryModule(core, name) {
   return changed;
 }
 
-function actionIndustry(core) {
-  var team = getTeam();
-  var stageInfo = economyStageInfo(core, team);
-  var mineOrder = buildEconomyMiningOrder(stageInfo);
-  for (var m = 0; m < mineOrder.length; m++) {
-    if (ensureMiningForItem(core, mineOrder[m])) return true;
-  }
-
-  var stageFactories = buildEconomyIndustryOrder(stageInfo);
-  for (var f = 0; f < stageFactories.length; f++) {
-    if (ensureIndustryModule(core, stageFactories[f])) return true;
-  }
-
-  var needs = rankIndustryNeeds(core, team);
-  for (var i = 0; i < needs.length; i++) {
-    var need = needs[i];
-    var def = need.def;
-    for (var j = 0; j < def.inputs.length; j++) {
-      var input = def.inputs[j];
-      var item = itemByName(input.name);
-      if (item == null) continue;
-      var inputTarget = industryInputTarget(need.name, input.name);
-      if (countDrillsForItem(team, item) <= 0 || coreItemCount(core, item) < inputTarget) {
-        if (ensureMiningForItem(core, input.name)) return true;
-      }
-    }
-    if (need.count < def.maxFactories || need.pressure > 0.25) {
-      if (ensureIndustryModule(core, need.name)) return true;
-    }
-  }
-  return tryUpgradeEconomy(team);
-}
-
 function actionLiquid(core) {
   var team = getTeam();
   if (state.pumpCount >= config.maxPumps && state.liquidHubCount >= config.maxLiquidHubs) return false;
@@ -6503,8 +6601,99 @@ function chooseLiquidMicroDecision(ctx) {
 }
 
 function executeLiquidMicroDecision(ctx, decision) {
-  if (ctx == null || decision == null) return false;
-  return actionLiquid(ctx.core);
+  if (ctx == null || decision == null || ctx.core == null) return false;
+  
+  var core = ctx.core;
+  var team = ctx.team;
+  
+  // Retrieve the pump block
+  var pumpBlock = pickPumpBlock(team);
+  if (pumpBlock == null) return false;
+  
+  // Attempt to place pump at the selected coordinates from the decision
+  if (!placeBlock(pumpBlock, decision.pumpX, decision.pumpY, 0, team)) {
+    return false;
+  }
+  
+  state.pumpCount++;
+  
+  // Try to find or create a liquid hub for distribution
+  var hub = findLiquidHub(team);
+  var hubPos = null;
+  
+  if (hub != null) {
+    hubPos = { x: hub.tile.x, y: hub.tile.y };
+    if (state.liquidHubCount < 1) state.liquidHubCount = 1;
+  }
+  
+  // If no hub exists and we can create one, try to place it
+  if (hubPos == null && state.liquidHubCount < config.maxLiquidHubs) {
+    var hubBlock = pickLiquidHubBlock(core);
+    if (hubBlock != null) {
+      var cx = core.tile.x;
+      var cy = core.tile.y;
+      var candidate = findPlaceForBlock(hubBlock, cx, cy, config.liquidHubSearchRadius, team);
+      if (candidate != null && placeBlock(hubBlock, candidate.x, candidate.y, 0, team)) {
+        hubPos = candidate;
+        state.liquidHubCount++;
+      }
+    }
+  }
+  
+  // Determine the coolant liquid (prefer cryofluid if available at hub)
+  var coolantLiquid = decision.liquid;
+  if (config.preferCryofluid && hub != null && hub.liquids != null) {
+    try {
+      if (hub.liquids.get(Liquids.cryofluid) > 0) coolantLiquid = Liquids.cryofluid;
+    } catch (e0) {
+      // ignore
+    }
+  }
+  
+  // Find coolant targets (thermal generators, etc.)
+  var coolantTargets = findCoolantTargets(team, coolantLiquid, decision.pumpX, decision.pumpY, config.maxCoolantTargets);
+  
+  // Lay conduit paths from pump to targets
+  if (hubPos != null) {
+    // Path from pump to hub
+    var stepHub = stepToward(decision.pumpX, decision.pumpY, hubPos.x, hubPos.y);
+    var sxHub = decision.pumpX + stepHub.dx;
+    var syHub = decision.pumpY + stepHub.dy;
+    placeConduitPath(team, sxHub, syHub, hubPos.x, hubPos.y, config.maxConduitSteps);
+    
+    // Paths from hub to coolant targets
+    for (var ct = 0; ct < coolantTargets.length; ct++) {
+      var t = coolantTargets[ct];
+      placeConduitPath(team, hubPos.x, hubPos.y, t.tile.x, t.tile.y, config.maxConduitSteps);
+    }
+  } else if (coolantTargets.length > 0) {
+    // No hub, chain targets together
+    var last = { x: decision.pumpX, y: decision.pumpY };
+    for (var ct2 = 0; ct2 < coolantTargets.length; ct2++) {
+      var t2 = coolantTargets[ct2];
+      var step = stepToward(last.x, last.y, t2.tile.x, t2.tile.y);
+      var sx = last.x + step.dx;
+      var sy = last.y + step.dy;
+      placeConduitPath(team, sx, sy, t2.tile.x, t2.tile.y, config.maxConduitSteps);
+      last = { x: t2.tile.x, y: t2.tile.y };
+    }
+  } else {
+    // No hub or targets, path to core
+    var target = { x: core.tile.x, y: core.tile.y };
+    var step2 = stepToward(decision.pumpX, decision.pumpY, target.x, target.y);
+    var sx2 = decision.pumpX + step2.dx;
+    var sy2 = decision.pumpY + step2.dy;
+    placeConduitPath(team, sx2, sy2, target.x, target.y, config.maxConduitSteps);
+  }
+  
+  // Try to place a power node near the pump for operation
+  var nodeBlock = pickPowerNodeBlock(team);
+  if (nodeBlock != null) {
+    var node = clampToBounds(decision.pumpX + 1, decision.pumpY);
+    placeBlock(nodeBlock, node.x, node.y, 0, team);
+  }
+  
+  return true;
 }
 
 function executeActionDecision(actionName, ctx, decision) {
@@ -6739,6 +6928,7 @@ Events.on(WorldLoadEvent, function(){
   state.currentStrategy = "balanced";
   state.lastStrategyTick = -9999;
   state.playerControlledUnitId = -1;
+  state.playerControllerMode = null;
   state.playerControllerSet = false;
   state.controllerResetPenalty = 0;
   state.nnModel = null;
@@ -6764,8 +6954,9 @@ Events.on(WorldLoadEvent, function(){
   state.lastEconomicFocus = null;
   state.logicControllers = { ground: null, air: null, naval: null };
   unlockedProducerCountCache = null;
+  rlSocketStopBackgroundThread();
   rlSocketClose();
-  rlSocket.queue = [];
+  if (rlSocket.queue != null) rlSocket.queue.clear();
   rlQMeta = emptyRLMeta();
   rlSchemaLastLoadTick = -9999;
   rlSchemaLastErrorTick = -9999;
@@ -6802,7 +6993,7 @@ Events.on(GameOverEvent, function(e){
     reason: "gameOver",
     winner: safeTeamName(winner)
   };
-  terminalInfo.reward = computeReward(prevState, "noop", terminalState, terminalInfo);
+  terminalInfo.reward = computeReward(prevState, terminalState, terminalInfo);
   emitTransition(prevState, "noop", terminalState, terminalInfo);
   state.lastRLState = terminalState;
 
@@ -7297,7 +7488,7 @@ function runAiStep(core, team) {
   var enemyCore2 = findEnemyCore(team);
   var enemies2 = countEnemyUnits(team);
   var afterState = snapshotState(core2, enemyCore2, enemies2, team);
-  var reward = computeReward(beforeState, pickedName, afterState, { ok: did });
+  var reward = computeReward(beforeState, afterState, { ok: did });
   state.lastReward = reward;
   state.lastMicroReward = reward;
   updateOnlineQTable(beforeState, pickedName, afterState, reward);

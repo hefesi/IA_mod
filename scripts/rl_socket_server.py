@@ -17,14 +17,47 @@ def socket_event_name(payload):
     return name
 
 
-def handle_connection(conn, addr, out_path, verbose, max_transitions=0, stop_on_event=""):
+def handle_connection(conn, addr, out_path, verbose, global_state, required_token="", allowlist=None, stop_on_event=""):
+    """
+    Handle a single client connection with optional token authentication.
+    
+    Args:
+        conn: socket connection
+        addr: client address
+        out_path: path to output log file
+        verbose: whether to print per-transition rewards
+        global_state: dict with 'total_transitions' counter (mutated in-place)
+        required_token: if set, clients must include this token in payload metadata
+        allowlist: list of allowed client IPs (None = allow all)
+        stop_on_event: name of event that triggers server stop
+    
+    Returns:
+        tuple of (connection_transitions, stop_event_name)
+    """
+    # Check IP allowlist if specified
+    if allowlist is not None and len(allowlist) > 0:
+        client_ip = addr[0] if isinstance(addr, tuple) else str(addr)
+        if client_ip not in allowlist:
+            if verbose:
+                print("client_rejected_not_in_allowlist client_ip={}".format(client_ip))
+            return 0, None
+    
     buf = ""
     count = 0
     total = 0.0
+    max_remaining = global_state.get("max_remaining", 0)
+    
     with conn, open(out_path, "a", encoding="utf-8") as f:
+        client_ip = addr[0] if isinstance(addr, tuple) else str(addr)
         if verbose:
-            print("client_connected={}".format(addr))
+            print("client_connected={} global_total={}".format(addr, global_state["total_transitions"]))
         while True:
+            # Check if we've hit the global limit
+            if max_remaining > 0 and global_state["total_transitions"] >= global_state["max_transitions"]:
+                if verbose:
+                    print("global_max_transitions_reached")
+                break
+            
             data = conn.recv(4096)
             if not data:
                 break
@@ -38,6 +71,14 @@ def handle_connection(conn, addr, out_path, verbose, max_transitions=0, stop_on_
                     tr = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                
+                # Check token if required
+                if required_token:
+                    if tr.get("token") != required_token:
+                        if verbose:
+                            print("payload_rejected_invalid_token client_ip={}".format(client_ip))
+                        continue
+                
                 event_name = socket_event_name(tr)
                 if event_name is not None:
                     if verbose:
@@ -49,27 +90,47 @@ def handle_connection(conn, addr, out_path, verbose, max_transitions=0, stop_on_
                 f.flush()
                 r = reward_from_transition(tr)
                 count += 1
+                global_state["total_transitions"] += 1
                 total += r
                 if verbose:
-                    print("t={t} a={a} r={r:.2f}".format(t=tr.get("t"), a=tr.get("a"), r=r))
-                if max_transitions and count >= max_transitions:
+                    print("t={t} a={a} r={r:.2f} connection_transitions={conn_t} global_transitions={global_t}".format(
+                        t=tr.get("t"), a=tr.get("a"), r=r, conn_t=count, global_t=global_state["total_transitions"]))
+                
+                # Check if we've hit the global limit
+                if max_remaining > 0 and global_state["total_transitions"] >= global_state["max_transitions"]:
                     return count, None
+    
     if verbose and count:
         avg = total / count
-        print("client_done transitions={} avg_reward={:.3f}".format(count, avg))
+        print("client_done client_ip={} connection_transitions={} global_transitions={} avg_reward={:.3f}".format(
+            client_ip, count, global_state["total_transitions"], avg))
     return count, None
 
 
 def main():
     parser = argparse.ArgumentParser(description="Mindustry RL socket receiver.")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host.")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1 for loopback; use 0.0.0.0 for public).")
     parser.add_argument("--port", type=int, default=4567, help="Bind port.")
     parser.add_argument("--out", default="rl_socket.log", help="Output log file.")
     parser.add_argument("--verbose", action="store_true", help="Print per-transition rewards.")
-    parser.add_argument("--max-transitions", type=int, default=0, help="Stop server after this many transitions (0 = unlimited).")
+    parser.add_argument("--max-transitions", type=int, default=0, help="Stop server after this many transitions globally (0 = unlimited).")
     parser.add_argument("--timeout", type=float, default=0.0, help="Stop server after this many seconds of no connection (0 = unlimited).")
     parser.add_argument("--stop-on-event", default="", help="Stop server when a socket control event with this name is received.")
+    parser.add_argument("--token", default="", help="Optional shared token for payload authentication (clients must include in payload metadata).")
+    parser.add_argument("--allowlist", default="", help="Optional comma-separated list of allowed client IPs (e.g., '127.0.0.1,192.168.1.100'). If empty, all IPs allowed.")
     args = parser.parse_args()
+
+    # Parse allowlist
+    allowlist = None
+    if args.allowlist:
+        allowlist = [ip.strip() for ip in args.allowlist.split(",") if ip.strip()]
+
+    # Global state tracking process-level transition counter
+    global_state = {
+        "total_transitions": 0,
+        "max_transitions": args.max_transitions,
+        "max_remaining": args.max_transitions if args.max_transitions > 0 else 0
+    }
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -78,12 +139,17 @@ def main():
         if args.timeout and args.timeout > 0:
             s.settimeout(args.timeout)
         print("listening_on={}:{}".format(args.host, args.port))
+        print("max_transitions={}".format(args.max_transitions if args.max_transitions > 0 else "unlimited"))
+        if args.token:
+            print("authentication=token_required")
+        if allowlist:
+            print("allowlist={}".format(",".join(allowlist)))
         stop = False
         while not stop:
             try:
                 conn, addr = s.accept()
             except socket.timeout:
-                print("timeout_reached, stopping server")
+                print("timeout_reached global_transitions={} stopping_server".format(global_state["total_transitions"]))
                 break
             try:
                 count, stop_event = handle_connection(
@@ -91,18 +157,24 @@ def main():
                     addr,
                     args.out,
                     args.verbose,
-                    max_transitions=args.max_transitions,
+                    global_state,
+                    required_token=args.token,
+                    allowlist=allowlist,
                     stop_on_event=args.stop_on_event,
                 )
                 if stop_event:
-                    print("stop_event_received={}, stopping server".format(stop_event))
+                    print("stop_event_received={} global_transitions={} stopping_server".format(
+                        stop_event, global_state["total_transitions"]))
                     break
-                if args.max_transitions and count >= args.max_transitions:
-                    print("max_transitions reached ({}), stopping server".format(count))
+                if args.max_transitions > 0 and global_state["total_transitions"] >= args.max_transitions:
+                    print("max_transitions_reached_globally global_transitions={} stopping_server".format(
+                        global_state["total_transitions"]))
                     break
             except Exception as exc:
                 print("client_error={}".format(exc))
                 time.sleep(0.2)
+    
+    print("final_global_transitions={}".format(global_state["total_transitions"]))
 
 
 if __name__ == "__main__":

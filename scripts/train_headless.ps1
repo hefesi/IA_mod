@@ -489,7 +489,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Exportando policy para nn_model.json..." -ForegroundColor Cyan
-& $python $exportScript --model $outModelPath --meta $outMetaPath --out $outNNJsonPath
+& $python $exportScript --model $outModelPath --meta $outMetaPath --out $outNNJsonPath --export-activation tanh
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Falha ao executar rl_export_nn_json.py"
     exit 1

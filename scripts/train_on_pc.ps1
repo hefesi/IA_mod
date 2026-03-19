@@ -112,7 +112,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Exportando policy para nn_model.json..." -ForegroundColor Cyan
-& $python scripts/rl_export_nn_json.py --model $OutModel --meta $OutMeta --out $OutNNJson
+& $python scripts/rl_export_nn_json.py --model $OutModel --meta $OutMeta --out $OutNNJson --export-activation tanh
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Falha ao executar rl_export_nn_json.py"
     Remove-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue

@@ -19,6 +19,40 @@ def load_state_dict(path):
     return sd
 
 
+def resolve_activation_name(activation_input):
+    """
+    Resolve activation name: either from PyTorch module name or string literal.
+    Falls back to 'relu' if unrecognized.
+    """
+    if activation_input is None:
+        return "relu"
+    
+    # If it's a string, normalize and return
+    if isinstance(activation_input, str):
+        lower = activation_input.lower()
+        if lower in ("tanh", "relu", "elu", "selu", "sigmoid", "none"):
+            return lower
+        return "relu"  # Default fallback
+    
+    # If it's a torch module, try to extract name
+    try:
+        module_name = activation_input.__class__.__name__
+        if "tanh" in module_name.lower():
+            return "tanh"
+        elif "relu" in module_name.lower():
+            return "relu"
+        elif "elu" in module_name.lower():
+            return "elu"
+        elif "selu" in module_name.lower():
+            return "selu"
+        elif "sigmoid" in module_name.lower():
+            return "sigmoid"
+    except:
+        pass
+    
+    return "relu"  # Default fallback
+
+
 def extract_linear_layers(sd, prefix="net"):
     idxs = set()
     for key in sd.keys():
@@ -54,7 +88,7 @@ def main():
     parser.add_argument("--meta", required=True, help="Path to meta JSON (actions/features/norms).")
     parser.add_argument("--out", default="nn_model.json", help="Output JSON for the mod.")
     parser.add_argument("--prefix", default="", help="State dict prefix for the policy head. Defaults to meta.policy_prefix or auto-detect.")
-    parser.add_argument("--hidden-act", default="relu", help="Activation for hidden layers (default: relu).")
+    parser.add_argument("--export-activation", default="", help="Activation for hidden layers (overrides metadata if provided; falls back to metadata, then 'relu').")
     args = parser.parse_args()
 
     sd = load_state_dict(args.model)
@@ -68,11 +102,17 @@ def main():
         else:
             prefix = "net"
 
+    # Determine activation: CLI arg > metadata > fallback to relu
+    if args.export_activation:
+        hidden_act = resolve_activation_name(args.export_activation)
+    else:
+        hidden_act = resolve_activation_name(meta.get("hidden_activation", "relu"))
+
     layers = extract_linear_layers(sd, prefix=prefix)
 
     out_layers = []
     for i, (w, b) in enumerate(layers):
-        act = args.hidden_act if i < len(layers) - 1 else "none"
+        act = hidden_act if i < len(layers) - 1 else "none"
         out_layers.append(
             {
                 "in": int(w.shape[1]),

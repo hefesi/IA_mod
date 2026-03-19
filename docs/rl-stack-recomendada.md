@@ -46,6 +46,24 @@ Depois do treino, exporte para o formato consumido pelo mod:
 python3 scripts/rl_export_nn_json.py --model ppo_model.pt --meta ppo_meta.json --out nn_model.json
 ```
 
+### Contrato de Ativação (Hidden-Layer Activation)
+
+O treinador PPO (`rl_ppo.py`) utiliza **Tanh** como função de ativação para as camadas ocultas e persiste essa informação no metadata (`ppo_meta.json`) sob a chave `"hidden_activation": "tanh"`.
+
+O exportador (`rl_export_nn_json.py`) lê automaticamente a ativação do metadata:
+
+- **Prioridade 1**: Usa o valor de `--export-activation` se fornecido explicitamente.
+- **Prioridade 2**: Lê `"hidden_activation"` do arquivo de metadata.
+- **Fallback**: Assume `"relu"` se nenhum dos anteriores estiver disponível.
+
+As orchestração de treinamento (`train_on_pc.ps1`, `train_headless.ps1`, `train_from_mobile.ps1`) passam `--export-activation tanh` automaticamente para garantir consistência.
+
+Se você precisar usar uma ativação diferente durante o treino (modificando `rl_ppo.py`), certifique-se de:
+
+1. Atualizar a linha `"activation_fn": torch.nn.Tanh` para a ativação desejada.
+2. Atualizar a linha `"hidden_activation": "tanh"` no metadata para corresponder (ex: `"relu"`, `"elu"`, etc.).
+3. Executar o exportador sem `--export-activation` ou com o valor correto para que a inferência use o formato correto.
+
 ## Tracking com W&B
 
 O tracking e opcional e so e ativado quando `--wandb-project` for informado:

@@ -13,6 +13,60 @@ No `scripts/ai.js` do mod:
 - `rlSocketHost: "127.0.0.1"`
 - `rlSocketPort: 4567`
 
+## Seguranca (autenticacao e rede)
+
+O socket server do RL oferece controles de segurança opcionais para proteger a coleta de dados:
+
+### Autenticacao por Token
+
+Para exigir um token compartilhado entre servidor e cliente:
+
+**No servidor (PowerShell):**
+```powershell
+.\scripts\train_headless.ps1 -Token "chave-secreta-123"
+```
+
+**No cliente (scripts/ai.js):**
+```javascript
+config.rlSocketEnabled = true;
+config.rlSocketToken = "chave-secreta-123";  // Deve corresponder ao servidor
+```
+
+Sem o token correto, payloads sao rejeitados silenciosamente.
+
+### Restricao de Interface de Rede
+
+**Local apenas (padrão, seguro):**
+```powershell
+.\scripts\train_headless.ps1
+```
+
+Socket ligado em `127.0.0.1` - apenas conexões locais permitidas.
+
+**Redes públicas (requer -BindPublic):**
+```powershell
+.\scripts\train_headless.ps1 -BindPublic
+```
+
+Socket ligado em `0.0.0.0` - aceita conexões externas. **Use apenas em redes confiáveis!**
+
+### Allowlist de IPs (servidor apenas)
+
+Se necessário executar via socket programaticamente:
+```bash
+python3 scripts/rl_socket_server.py --host 0.0.0.0 --port 4567 --allowlist "192.168.1.100,192.168.1.101"
+```
+
+Apenas os IPs listados podem conectar.
+
+### Recomendação para Mobile
+
+Para treinar a partir de celulares em redes compartilhadas (ex: WiFi corporativa):
+
+1. **Prefira loopback**: Rode servidor headless no PC com token se possível.
+2. **Se precisar de rede pública**: Use `-BindPublic` + `-Token` em produção.
+3. **Teste antes**: Configure firewall/rede para aceitar apenas o range esperado.
+
 ## Execucao recomendada
 No PowerShell, dentro do repositorio do mod:
 
