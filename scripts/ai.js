@@ -275,6 +275,8 @@ var config = {
   mobileCommandInterval: 180,
   mobileFactoryConfigInterval: 1200,
   mobileLiquidSearchRadius: 8,
+  mobileCoreTapSingleToggle: true,
+  mobileTapToggleCooldown: 45,
   safeModeLogInterval: 600,
   contentScanInterval: 900,
   factoryConfigInterval: 600,
@@ -6130,9 +6132,32 @@ Events.on(TapEvent, function(e){
   if (e.player != null && e.player.isLocal != null && !e.player.isLocal()) return;
   var build = e.tile.build;
   if (build == null || build.block == null) return;
+  var isCore = false;
   try {
-    if (build.block.flags == null || !build.block.flags.contains(BlockFlag.core)) return;
+    isCore = build.block.flags != null && build.block.flags.contains(BlockFlag.core);
   } catch (e2) {
+    isCore = false;
+  }
+  if (!isCore) {
+    try {
+      var bname = build.block.name != null ? String(build.block.name).toLowerCase() : "";
+      isCore = bname.indexOf("core") >= 0;
+    } catch (e3) {
+      isCore = false;
+    }
+  }
+  if (!isCore) return;
+
+  if (isMobileSafe() && config.mobileCoreTapSingleToggle) {
+    var cooldown = config.mobileTapToggleCooldown != null ? config.mobileTapToggleCooldown : 45;
+    if (cooldown < 0) cooldown = 0;
+    var canToggle = (state.tick - state.lastTapTick) > cooldown;
+    if (canToggle) {
+      setAiEnabled(!state.aiEnabled, e.player);
+      state.lastTapTick = state.tick;
+      state.lastTapX = e.tile.x;
+      state.lastTapY = e.tile.y;
+    }
     return;
   }
 
@@ -6493,11 +6518,24 @@ Events.run(Trigger.update, function(){
 
   var headless = isHeadless();
   var localPlayer = getLocalPlayer();
-  var team = localPlayer != null ? localPlayer.team() : Vars.state.rules.defaultTeam;
+  var fallbackTeam = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.defaultTeam : null;
+  var team = localPlayer != null ? localPlayer.team() : fallbackTeam;
+  if (team == null) team = getTeam();
   var core = getCore(team);
-  if (core == null || (!headless && localPlayer == null)) {
-    if (headless) warnBuildFail("Aguardando core...");
-    else warnBuildFail("Aguardando player/core...");
+  if (core == null) {
+    warnBuildFail("Aguardando core...");
+    return;
+  }
+  if (!headless && localPlayer == null) {
+    // Mobile/client edge case: em algumas versões o player local pode não estar pronto
+    // no mesmo tick, mas já existe core/time; não bloquear IA por isso.
+    if ((state.tick - state.lastWarnTick) >= config.warnInterval) {
+      warnBuildFail("Player local indisponível; IA rodando via team/core.");
+    }
+  }
+
+  if (team == null) {
+    warnBuildFail("Aguardando team...");
     return;
   }
 
