@@ -6400,6 +6400,10 @@ function runAiStep(core, team) {
     }
 
     if (config.rlPolicyMode == "nn" && state.nnModel != null) {
+      var heuristicScores = {};
+      for (var hs = 0; hs < actions.length; hs++) {
+        heuristicScores[actions[hs].name] = actions[hs].score;
+      }
       var nnScores = nnScoresForState(beforeState);
       if (nnScores != null) {
         for (var qi2 = 0; qi2 < actions.length; qi2++) {
@@ -6422,6 +6426,27 @@ function runAiStep(core, team) {
             if (floor < 0) floor = 0;
             var minScore = act2.baseScore * floor;
             if (act2.score < minScore) act2.score = minScore;
+          }
+        }
+
+        var noopScore = -999999;
+        var bestNonNoopNN = -999999;
+        var bestNonNoopHeuristic = -999999;
+        for (var ns = 0; ns < actions.length; ns++) {
+          var actN = actions[ns];
+          if (actN.name == "noop") {
+            noopScore = actN.score;
+          } else {
+            if (actN.score > bestNonNoopNN) bestNonNoopNN = actN.score;
+            var hScore = heuristicScores[actN.name];
+            if (hScore != null && hScore > bestNonNoopHeuristic) bestNonNoopHeuristic = hScore;
+          }
+        }
+        if (bestNonNoopHeuristic > 0 && bestNonNoopNN <= noopScore) {
+          for (var hr = 0; hr < actions.length; hr++) {
+            var actR = actions[hr];
+            var fallbackScore = heuristicScores[actR.name];
+            if (fallbackScore != null) actR.score = fallbackScore;
           }
         }
       }
