@@ -429,6 +429,7 @@ var rlSocket = {
   sock: null,
   out: null,
   lastConnectTick: -9999,
+  lastErrorTick: -9999,
   queue: []
 };
 
@@ -593,7 +594,10 @@ function rlSocketConnect() {
     Log.info("[RL] Socket conectado: " + config.rlSocketHost + ":" + config.rlSocketPort);
     return true;
   } catch (e) {
-    Log.info("[RL] Socket connect error: " + e);
+    if ((state.tick - rlSocket.lastErrorTick) > 600) {
+      Log.info("[RL] Socket connect error: " + e + " | para desativar logs remotos: rlSocketEnabled=false");
+      rlSocket.lastErrorTick = state.tick;
+    }
     rlSocketClose();
     return false;
   }
@@ -2466,16 +2470,38 @@ function resolveMicroPolicyFi(actionName) {
   }
 }
 
+function microPolicyFileCandidates(actionName) {
+  var list = [];
+  if (actionName == null || actionName == "") return list;
+  list.push(String(actionName));
+  if (actionName == "industry") {
+    list.push("build");
+    list.push("economy");
+  } else if (actionName == "mine") {
+    list.push("expand");
+    list.push("resource");
+  } else if (actionName == "power") {
+    list.push("energy");
+  }
+  return list;
+}
+
 function loadMicroPolicyModel(actionName) {
   if (!config.rlMicroPolicyEnabled) return null;
   if (actionName == null || actionName == "") return null;
   var cached = state.microPolicies[actionName];
   var lastLoad = state.microLastLoadTicks[actionName];
   if (cached != null && config.rlMicroPolicyReloadTicks > 0 && (state.tick - lastLoad) < config.rlMicroPolicyReloadTicks) return cached;
-  var fi = resolveMicroPolicyFi(actionName);
+  var fi = null;
+  var aliases = microPolicyFileCandidates(actionName);
+  for (var ai = 0; ai < aliases.length; ai++) {
+    fi = resolveMicroPolicyFi(aliases[ai]);
+    if (fi != null && fi.exists()) break;
+    fi = null;
+  }
   if (fi == null || !fi.exists()) {
     if ((state.tick - (state.microLastErrorTicks[actionName] || -9999)) > 600) {
-      Log.info("[RL] Micro policy nao encontrada: " + actionName);
+      Log.info("[RL] Micro policy nao encontrada: " + actionName + " (arquivos tentados: " + aliases.join(", ") + ")");
       state.microLastErrorTicks[actionName] = state.tick;
     }
     if (config.rlMicroPolicyBootstrapMissing) {
