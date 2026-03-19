@@ -107,6 +107,7 @@ var config = {
   rlEpsilonMin: 0.02,
   rlEpsilonDecay: 0.999,
   rlEpsilonOnlyWhenRL: true,
+  rlNoopRescueStreak: 8,
   rlOnlineEnabled: false,
   rlAlpha: 0.12,
   rlGamma: 0.9,
@@ -411,7 +412,8 @@ var state = {
     air: null,
     naval: null
   },
-  lastMicroReward: 0
+  lastMicroReward: 0,
+  noopStreak: 0
 };
 
 // --- RL logging helpers (offline training via logs) ---
@@ -6823,6 +6825,14 @@ function runAiStep(core, team) {
 
   applySituationalActionGuards(actions, actionCtx);
 
+  if (config.rlPolicyMode == "nn" && state.noopStreak >= (config.rlNoopRescueStreak || 8)) {
+    for (var rs = 0; rs < actions.length; rs++) {
+      var actRescue = actions[rs];
+      if (actRescue == null) continue;
+      actRescue.score = actRescue.baseScore != null ? actRescue.baseScore : actRescue.score;
+    }
+  }
+
   var ranked = rankActions(actions);
   var policyActions = nnUsesPolicySampling() ? policyReadyActions(actions) : null;
   var pickedList = nnUsesPolicySampling() ? pickPolicyOrder(policyActions) : pickExploreOrder(ranked);
@@ -6855,6 +6865,8 @@ function runAiStep(core, team) {
   }
   decayEpsilon();
   var did = state.lastActionOk === true;
+  if (!did || pickedName == "noop") state.noopStreak += 1;
+  else state.noopStreak = 0;
 
   var core2 = getCore(team);
   var enemyCore2 = findEnemyCore(team);
