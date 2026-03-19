@@ -102,6 +102,12 @@ var config = {
   rlNNSaveExternal: false,
   rlNNAlpha: 0.01,
   rlNNGamma: 0.9,
+  rlAdaptiveBlend: true,
+  rlAdaptiveBlendMin: 0.25,
+  rlAdaptiveBlendMax: 0.85,
+  rlAdaptiveBlendPressureWeight: 0.55,
+  rlAdaptiveBlendStageWeight: 0.45,
+  aiDirectiveDurationTicks: 3600,
   rlEpsilonEnabled: true,
   rlEpsilon: 0.08,
   rlEpsilonMin: 0.02,
@@ -413,7 +419,9 @@ var state = {
     naval: null
   },
   lastMicroReward: 0,
-  noopStreak: 0
+  noopStreak: 0,
+  commandBias: null,
+  commandBiasUntilTick: -1
 };
 
 // --- RL logging helpers (offline training via logs) ---
@@ -2779,6 +2787,106 @@ function sampleWeightedIndex(weights) {
     if (r <= acc) return i;
   }
   return weights.length - 1;
+}
+
+function clampNumber(v, minv, maxv) {
+  if (v < minv) return minv;
+  if (v > maxv) return maxv;
+  return v;
+}
+
+function normalizedStage(stageInfo) {
+  var stage = stageInfo != null && stageInfo.stage != null ? stageInfo.stage : 0;
+  return clampNumber(stage / 5, 0, 1);
+}
+
+function adaptiveBlendWeight(stageInfo, reservePressureValue, fallbackBlend) {
+  var blend = fallbackBlend != null ? fallbackBlend : 0.5;
+  if (!config.rlAdaptiveBlend) return blend;
+  var minBlend = config.rlAdaptiveBlendMin != null ? config.rlAdaptiveBlendMin : 0.25;
+  var maxBlend = config.rlAdaptiveBlendMax != null ? config.rlAdaptiveBlendMax : 0.85;
+  if (maxBlend < minBlend) {
+    var tmp = minBlend;
+    minBlend = maxBlend;
+    maxBlend = tmp;
+  }
+  var pressureWeight = config.rlAdaptiveBlendPressureWeight != null ? config.rlAdaptiveBlendPressureWeight : 0.55;
+  var stageWeight = config.rlAdaptiveBlendStageWeight != null ? config.rlAdaptiveBlendStageWeight : 0.45;
+  var confidence = clampNumber((1 - reservePressureValue) * pressureWeight + normalizedStage(stageInfo) * stageWeight, 0, 1);
+  return minBlend + (maxBlend - minBlend) * confidence;
+}
+
+function blendScores(heuristicScore, learnedScore, learnedWeight) {
+  var h = heuristicScore != null ? heuristicScore : 0;
+  if (learnedScore == null) return h;
+  var lw = clampNumber(learnedWeight != null ? learnedWeight : 0.5, 0, 1);
+  return h * (1 - lw) + learnedScore * lw;
+}
+
+function extractAiIntent(parts) {
+  var intent = {
+    verb: parts.length > 1 ? parts[1] : "toggle",
+    arg1: parts.length > 2 ? parts[2] : null,
+    raw: parts.join(" ")
+  };
+  if (intent.raw.indexOf("liga") >= 0 || intent.raw.indexOf("ativ") >= 0) intent.verb = "on";
+  if (intent.raw.indexOf("desliga") >= 0 || intent.raw.indexOf("parar") >= 0) intent.verb = "off";
+  if (intent.raw.indexOf("status") >= 0 || intent.raw.indexOf("estado") >= 0) intent.verb = "status";
+  if (intent.raw.indexOf("limpar") >= 0 || intent.raw.indexOf("resetar") >= 0) intent.verb = "clear";
+  if (intent.raw.indexOf("estrateg") >= 0) intent.verb = "strategy";
+  if (intent.raw.indexOf("modo") >= 0 || intent.raw.indexOf("policy") >= 0) intent.verb = "policy";
+  return intent;
+}
+
+function parseAiDirective(text) {
+  if (text == null) return null;
+  var msg = String(text).toLowerCase();
+  var bias = {};
+  if (msg.indexOf("econom") >= 0 || msg.indexOf("miner") >= 0 || msg.indexOf("recurso") >= 0) {
+    bias.mine = 1.25;
+    bias.industry = 1.2;
+  }
+  if (msg.indexOf("defes") >= 0 || msg.indexOf("seguran") >= 0 || msg.indexOf("proteg") >= 0) {
+    bias.defend = 1.35;
+    bias.rally = 1.1;
+    bias.attackWave = 0.75;
+  }
+  if (msg.indexOf("ataq") >= 0 || msg.indexOf("agress") >= 0 || msg.indexOf("pression") >= 0) {
+    bias.attackWave = 1.35;
+    bias.rally = 1.2;
+    bias.defend = 0.9;
+  }
+  if (msg.indexOf("energi") >= 0 || msg.indexOf("power") >= 0 || msg.indexOf("bateria") >= 0) {
+    bias.power = 1.3;
+    bias.thermal = 1.25;
+  }
+  if (msg.indexOf("liqu") >= 0 || msg.indexOf("coolant") >= 0 || msg.indexOf("criogen") >= 0) {
+    bias.liquid = 1.35;
+  }
+  if (msg.indexOf("industr") >= 0 || msg.indexOf("fabr") >= 0 || msg.indexOf("produção") >= 0 || msg.indexOf("producao") >= 0) {
+    bias.industry = bias.industry != null ? Math.max(bias.industry, 1.3) : 1.3;
+  }
+  var keys = Object.keys(bias);
+  return keys.length > 0 ? bias : null;
+}
+
+function applyCommandBias(actions) {
+  if (actions == null || actions.length == 0) return;
+  if (state.commandBias == null) return;
+  if (state.tick > state.commandBiasUntilTick) {
+    state.commandBias = null;
+    state.commandBiasUntilTick = -1;
+    return;
+  }
+  for (var i = 0; i < actions.length; i++) {
+    var act = actions[i];
+    if (act == null || act.name == null) continue;
+    var mult = state.commandBias[act.name];
+    if (mult == null) continue;
+    if (mult < 0) mult = 0;
+    act.baseScore *= mult;
+    act.score *= mult;
+  }
 }
 
 function pickPolicyOrder(actions) {
@@ -6460,7 +6568,9 @@ Events.on(PlayerChatEvent, function(e){
   var parts = msg.split(/\s+/);
   if (parts[0] != "/ia") return;
 
-  var cmd = parts.length > 1 ? parts[1] : "toggle";
+  var intent = extractAiIntent(parts);
+  var cmd = intent.verb;
+  var arg1 = intent.arg1;
   var enabled = state.aiEnabled;
   if (cmd == "on" || cmd == "ligar" || cmd == "start" || cmd == "true" || cmd == "1") {
     enabled = true;
@@ -6468,13 +6578,71 @@ Events.on(PlayerChatEvent, function(e){
     enabled = false;
   } else if (cmd == "status" || cmd == "estado") {
     try {
-      if (e.player != null) e.player.sendMessage("IA: " + (state.aiEnabled ? "ligada" : "desligada"));
+      if (e.player != null) {
+        e.player.sendMessage(
+          "IA: " + (state.aiEnabled ? "ligada" : "desligada")
+          + " | estrategia=" + currentStrategyName(state.currentStrategy)
+          + " | policy=" + config.rlPolicyMode
+          + " | diretriz=" + (state.commandBias != null && state.tick <= state.commandBiasUntilTick ? "ativa" : "nenhuma")
+        );
+      }
     } catch (e2) {
       // ignore
     }
     e.cancelled = true;
     return;
+  } else if (cmd == "strategy" || cmd == "estrategia") {
+    var newStrategy = arg1 != null ? String(arg1).toLowerCase() : "auto";
+    if (newStrategy != "auto" && newStrategy != "balanced" && newStrategy != "aggressive" && newStrategy != "defensive" && newStrategy != "economic") {
+      newStrategy = "auto";
+    }
+    config.strategyMode = newStrategy;
+    state.lastStrategyTick = -999999;
+    try {
+      if (e.player != null) e.player.sendMessage("IA estrategia definida para: " + newStrategy);
+    } catch (e3) {
+      // ignore
+    }
+    e.cancelled = true;
+    return;
+  } else if (cmd == "policy" || cmd == "modo") {
+    var newPolicy = arg1 != null ? String(arg1).toLowerCase() : "hybrid";
+    if (newPolicy != "heuristic" && newPolicy != "qtable" && newPolicy != "hybrid" && newPolicy != "nn") {
+      newPolicy = "hybrid";
+    }
+    config.rlPolicyMode = newPolicy;
+    try {
+      if (e.player != null) e.player.sendMessage("IA policy definida para: " + newPolicy);
+    } catch (e4) {
+      // ignore
+    }
+    e.cancelled = true;
+    return;
+  } else if (cmd == "clear") {
+    state.commandBias = null;
+    state.commandBiasUntilTick = -1;
+    try {
+      if (e.player != null) e.player.sendMessage("IA limpou diretrizes temporarias.");
+    } catch (e6) {
+      // ignore
+    }
+    e.cancelled = true;
+    return;
   } else {
+    var directive = parseAiDirective(msg);
+    if (directive != null) {
+      state.commandBias = directive;
+      var duration = config.aiDirectiveDurationTicks != null ? config.aiDirectiveDurationTicks : 3600;
+      if (duration < 0) duration = 0;
+      state.commandBiasUntilTick = state.tick + duration;
+      try {
+        if (e.player != null) e.player.sendMessage("IA aplicou diretriz inteligente temporaria.");
+      } catch (e5) {
+        // ignore
+      }
+      e.cancelled = true;
+      return;
+    }
     enabled = !state.aiEnabled;
   }
 
@@ -6743,13 +6911,14 @@ function runAiStep(core, team) {
   industryScore *= reserveBoost;
   addAction("industry", industryScore, actionHandlers.industry);
   addAction("noop", 0, actionHandlers.noop);
+  applyCommandBias(actions);
 
   if (config.rlPolicyMode != "heuristic") {
     if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
       var qScores = qScoresForState(beforeState);
       var isQTable = config.rlPolicyMode == "qtable";
       var isHybrid = config.rlPolicyMode == "hybrid";
-      var blend = config.rlQTableBlend;
+      var blend = adaptiveBlendWeight(stageInfo, reserveP, config.rlQTableBlend);
       for (var qi = 0; qi < actions.length; qi++) {
         var act = actions[qi];
         var qv = qScores != null ? qScores[act.name] : null;
@@ -6758,7 +6927,7 @@ function runAiStep(core, team) {
           continue;
         }
         if (isQTable) act.score = qv;
-        else if (isHybrid) act.score = act.score * (1 - blend) + qv * blend;
+        else if (isHybrid) act.score = blendScores(act.score, qv, blend);
       }
     }
 
@@ -6783,7 +6952,8 @@ function runAiStep(core, team) {
             if (!config.rlNNFallbackHeuristic) act2.score = -999999;
             continue;
           }
-          act2.score = nnv;
+          var nnBlend = adaptiveBlendWeight(stageInfo, reserveP, config.rlQTableBlend);
+          act2.score = blendScores(act2.score, nnv, nnBlend);
           if (act2.name == "mine" && shouldProtectEconomicMineScore(miningPlan)) {
             var floor = config.rlNNEconomicGuardFloor != null ? config.rlNNEconomicGuardFloor : 1.0;
             if (floor < 0) floor = 0;
