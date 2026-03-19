@@ -151,6 +151,7 @@ var config = {
   campaignSafeMode: true,
   warnInterval: 300,
   // When true, enabling the AI allows it to take over the local player's unit.
+  // Mantido true para permitir construção inicial usando recursos/start flow do player.
   aiControlPlayerUnit: true,
   // When true, the AI only observes/commands other units and keeps the player's unit under manual control.
   observerMode: false,
@@ -986,11 +987,42 @@ function updateCameraToUnit(unit) {
   }
 }
 
+function isUnitUsable(unit) {
+  if (unit == null) return false;
+  try {
+    if (unit.dead != null && unit.dead) return false;
+  } catch (e) {
+    // ignore
+  }
+  try {
+    if (unit.isValid != null && !unit.isValid()) return false;
+  } catch (e2) {
+    // ignore
+  }
+  try {
+    if (unit.health != null && unit.health <= 0) return false;
+  } catch (e3) {
+    // ignore
+  }
+  return true;
+}
+
 function ensurePlayerControlled() {
   if (!config.aiControlPlayerUnit) return;
   var player = getLocalPlayer();
-  if (player == null || player.unit() == null) return;
-  var unit = player.unit();
+  if (player == null) return;
+  var unit = null;
+  try {
+    unit = player.unit();
+  } catch (e) {
+    unit = null;
+  }
+  // Enquanto o player estiver sem unidade viva (spawn/morte), nao tenta reassumir controle.
+  if (!isUnitUsable(unit)) {
+    state.playerControllerMode = "player";
+    state.playerControlledUnitId = -1;
+    return;
+  }
   var unitId = unit.id;
 
   // If the player switched unit (respawn, etc), force reassignment.
@@ -3823,8 +3855,16 @@ function placeBlock(block, x, y, rotation, team, ignoreReserveItems) {
     warnBuildFail("Sem recursos: " + block.localizedName);
     return false;
   }
+  var builderUnit = null;
   if (player != null) {
-    Call.constructFinish(tile, block, player.unit(), rotation || 0, team, null);
+    try {
+      builderUnit = player.unit();
+    } catch (e) {
+      builderUnit = null;
+    }
+  }
+  if (player != null && isUnitUsable(builderUnit)) {
+    Call.constructFinish(tile, block, builderUnit, rotation || 0, team, null);
   } else {
     try {
       if (tile.setNet != null) {
