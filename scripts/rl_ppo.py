@@ -1,92 +1,128 @@
 import argparse
 import json
+import random
+from collections import OrderedDict
+from pathlib import Path
 
-from rl_common import (
-    DEFAULT_ACTIONS,
-    FEATURES,
-    NORMS,
-    is_terminal_transition,
-    load_transitions,
-    reward_from_transition,
-    vec_from_state,
-)
+from rl_common import DEFAULT_ACTIONS, FEATURES, NORMS, load_transitions
+from rl_data import convert_log_to_parquet
+from rl_env import MindustryDatasetEnv, MindustryScenarioEnv, missing_dependency_message
 
 
-def transition_tick(tr):
-    raw = tr.get("t")
-    if raw is None:
-        raw = (tr.get("s") or {}).get("tick")
-    try:
-        return int(raw)
-    except Exception:
-        return None
+def resolve_env_mode(args):
+    if args.env != "auto":
+        return args.env
+    if args.scenarios:
+        return "scenarios"
+    return "dataset"
 
 
-def build_rollouts(transitions, action_index):
-    rows = []
-    episode_ranges = []
-    start = 0
-    prev_tick = None
+def set_global_seed(seed, np_module=None, torch_module=None):
+    random.seed(seed)
+    if np_module is not None:
+        np_module.random.seed(seed)
+    if torch_module is not None:
+        torch_module.manual_seed(seed)
+        if torch_module.cuda.is_available():
+            torch_module.cuda.manual_seed_all(seed)
+        try:
+            torch_module.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch_module.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+        if hasattr(torch_module.backends, "cudnn"):
+            torch_module.backends.cudnn.benchmark = False
+            torch_module.backends.cudnn.deterministic = True
 
-    for tr in transitions:
-        tick = transition_tick(tr)
-        if rows and tick is not None and prev_tick is not None and tick < prev_tick:
-            episode_ranges.append((start, len(rows)))
-            start = len(rows)
 
-        action_name = tr.get("a", "noop")
-        action_idx = action_index.get(action_name, action_index.get("noop", 0))
-        rows.append(
-            {
-                "state": vec_from_state(tr.get("s", {})),
-                "action": action_idx,
-                "reward": reward_from_transition(tr),
-                "done": 1.0 if is_terminal_transition(tr) else 0.0,
-            }
+def linear_layers(module, linear_type):
+    layers = []
+    if module is None:
+        return layers
+    for item in module.modules():
+        if isinstance(item, linear_type):
+            layers.append(item)
+    return layers
+
+
+def build_export_state_dict(model, torch_module):
+    nn = torch_module.nn
+    policy_layers = linear_layers(model.policy.mlp_extractor.policy_net, nn.Linear)
+    value_layers = linear_layers(model.policy.mlp_extractor.value_net, nn.Linear)
+    policy_layers.append(model.policy.action_net)
+    value_layers.append(model.policy.value_net)
+
+    state_dict = OrderedDict()
+    for idx, layer in enumerate(policy_layers):
+        key_idx = idx * 2
+        state_dict["policy_net.{}.weight".format(key_idx)] = layer.weight.detach().cpu()
+        state_dict["policy_net.{}.bias".format(key_idx)] = layer.bias.detach().cpu()
+    for idx, layer in enumerate(value_layers):
+        key_idx = idx * 2
+        state_dict["value_net.{}.weight".format(key_idx)] = layer.weight.detach().cpu()
+        state_dict["value_net.{}.bias".format(key_idx)] = layer.bias.detach().cpu()
+    return state_dict
+
+
+def build_env_factory(env_mode, args, action_list):
+    if env_mode == "scenarios":
+        def factory():
+            return MindustryScenarioEnv.from_file(
+                args.scenarios,
+                max_episode_steps=args.max_episode_steps,
+                seed=args.seed,
+            )
+
+        return factory
+
+    def factory():
+        return MindustryDatasetEnv.from_log(
+            args.log,
+            limit=args.limit,
+            default_actions=action_list,
+            max_episode_steps=args.max_episode_steps,
+            seed=args.seed,
         )
 
-        prev_tick = tick
-        if rows[-1]["done"] > 0.5:
-            episode_ranges.append((start, len(rows)))
-            start = len(rows)
-            prev_tick = None
-
-    if start < len(rows):
-        episode_ranges.append((start, len(rows)))
-
-    return rows, episode_ranges
+    return factory
 
 
-def compute_gae(values, rewards, dones, episode_ranges, gamma, gae_lambda):
-    advantages = [0.0] * len(rewards)
-    returns = [0.0] * len(rewards)
+def maybe_init_wandb(args):
+    if not args.wandb_project:
+        return None, None
 
-    for start, end in episode_ranges:
-        gae = 0.0
-        next_value = 0.0
-        next_non_terminal = 0.0
-        for idx in range(end - 1, start - 1, -1):
-            if idx < end - 1 and dones[idx] < 0.5:
-                next_value = values[idx + 1]
-                next_non_terminal = 1.0
-            else:
-                next_value = 0.0
-                next_non_terminal = 0.0
+    try:
+        import wandb
+        from wandb.integration.sb3 import WandbCallback
+    except Exception as exc:
+        print("wandb_missing={}".format(exc))
+        print("install='pip install wandb'")
+        raise SystemExit(1)
 
-            delta = rewards[idx] + gamma * next_value * next_non_terminal - values[idx]
-            gae = delta + gamma * gae_lambda * next_non_terminal * gae
-            advantages[idx] = gae
-            returns[idx] = gae + values[idx]
-
-    return advantages, returns
+    tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=args.wandb_run_name or None,
+        tags=tags or None,
+        mode="offline" if args.wandb_offline else None,
+        config={k: v for k, v in vars(args).items() if isinstance(v, (str, int, float, bool))},
+        sync_tensorboard=True,
+    )
+    return run, WandbCallback(verbose=0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Offline PPO-style actor-critic trainer for Mindustry RL logs.")
+    parser = argparse.ArgumentParser(description="Stable-Baselines3 PPO trainer for Mindustry decision logs/scenarios.")
+    parser.add_argument("--env", choices=["auto", "dataset", "scenarios"], default="auto", help="Training environment source.")
     parser.add_argument("--log", default="mindustry.log", help="Path to Mindustry log or socket log.")
-    parser.add_argument("--out", default="ppo_model.pt", help="Output checkpoint path.")
+    parser.add_argument("--scenarios", default="", help="Path to fixed scenario JSON for deterministic validation/training.")
+    parser.add_argument("--out", default="ppo_model.pt", help="Output checkpoint path compatible with rl_export_nn_json.py.")
     parser.add_argument("--out-meta", default="ppo_meta.json", help="Output metadata path.")
-    parser.add_argument("--epochs", type=int, default=12, help="Number of PPO update epochs.")
+    parser.add_argument("--out-sb3", default="", help="Optional raw Stable-Baselines3 .zip output.")
+    parser.add_argument("--epochs", type=int, default=8, help="Number of PPO rollout/update cycles.")
+    parser.add_argument("--n-steps", type=int, default=256, help="Rollout steps collected per PPO update.")
     parser.add_argument("--batch", type=int, default=64, help="Mini-batch size.")
     parser.add_argument("--gamma", type=float, default=0.98, help="Discount factor.")
     parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda.")
@@ -95,138 +131,124 @@ def main():
     parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy bonus coefficient.")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
     parser.add_argument("--hidden", type=int, default=64, help="Hidden layer width.")
-    parser.add_argument("--limit", type=int, default=0, help="Max transitions to read (0 = no limit).")
-    parser.add_argument("--device", default="cpu", help="Device: cpu or cuda.")
+    parser.add_argument("--limit", type=int, default=0, help="Max transitions to read from logs (0 = no limit).")
+    parser.add_argument("--device", default="cpu", help="Device: cpu, cuda or auto.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
+    parser.add_argument("--eval-episodes", type=int, default=5, help="Episodes for deterministic evaluation after training.")
+    parser.add_argument("--max-episode-steps", type=int, default=128, help="Episode horizon used by the Gymnasium wrapper.")
+    parser.add_argument("--parquet-out", default="", help="Optional Parquet export of the training log for DuckDB analysis.")
+    parser.add_argument("--wandb-project", default="", help="Weights & Biases project name.")
+    parser.add_argument("--wandb-entity", default="", help="Weights & Biases entity/team.")
+    parser.add_argument("--wandb-run-name", default="", help="Weights & Biases run name.")
+    parser.add_argument("--wandb-tags", default="mindustry,rl,ppo", help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb-offline", action="store_true", help="Run Weights & Biases in offline mode.")
     args = parser.parse_args()
 
-    transitions, action_list, action_index = load_transitions(args.log, limit=args.limit, default_actions=DEFAULT_ACTIONS)
-    if not transitions:
-        print("no_transitions_found")
-        return
-
-    rows, episode_ranges = build_rollouts(transitions, action_index)
+    env_mode = resolve_env_mode(args)
 
     try:
+        import numpy as np
         import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-        import torch.optim as optim
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.callbacks import CallbackList
+        from stable_baselines3.common.evaluation import evaluate_policy
+        from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
     except Exception as exc:
-        print("pytorch_missing={}".format(exc))
-        print("install=torch (pip install torch)")
+        print("sb3_dependencies_missing={}".format(exc))
+        print("rl_env={}".format(missing_dependency_message()))
+        print("install='pip install stable-baselines3 gymnasium numpy torch'")
         return
 
-    torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    action_list = list(DEFAULT_ACTIONS)
+    dataset_size = 0
+    scenario_count = 0
 
-    class ActorCritic(nn.Module):
-        def __init__(self, in_dim, out_dim, hidden_dim):
-            super(ActorCritic, self).__init__()
-            self.policy_net = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                nn.Tanh(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.Tanh(),
-                nn.Linear(hidden_dim, out_dim),
-            )
-            self.value_net = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                nn.Tanh(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.Tanh(),
-                nn.Linear(hidden_dim, 1),
-            )
+    if env_mode == "dataset":
+        transitions, action_list, _ = load_transitions(args.log, limit=args.limit, default_actions=DEFAULT_ACTIONS)
+        dataset_size = len(transitions)
+        if not transitions:
+            print("no_transitions_found")
+            return
+        if args.parquet_out:
+            try:
+                stats = convert_log_to_parquet(args.log, args.parquet_out, limit=args.limit, transition_type="any")
+            except Exception as exc:
+                print("parquet_export_failed={}".format(exc))
+                return
+            print("parquet_rows={rows} parquet_columns={columns} parquet_out={out_path}".format(**stats))
+    else:
+        payload = json.loads(Path(args.scenarios).read_text(encoding="utf-8"))
+        action_list = list(payload.get("actions") or DEFAULT_ACTIONS)
+        scenario_count = len(payload.get("scenarios") or [])
+        if scenario_count == 0:
+            print("no_scenarios_found")
+            return
 
-        def policy(self, x):
-            return self.policy_net(x)
+    set_global_seed(args.seed, np_module=np, torch_module=torch)
+    env_factory = build_env_factory(env_mode, args, action_list)
+    train_env = VecMonitor(DummyVecEnv([env_factory]))
+    eval_env = VecMonitor(DummyVecEnv([env_factory]))
+    train_env.seed(args.seed)
+    eval_seed = args.seed + 1000
+    eval_env.seed(eval_seed)
 
-        def value(self, x):
-            return self.value_net(x).squeeze(1)
+    policy_kwargs = dict(
+        activation_fn=torch.nn.Tanh,
+        net_arch=dict(pi=[args.hidden, args.hidden], vf=[args.hidden, args.hidden]),
+    )
 
-    states = torch.tensor([row["state"] for row in rows], dtype=torch.float32, device=device)
-    actions = torch.tensor([row["action"] for row in rows], dtype=torch.int64, device=device)
-    rewards = [float(row["reward"]) for row in rows]
-    dones = [float(row["done"]) for row in rows]
+    run = None
+    callbacks = []
+    wandb_run, wandb_callback = maybe_init_wandb(args)
+    if wandb_run is not None:
+        run = wandb_run
+        callbacks.append(wandb_callback)
 
-    model = ActorCritic(len(FEATURES), len(action_list), args.hidden).to(device)
-    opt = optim.Adam(model.parameters(), lr=args.lr)
+    total_timesteps = max(args.batch, args.n_steps * args.epochs)
+    model = PPO(
+        policy="MlpPolicy",
+        env=train_env,
+        learning_rate=args.lr,
+        n_steps=args.n_steps,
+        batch_size=args.batch,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_ratio,
+        ent_coef=args.entropy_coef,
+        vf_coef=args.value_coef,
+        seed=args.seed,
+        device=args.device,
+        policy_kwargs=policy_kwargs,
+        verbose=1,
+    )
 
-    last_actor = 0.0
-    last_value = 0.0
-    last_entropy = 0.0
-    avg_reward = sum(rewards) / max(1, len(rewards))
+    callback = CallbackList(callbacks) if callbacks else None
+    model.learn(total_timesteps=total_timesteps, callback=callback, progress_bar=False)
 
-    for epoch in range(args.epochs):
-        with torch.no_grad():
-            logits = model.policy(states)
-            values = model.value(states)
-            old_log_probs = F.log_softmax(logits, dim=1).gather(1, actions.unsqueeze(1)).squeeze(1)
-            advantages, returns = compute_gae(
-                values.detach().cpu().tolist(),
-                rewards,
-                dones,
-                episode_ranges,
-                gamma=args.gamma,
-                gae_lambda=args.gae_lambda,
-            )
+    eval_rewards, eval_lengths = evaluate_policy(
+        model,
+        eval_env,
+        n_eval_episodes=args.eval_episodes,
+        deterministic=True,
+        return_episode_rewards=True,
+        warn=False,
+    )
+    eval_mean_reward = float(sum(eval_rewards) / max(1, len(eval_rewards)))
+    eval_mean_length = float(sum(eval_lengths) / max(1, len(eval_lengths)))
 
-        advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
-        returns = torch.tensor(returns, dtype=torch.float32, device=device)
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
-
-        perm = torch.randperm(states.size(0), device=device)
-        actor_total = 0.0
-        value_total = 0.0
-        entropy_total = 0.0
-        batches = 0
-
-        for start in range(0, states.size(0), args.batch):
-            idx = perm[start : start + args.batch]
-            logits_mb = model.policy(states[idx])
-            log_probs_all = F.log_softmax(logits_mb, dim=1)
-            probs_all = log_probs_all.exp()
-            log_probs = log_probs_all.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
-            ratio = torch.exp(log_probs - old_log_probs[idx])
-
-            unclipped = ratio * advantages[idx]
-            clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * advantages[idx]
-            actor_loss = -torch.min(unclipped, clipped).mean()
-
-            value_pred = model.value(states[idx])
-            value_loss = F.mse_loss(value_pred, returns[idx])
-            entropy = -(probs_all * log_probs_all).sum(dim=1).mean()
-
-            loss = actor_loss + args.value_coef * value_loss - args.entropy_coef * entropy
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-            actor_total += float(actor_loss.item())
-            value_total += float(value_loss.item())
-            entropy_total += float(entropy.item())
-            batches += 1
-
-        last_actor = actor_total / max(1, batches)
-        last_value = value_total / max(1, batches)
-        last_entropy = entropy_total / max(1, batches)
-        print(
-            "epoch={} actor_loss={:.6f} value_loss={:.6f} entropy={:.6f} avg_reward={:.3f}".format(
-                epoch + 1, last_actor, last_value, last_entropy, avg_reward
-            )
-        )
+    out_sb3 = args.out_sb3 or str(Path(args.out).with_suffix(".zip"))
+    model.save(out_sb3)
 
     checkpoint = {
-        "algorithm": "ppo-style",
+        "algorithm": "stable-baselines3-ppo",
         "policy_prefix": "policy_net",
         "value_prefix": "value_net",
-        "state_dict": model.state_dict(),
+        "state_dict": build_export_state_dict(model, torch),
     }
     torch.save(checkpoint, args.out)
 
     meta = {
-        "algorithm": "ppo-style",
+        "algorithm": "stable-baselines3-ppo",
         "policy": "categorical",
         "output": "logits",
         "policy_prefix": "policy_net",
@@ -234,22 +256,49 @@ def main():
         "actions": action_list,
         "features": FEATURES,
         "norms": NORMS,
+        "env_mode": env_mode,
         "hidden": args.hidden,
+        "learning_rate": args.lr,
         "gamma": args.gamma,
         "gae_lambda": args.gae_lambda,
         "clip_ratio": args.clip_ratio,
-        "avg_reward": avg_reward,
-        "last_actor_loss": last_actor,
-        "last_value_loss": last_value,
-        "last_entropy": last_entropy,
-        "episodes": len(episode_ranges),
-        "transitions": len(rows),
+        "value_coef": args.value_coef,
+        "entropy_coef": args.entropy_coef,
+        "seed": args.seed,
+        "timesteps": total_timesteps,
+        "n_steps": args.n_steps,
+        "batch_size": args.batch,
+        "eval_episodes": args.eval_episodes,
+        "eval_mean_reward": eval_mean_reward,
+        "eval_mean_length": eval_mean_length,
+        "dataset_transitions": dataset_size,
+        "scenario_count": scenario_count,
+        "sb3_model": out_sb3,
+        "parquet_out": args.parquet_out or "",
     }
     with open(args.out_meta, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    if run is not None:
+        run.log(
+            {
+                "eval/mean_reward": eval_mean_reward,
+                "eval/mean_length": eval_mean_length,
+                "train/timesteps": total_timesteps,
+            }
+        )
+        run.finish()
+
+    train_env.close()
+    eval_env.close()
+
+    print("env_mode={}".format(env_mode))
+    print("timesteps={}".format(total_timesteps))
+    print("eval_mean_reward={:.4f}".format(eval_mean_reward))
+    print("eval_mean_length={:.4f}".format(eval_mean_length))
     print("saved_model={}".format(args.out))
     print("saved_meta={}".format(args.out_meta))
+    print("saved_sb3={}".format(out_sb3))
 
 
 if __name__ == "__main__":

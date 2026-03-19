@@ -17,7 +17,7 @@ No `scripts/ai.js` do mod:
 No PowerShell, dentro do repositorio do mod:
 
 ```powershell
-.\scripts\train_headless.ps1 -Map "Maze" -Mode "survival" -Timeout 1800 -Epochs 8
+.\scripts\train_headless.ps1 -Map "Maze" -Mode "survival" -Timeout 1800 -Epochs 8 -ParquetOut "logs\maze.parquet" -Validate
 ```
 
 Se nao informar `-Map`, o script envia apenas `host` (mapa aleatorio, modo survival).
@@ -75,11 +75,17 @@ Use esses nomes exatamente como apareceram no log ao preencher `-Map`, `-Curricu
 - `-AppendLog`: preserva o `rl_socket.log` existente em vez de limpar no inicio.
 - `-NoHost`: nao envia o comando `host` automaticamente.
 - `-NoWait`: nao espera ENTER; util com timeout/transitions.
+- `-ParquetOut`: exporta o log consolidado para Parquet ao fim da coleta.
+- `-Validate`: roda a suite deterministica `scripts/validate_rl_stack.py` ao final.
+- `-WandbProject`: ativa tracking do treino PPO no Weights & Biases.
+- `-WandbOffline`: salva o tracking do W&B em modo offline.
+- `-Seed`: seed global usada no treino PPO e nos wrappers de validacao.
 
 ## Saidas
 - Log bruto: `rl_socket.log`
 - Log do server: `headless_server.log`
-- Checkpoint PPO-style: `ppo_model.pt`
+- Dataset analitico opcional: `logs/*.parquet`
+- Checkpoint PPO SB3 compativel com export: `ppo_model.pt`
 - Metadados do treino: `ppo_meta.json`
 - Policy pronta para o mod: `nn_model.json`
 

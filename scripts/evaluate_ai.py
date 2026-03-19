@@ -139,11 +139,13 @@ def evaluate(log_path):
         combined = (proc.stdout + proc.stderr).strip()
         short = " | ".join(combined.splitlines()[-4:])
         torch_missing = "pytorch_missing=" in combined
+        sb3_missing = "sb3_dependencies_missing=" in combined or "missing_rl_env_dependencies=" in combined
 
-        if torch_missing:
-            checks.append(CheckResult("ppo roda com log sintetico", True, short or "skip (torch missing)"))
-            checks.append(CheckResult("export PPO gera nn_model.json", True, "skip (torch missing)"))
-            checks.append(CheckResult("adaptabilidade: acao custom entra na policy", True, "skip (torch missing)"))
+        if torch_missing or sb3_missing:
+            reason = "sb3 stack missing" if sb3_missing else "torch missing"
+            checks.append(CheckResult("ppo roda com log sintetico", True, short or f"skip ({reason})"))
+            checks.append(CheckResult("export PPO gera nn_model.json", True, f"skip ({reason})"))
+            checks.append(CheckResult("adaptabilidade: acao custom entra na policy", True, f"skip ({reason})"))
         else:
             ok_train = proc.returncode == 0 and out_model.exists() and out_meta.exists()
             checks.append(CheckResult("ppo roda com log sintetico", ok_train, short))

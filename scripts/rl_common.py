@@ -55,6 +55,14 @@ def num(d, key):
         return 0.0
 
 
+def bucketize(val, bins):
+    idx = 0
+    for bound in bins:
+        if val >= bound:
+            idx += 1
+    return idx
+
+
 def reward(s, s2):
     r = 0.0
     r += 0.005 * (num(s2, "copper") - num(s, "copper"))
@@ -131,6 +139,48 @@ def vec_from_state(s):
         v = max(-10.0, min(10.0, v / n))
         vec.append(v)
     return vec
+
+
+def encode_state(s):
+    key = []
+    for name, bins in FEATURE_BUCKETS:
+        key.append(bucketize(num(s, name), bins))
+    return tuple(key)
+
+
+def transition_tick(tr):
+    raw = tr.get("t")
+    if raw is None:
+        raw = (tr.get("s") or {}).get("tick")
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def split_episodes(transitions):
+    episodes = []
+    current = []
+    prev_tick = None
+
+    for tr in transitions:
+        tick = transition_tick(tr)
+        if current and tick is not None and prev_tick is not None and tick < prev_tick:
+            episodes.append(current)
+            current = []
+            prev_tick = None
+
+        current.append(tr)
+        prev_tick = tick
+
+        if is_terminal_transition(tr):
+            episodes.append(current)
+            current = []
+            prev_tick = None
+
+    if current:
+        episodes.append(current)
+    return episodes
 
 
 def iter_transitions(log_path, limit=0, transition_type="transition"):

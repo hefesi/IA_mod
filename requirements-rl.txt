@@ -1,0 +1,7 @@
+numpy>=1.26
+torch>=2.2
+gymnasium>=0.29
+stable-baselines3>=2.3
+wandb>=0.17
+pyarrow>=16.0
+duckdb>=1.0

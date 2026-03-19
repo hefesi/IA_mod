@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "seed": 17,
+  "actions": [
+    "attackWave",
+    "rally",
+    "mine",
+    "industry",
+    "defend",
+    "power",
+    "liquid",
+    "thermal",
+    "noop"
+  ],
+  "scenarios": [
+    {
+      "name": "economy-bootstrap",
+      "max_steps": 3,
+      "steps": [
+        {
+          "preferred_action": "mine",
+          "state": {
+            "resourceTier1": 90,
+            "resourceTier2": 18,
+            "economicPressure": 0.74,
+            "powerPressure": 0.28,
+            "coreHealthFrac": 1.0,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -7.0,
+          "transitions": {
+            "mine": { "reward": 18.0 },
+            "industry": { "reward": 5.0 },
+            "defend": { "reward": 2.0 },
+            "*": { "reward": -7.0 }
+          }
+        },
+        {
+          "preferred_action": "power",
+          "state": {
+            "resourceTier1": 260,
+            "resourceTier2": 60,
+            "economicPressure": 0.33,
+            "powerPressure": 0.82,
+            "factoryCapacity": 3,
+            "coreHealthFrac": 1.0,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -6.0,
+          "transitions": {
+            "power": { "reward": 14.0 },
+            "thermal": { "reward": 10.0 },
+            "industry": { "reward": 4.0 },
+            "*": { "reward": -6.0 }
+          }
+        },
+        {
+          "preferred_action": "industry",
+          "state": {
+            "resourceTier1": 420,
+            "resourceTier2": 150,
+            "economicPressure": 0.18,
+            "powerPressure": 0.22,
+            "factoryCapacity": 7,
+            "factoryVariety": 2,
+            "coreHealthFrac": 1.0,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -5.0,
+          "transitions": {
+            "industry": { "reward": 20.0, "terminated": true },
+            "mine": { "reward": 6.0, "terminated": true },
+            "noop": { "reward": -3.0, "terminated": true },
+            "*": { "reward": -5.0, "terminated": true }
+          }
+        }
+      ]
+    },
+    {
+      "name": "core-under-siege",
+      "max_steps": 3,
+      "steps": [
+        {
+          "preferred_action": "defend",
+          "state": {
+            "enemies": 11,
+            "defensePressure": 0.88,
+            "coreHealthFrac": 0.62,
+            "unitsTotal": 7,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -10.0,
+          "transitions": {
+            "defend": { "reward": 24.0 },
+            "rally": { "reward": 9.0 },
+            "attackWave": { "reward": -4.0 },
+            "*": { "reward": -10.0 }
+          }
+        },
+        {
+          "preferred_action": "rally",
+          "state": {
+            "enemies": 6,
+            "defensePressure": 0.48,
+            "coreHealthFrac": 0.79,
+            "unitsTotal": 12,
+            "combatStock": 140,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -8.0,
+          "transitions": {
+            "rally": { "reward": 16.0 },
+            "defend": { "reward": 7.0 },
+            "attackWave": { "reward": 2.0 },
+            "*": { "reward": -8.0 }
+          }
+        },
+        {
+          "preferred_action": "attackWave",
+          "state": {
+            "enemies": 2,
+            "defensePressure": 0.18,
+            "coreHealthFrac": 0.93,
+            "unitsTotal": 18,
+            "combatStock": 250,
+            "distEnemy": 14,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -6.0,
+          "transitions": {
+            "attackWave": { "reward": 22.0, "terminated": true },
+            "rally": { "reward": 8.0, "terminated": true },
+            "noop": { "reward": -2.0, "terminated": true },
+            "*": { "reward": -6.0, "terminated": true }
+          }
+        }
+      ]
+    },
+    {
+      "name": "liquid-and-power-balance",
+      "max_steps": 3,
+      "steps": [
+        {
+          "preferred_action": "liquid",
+          "state": {
+            "liquidPressure": 0.87,
+            "powerPressure": 0.54,
+            "factoryCapacity": 5,
+            "upgradeCapacity": 2,
+            "coreHealthFrac": 1.0,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -8.0,
+          "transitions": {
+            "liquid": { "reward": 15.0 },
+            "power": { "reward": 6.0 },
+            "thermal": { "reward": 5.0 },
+            "*": { "reward": -8.0 }
+          }
+        },
+        {
+          "preferred_action": "thermal",
+          "state": {
+            "liquidPressure": 0.35,
+            "powerPressure": 0.76,
+            "factoryCapacity": 6,
+            "upgradeCapacity": 3,
+            "coreHealthFrac": 1.0,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -7.0,
+          "transitions": {
+            "thermal": { "reward": 13.0 },
+            "power": { "reward": 11.0 },
+            "industry": { "reward": 4.0 },
+            "*": { "reward": -7.0 }
+          }
+        },
+        {
+          "preferred_action": "industry",
+          "state": {
+            "liquidPressure": 0.16,
+            "powerPressure": 0.24,
+            "factoryCapacity": 9,
+            "upgradeCapacity": 5,
+            "factoryVariety": 4,
+            "coreHealthFrac": 1.0,
+            "corePresent": 1,
+            "enemyCore": 1
+          },
+          "default_reward": -5.0,
+          "transitions": {
+            "industry": { "reward": 17.0, "terminated": true },
+            "power": { "reward": 7.0, "terminated": true },
+            "noop": { "reward": -3.0, "terminated": true },
+            "*": { "reward": -5.0, "terminated": true }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -7,11 +7,13 @@ Flow:
  3) Send "host" (optional map/mode) or a curriculum command
  4) Collect transitions until ENTER, timeout or max transitions
  5) Repeat the collection for curriculum slices when requested
- 6) Train a PPO-style actor-critic with scripts/rl_ppo.py
- 7) Export the policy head to nn_model.json for the mod
+ 6) Train Stable-Baselines3 PPO with scripts/rl_ppo.py
+ 7) Optionally export the raw log to Parquet for DuckDB analysis
+ 8) Export the policy head to nn_model.json for the mod
+ 9) Optionally run the deterministic validation suite
 
 Quick use:
-  .\scripts\train_headless.ps1 -Map "Maze" -Mode "survival" -Timeout 1800 -Epochs 8
+  .\scripts\train_headless.ps1 -Map "Maze" -Mode "survival" -Timeout 1800 -Epochs 8 -ParquetOut "logs\maze.parquet" -Validate
 
 Curriculum example:
   .\scripts\train_headless.ps1 -CurriculumMaps "Maze","Fork","Archipelago" -CurriculumRuns 6 -CurriculumRandomize -Timeout 600 -Epochs 8
@@ -35,11 +37,20 @@ param(
     [int]$Timeout = 0,
     [int]$MaxTransitions = 0,
     [int]$Epochs = 5,
+    [int]$RolloutSteps = 256,
+    [int]$BatchSize = 64,
+    [int]$Seed = 7,
     [string]$LogFile = "rl_socket.log",
     [string]$OutModel = "ppo_model.pt",
     [string]$OutMeta = "ppo_meta.json",
     [string]$OutNNJson = "nn_model.json",
+    [string]$ParquetOut = "",
     [string]$ServerLog = "headless_server.log",
+    [string]$WandbProject = "",
+    [string]$WandbEntity = "",
+    [string]$WandbRunName = "",
+    [switch]$WandbOffline,
+    [switch]$Validate,
     [switch]$AppendLog,
     [switch]$NoWait,
     [switch]$NoHost
@@ -360,10 +371,12 @@ if (-not (Test-Path $gradlew)) {
 $socketScript = Resolve-PathIfRelative -Path "scripts/rl_socket_server.py" -Base $modRoot
 $ppoScript = Resolve-PathIfRelative -Path "scripts/rl_ppo.py" -Base $modRoot
 $exportScript = Resolve-PathIfRelative -Path "scripts/rl_export_nn_json.py" -Base $modRoot
+$validateScript = Resolve-PathIfRelative -Path "scripts/validate_rl_stack.py" -Base $modRoot
 $logPath = Resolve-PathIfRelative -Path $LogFile -Base $modRoot
 $outModelPath = Resolve-PathIfRelative -Path $OutModel -Base $modRoot
 $outMetaPath = Resolve-PathIfRelative -Path $OutMeta -Base $modRoot
 $outNNJsonPath = Resolve-PathIfRelative -Path $OutNNJson -Base $modRoot
+$parquetOutPath = if ([string]::IsNullOrWhiteSpace($ParquetOut)) { "" } else { Resolve-PathIfRelative -Path $ParquetOut -Base $modRoot }
 $serverLogPath = Resolve-PathIfRelative -Path $ServerLog -Base $modRoot
 
 $specs = $null
@@ -443,8 +456,33 @@ foreach ($spec in $specs) {
     }
 }
 
-Write-Host "Treinando policy PPO-style..." -ForegroundColor Cyan
-& $python $ppoScript --log $logPath --out $outModelPath --out-meta $outMetaPath --epochs $Epochs
+Write-Host "Treinando policy PPO (Stable-Baselines3)..." -ForegroundColor Cyan
+$ppoArgs = @(
+    $ppoScript,
+    "--log", $logPath,
+    "--out", $outModelPath,
+    "--out-meta", $outMetaPath,
+    "--epochs", $Epochs,
+    "--n-steps", $RolloutSteps,
+    "--batch", $BatchSize,
+    "--seed", $Seed
+)
+if (-not [string]::IsNullOrWhiteSpace($parquetOutPath)) {
+    $ppoArgs += @("--parquet-out", $parquetOutPath)
+}
+if (-not [string]::IsNullOrWhiteSpace($WandbProject)) {
+    $ppoArgs += @("--wandb-project", $WandbProject)
+}
+if (-not [string]::IsNullOrWhiteSpace($WandbEntity)) {
+    $ppoArgs += @("--wandb-entity", $WandbEntity)
+}
+if (-not [string]::IsNullOrWhiteSpace($WandbRunName)) {
+    $ppoArgs += @("--wandb-run-name", $WandbRunName)
+}
+if ($WandbOffline) {
+    $ppoArgs += "--wandb-offline"
+}
+& $python @ppoArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Falha ao executar rl_ppo.py"
     exit 1
@@ -457,10 +495,22 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+if ($Validate) {
+    Write-Host "Rodando suite deterministica de validacao..." -ForegroundColor Cyan
+    & $python $validateScript
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Falha na validacao automatica da stack RL"
+        exit 1
+    }
+}
+
 Write-Host ""
 Write-Host "Treino concluido." -ForegroundColor Green
 Write-Host "Log de transicoes: $logPath"
 Write-Host "Checkpoint PPO:     $outModelPath"
 Write-Host "Meta PPO:           $outMetaPath"
 Write-Host "Policy exportada:   $outNNJsonPath"
+if (-not [string]::IsNullOrWhiteSpace($parquetOutPath)) {
+    Write-Host "Dataset Parquet:    $parquetOutPath"
+}
 Write-Host "No mod, confirme config.rlPolicyMode='nn' e config.rlNNFile/config.rlNNPath para carregar esse arquivo." -ForegroundColor Green

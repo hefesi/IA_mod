@@ -6,27 +6,11 @@ from collections import defaultdict
 from rl_common import (
     DEFAULT_ACTIONS,
     FEATURE_DEFS,
-    FEATURE_BUCKETS,
     NORMS,
+    encode_state,
     load_transitions,
-    num,
     reward_from_transition,
 )
-
-
-def bucketize(val, bins):
-    idx = 0
-    for b in bins:
-        if val >= b:
-            idx += 1
-    return idx
-
-
-def encode_state(s):
-    key = []
-    for name, bins in FEATURE_BUCKETS:
-        key.append(bucketize(num(s, name), bins))
-    return tuple(key)
 
 
 def main():
