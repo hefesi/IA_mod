@@ -11,6 +11,7 @@ AI_JS = ROOT / "scripts" / "ai.js"
 MAIN_JS = ROOT / "scripts" / "main.js"
 MOD_JSON = ROOT / "mod.json"
 SCHEMA_JSON = ROOT / "rl_schema.json"
+NN_MODEL_JSON = ROOT / "nn_model.json"
 
 
 class CheckResult:
@@ -79,6 +80,17 @@ def evaluate(log_path):
     checks.append(CheckResult("modo RL padrao e nn", 'rlPolicyMode: "nn"' in ai_text, "scripts/ai.js"))
     uses_shared_schema = 'rlSchemaFile: "rl_schema.json"' in ai_text and "loadRLSchema(" in ai_text
     checks.append(CheckResult("runtime JS usa schema compartilhado", uses_shared_schema, "scripts/ai.js -> rl_schema.json"))
+
+    current_nn = read_json(NN_MODEL_JSON)
+    nn_exists = current_nn is not None
+    checks.append(CheckResult("nn_model.json valido", nn_exists, str(NN_MODEL_JSON)))
+    if nn_exists and schema_exists:
+        nn_actions = current_nn.get("actions", [])
+        nn_features = current_nn.get("features", [])
+        schema_actions_set = set(schema_actions)
+        nn_actions_set = set(nn_actions) if isinstance(nn_actions, list) else set()
+        checks.append(CheckResult("modelo atual cobre todas as acoes do schema", nn_actions_set == schema_actions_set, f"schema={sorted(schema_actions_set)} model={sorted(nn_actions_set)}"))
+        checks.append(CheckResult("modelo atual cobre features principais do schema", len(nn_features) >= 0.7 * len(schema_features), f"schema_features={len(schema_features)} model_features={len(nn_features)}"))
 
     sample = [
         {
@@ -151,6 +163,11 @@ def evaluate(log_path):
             checks.append(CheckResult("adaptabilidade: acao custom entra na policy", has_custom, "customModAction em actions"))
 
     checks.append(check_real_log(log_path))
+    if log_path.exists():
+        real_actions = set()
+        for tr in iter_transitions(log_path):
+            real_actions.add(tr.get("a", "noop"))
+        checks.append(CheckResult("log real tem diversidade minima de acoes", len(real_actions) >= 2, f"unique_actions={sorted(real_actions)}"))
 
     failed = [c for c in checks if not c.ok]
 
