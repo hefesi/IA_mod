@@ -444,9 +444,16 @@ function Wait-ForCollectionStop {
     }
 }
 
+
 $python = Get-PythonCommand
 if (-not $python) {
     Write-Error "Python nao encontrado no PATH. Instale Python (ou py launcher)."
+    exit 1
+}
+
+# Enforce: If -BindPublic is set, require a non-empty -Token
+if ($BindPublic -and [string]::IsNullOrWhiteSpace($Token)) {
+    Write-Error "Por seguranca, -Token obrigatorio quando -BindPublic for usado. Forneca um valor seguro para -Token."
     exit 1
 }
 
@@ -539,7 +546,31 @@ foreach ($spec in $specs) {
 
     $bindHost = if ($BindPublic) { "0.0.0.0" } else { "127.0.0.1" }
     $serverJob = Start-SocketCollectionJob -JobName $socketJobName -Python $python -SocketScript $socketScript -LogPath $logPath -SliceTimeout $Timeout -SliceMaxTransitions $MaxTransitions -BindHost $bindHost -Token $Token
-    Start-Sleep -Milliseconds 600
+    Start-Sleep -Milliseconds 1000
+    $jobState = (Get-Job -Name $socketJobName -ErrorAction SilentlyContinue).State
+    $retrySocketJob = $false
+    if ($jobState -ne "Running") {
+        Write-Warning "Socket server job falhou ao iniciar. Estado: $jobState"
+        $jobOutput = Receive-Job -Name $socketJobName -ErrorAction SilentlyContinue
+        if ($jobOutput) { Write-Host "Socket job output:\n$jobOutput" -ForegroundColor Red }
+        Remove-Job -Name $socketJobName -ErrorAction SilentlyContinue
+        # Retry once with backoff
+        Write-Host "Tentando reiniciar o socket server apos 2s..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+        $serverJob = Start-SocketCollectionJob -JobName $socketJobName -Python $python -SocketScript $socketScript -LogPath $logPath -SliceTimeout $Timeout -SliceMaxTransitions $MaxTransitions -BindHost $bindHost -Token $Token
+        Start-Sleep -Milliseconds 1000
+        $jobState = (Get-Job -Name $socketJobName -ErrorAction SilentlyContinue).State
+        if ($jobState -ne "Running") {
+            Write-Error "Socket server job falhou novamente ao iniciar. Estado: $jobState"
+            $jobOutput = Receive-Job -Name $socketJobName -ErrorAction SilentlyContinue
+            if ($jobOutput) { Write-Host "Socket job output:\n$jobOutput" -ForegroundColor Red }
+            Remove-Job -Name $socketJobName -ErrorAction SilentlyContinue
+            continue
+        }
+        else {
+            Write-Host "Socket server iniciado com sucesso na segunda tentativa." -ForegroundColor Green
+        }
+    }
 
     Write-Host "Iniciando headless server: gradlew server:run" -ForegroundColor Cyan
     $process = Start-HeadlessProcess -GradlewPath $gradlew -WorkingDir $repoRoot

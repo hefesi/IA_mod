@@ -20,10 +20,16 @@ def socket_event_name(payload):
 def payload_has_valid_token(payload, required_token):
     if not required_token:
         return True
+    if not isinstance(payload, dict):
+        return False
     return payload.get("token") == required_token
 
 
 def handle_connection(conn, addr, out_path, verbose, global_state, required_token="", allowlist=None, stop_on_event="", recv_timeout=30, max_line_size=65536):
+        # Invalid payload diagnostics
+        invalid_payload_count = 0
+        last_invalid_log_time = 0
+
     """
     Handle a single client connection with optional token authentication.
     
@@ -97,14 +103,28 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
                 try:
                     tr = json.loads(line)
                 except json.JSONDecodeError:
+                    invalid_payload_count += 1
+                    now = time.time()
+                    if now - last_invalid_log_time > 10:
+                        print(f"invalid_payload_rejected reason=json_decode client_ip={client_ip} count={invalid_payload_count}")
+                        last_invalid_log_time = now
                     continue
-                
+
+                # Validate payload type before token/event logic
+                if not isinstance(tr, dict):
+                    invalid_payload_count += 1
+                    now = time.time()
+                    if now - last_invalid_log_time > 10:
+                        print(f"invalid_payload_rejected reason=not_dict client_ip={client_ip} count={invalid_payload_count}")
+                        last_invalid_log_time = now
+                    continue
+
                 # Check token if required
                 if not payload_has_valid_token(tr, required_token):
                     if verbose:
                         print("payload_rejected_invalid_token client_ip={}".format(client_ip))
                     continue
-                
+
                 event_name = socket_event_name(tr)
                 if event_name is not None:
                     if verbose:
@@ -112,7 +132,43 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
                     if stop_on_event and event_name == stop_on_event:
                         return count, event_name
                     continue
-                f.write(line + "\n")
+                # Strict contract validation for non-event records
+                def is_valid_transition(payload):
+                    # Required fields and types
+                    required = ["type", "s", "a", "s2", "info", "t"]
+                    if not isinstance(payload, dict):
+                        return False, "not_dict"
+                    for k in required:
+                        if k not in payload:
+                            return False, f"missing_{k}"
+                    if payload["type"] not in ("transition", "micro"):
+                        return False, "bad_type"
+                    if not isinstance(payload["s"], dict):
+                        return False, "s_not_dict"
+                    if not isinstance(payload["s2"], dict):
+                        return False, "s2_not_dict"
+                    # Only allow non-empty string actions
+                    if not (isinstance(payload["a"], str) and payload["a"]):
+                        return False, "a_not_string"
+                    if not isinstance(payload["info"], dict):
+                        return False, "info_not_dict"
+                    if not (isinstance(payload["t"], int) and payload["t"] >= 0):
+                        return False, "t_bad"
+                    return True, "ok"
+
+                valid, reason = is_valid_transition(tr)
+                if not valid:
+                    invalid_payload_count += 1
+                    now = time.time()
+                    # Log at most once per 10s
+                    if now - last_invalid_log_time > 10:
+                        print(f"invalid_payload_rejected reason={reason} client_ip={client_ip} count={invalid_payload_count}")
+                        last_invalid_log_time = now
+                    continue
+
+                # Only persist and score valid transitions (normalize action to string)
+                tr["a"] = str(tr["a"]) if isinstance(tr["a"], str) else "noop"
+                f.write(json.dumps(tr) + "\n")
                 f.flush()
                 r = reward_from_transition(tr)
                 count += 1
@@ -121,7 +177,6 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
                 if verbose:
                     print("t={t} a={a} r={r:.2f} connection_transitions={conn_t} global_transitions={global_t}".format(
                         t=tr.get("t"), a=tr.get("a"), r=r, conn_t=count, global_t=global_state["total_transitions"]))
-                
                 # Check if we've hit the global limit
                 if max_remaining > 0 and global_state["total_transitions"] >= global_state["max_transitions"]:
                     return count, None

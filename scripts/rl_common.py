@@ -265,11 +265,19 @@ def iter_transitions(log_path, limit=0, transition_type="transition"):
 
 
 def build_action_list(transitions, default_actions=None):
-    actions = set(default_actions or DEFAULT_ACTIONS)
-    for tr in transitions:
-        actions.add(tr.get("a", "noop"))
+    actions = set()
     base = list(default_actions or DEFAULT_ACTIONS)
-    return base + sorted(a for a in actions if a not in base)
+    # Add only valid non-empty string actions from defaults
+    for a in base:
+        if isinstance(a, str) and a:
+            actions.add(a)
+    # Add only valid non-empty string actions from transitions
+    for tr in transitions:
+        act = tr.get("a", "noop")
+        if isinstance(act, str) and act:
+            actions.add(act)
+    # Defensive: filter and sort only valid string actions
+    return base + sorted(a for a in actions if a not in base and isinstance(a, str) and a)
 
 
 def load_transitions(log_path, limit=0, default_actions=None, transition_type="transition"):

@@ -161,9 +161,9 @@ var config = {
   autoDisableHudOnMobile: true,
   campaignSafeMode: true,
   warnInterval: 300,
-  // Default runtime value on world load. Player-unit takeover is opt-in.
+  // Default runtime value on world load. Player-unit takeover is enabled by default.
   aiControlPlayerUnit: true,
-  // Default runtime value on world load. Observer mode keeps the player's unit manual.
+  // Default runtime value on world load. When false, AI controls the player's unit (unless overridden by observer mode).
   observerMode: false,
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
   controllerResetPenalty: -1,
@@ -400,7 +400,10 @@ var rlSocket = {
   queueSize: new AtomicInteger(0),
   backgroundThread: null,
   stopRequested: false,
-  threadLock: new java.lang.Object()
+  threadLock: new java.lang.Object(),
+  sendRetryCount: 0,
+  sendDropCount: 0,
+  lastSendErrorTick: -9999
 };
 
 var rlSchemaLastLoadTick = -9999;
@@ -956,32 +959,44 @@ function rlSocketBackgroundWorker() {
   // This function runs on the background thread
   var queueDrainLimit = 50;  // Process up to 50 items per cycle to avoid blocking
   var sleepMs = 50;  // Sleep between queue drain cycles
-  
   while (!rlSocket.stopRequested) {
     try {
       Thread.sleep(sleepMs);
-      
       // Attempt to connect and drain queue
       if (!config.rlSocketEnabled) continue;
-      
       if (!rlSocketConnected()) {
         if (!rlSocketConnect()) continue;
       }
-      
       if (!rlSocketConnected()) continue;
-      
       // Drain queue items
       var count = 0;
       while (count < queueDrainLimit && rlSocket.queue != null && rlSocket.queueSize != null && rlSocket.queueSize.get() > 0) {
+        var line = null;
         try {
-          var line = rlSocketPollQueue();
+          line = rlSocketPollQueue();
           if (line == null) break;
           if (line != null && rlSocket.out != null) {
             rlSocket.out.println(line);
+            if (rlSocket.out.checkError()) {
+              // IO error detected, requeue and close socket
+              rlSocket.sendRetryCount++;
+              if ((state.tick - rlSocket.lastSendErrorTick) > 600) {
+                Log.info("[RL] Socket send error (checkError) - requeueing and closing socket");
+                rlSocket.lastSendErrorTick = state.tick;
+              }
+              if (line != null) rlSocketQueue(line); // requeue unsent
+              rlSocketClose();
+              break;
+            }
           }
           count++;
         } catch (e) {
-          Log.info("[RL] Error sending via socket: " + e);
+          rlSocket.sendRetryCount++;
+          if ((state.tick - rlSocket.lastSendErrorTick) > 600) {
+            Log.info("[RL] Error sending via socket: " + e + " - requeueing and closing socket");
+            rlSocket.lastSendErrorTick = state.tick;
+          }
+          if (line != null) rlSocketQueue(line); // requeue unsent
           rlSocketClose();
           break;
         }
@@ -992,7 +1007,6 @@ function rlSocketBackgroundWorker() {
       }
     }
   }
-  
   // Clean up on exit
   rlSocketClose();
 }
@@ -1027,13 +1041,15 @@ function rlSocketQueue(line) {
   
   // Apply queue size limit: drop oldest if at max
   if (config.rlSocketQueueMax != null && config.rlSocketQueueMax > 0 && rlSocket.queueSize.get() >= config.rlSocketQueueMax) {
+    // Drop the oldest payload and increment drop counter
     rlSocketPollQueue();
+    rlSocket.sendDropCount++;
   }
-  
+
   // Add to queue
   rlSocket.queue.add(line);
   rlSocket.queueSize.incrementAndGet();
-  
+
   // Ensure background thread is running
   rlSocketEnsureBackground();
 }
@@ -1042,58 +1058,73 @@ function rlSocketFlush(blockingDrainTimeoutMs) {
   // If blockingDrainTimeoutMs provided, drain queue synchronously before background thread processing
   // This is used for shutdown paths to ensure no queued payloads are lost on socket close
   if (!config.rlSocketEnabled) return true;
-  
   if (blockingDrainTimeoutMs != null && blockingDrainTimeoutMs >= 0) {
     var drainStartMs = Date.now();
     var maxDrainMs = blockingDrainTimeoutMs;
     var drainLimit = 100;  // Process up to 100 items per drain cycle
     var drainCycles = 0;
-    
     // Drain all queued items synchronously with timeout
     while (drainCycles < 50) {  // Safety limit: max 50 cycles
       var elapsedMs = Date.now() - drainStartMs;
       if (elapsedMs >= maxDrainMs) {
         break;  // Timeout reached, stop draining
       }
-      
       if (rlSocket.queue == null || rlSocket.queueSize == null || rlSocket.queueSize.get() <= 0) {
         break;  // Queue empty, done draining
       }
-      
       // Attempt to connect if needed
       if (!rlSocketConnected()) {
         if (!rlSocketConnect()) {
           break;  // Cannot connect, stop draining
         }
       }
-      
       // Drain a batch
       var count = 0;
       while (count < drainLimit && rlSocket.queueSize.get() > 0) {
+        var line = null;
         try {
-          var line = rlSocketPollQueue();
+          line = rlSocketPollQueue();
           if (line == null) break;
           if (rlSocket.out != null) {
             rlSocket.out.println(line);
+            if (rlSocket.out.checkError()) {
+              rlSocket.sendRetryCount++;
+              if ((state.tick - rlSocket.lastSendErrorTick) > 600) {
+                Log.info("[RL] Socket send error (checkError) during flush - requeueing and closing socket");
+                rlSocket.lastSendErrorTick = state.tick;
+              }
+              if (line != null) rlSocketQueue(line);
+              rlSocketClose();
+              break;
+            }
           }
           count++;
         } catch (e) {
-          Log.info("[RL] Error draining socket queue: " + e);
+          rlSocket.sendRetryCount++;
+          if ((state.tick - rlSocket.lastSendErrorTick) > 600) {
+            Log.info("[RL] Error draining socket queue: " + e + " - requeueing and closing socket");
+            rlSocket.lastSendErrorTick = state.tick;
+          }
+          if (line != null) rlSocketQueue(line);
+          rlSocketClose();
           break;
         }
       }
-      
       if (count == 0) {
         break;  // No items processed, queue is stalled
       }
-      
       drainCycles++;
     }
   }
-  
   // Ensure background thread is running for async processing
   rlSocketEnsureBackground();
   return true;
+}
+// Optionally, add a periodic log for drop stats
+function rlSocketLogStats() {
+  if ((state.tick % 600) === 0) {
+    Log.info("[RL] Socket send retries: " + rlSocket.sendRetryCount + ", drops: " + rlSocket.sendDropCount);
+  }
 }
 
 function rlSocketSend(line) {
@@ -2977,8 +3008,12 @@ function loadQTable() {
   try {
     var text = fi.readString();
     var data = JSON.parse(String(text));
+    // Validate metadata before assignment
+    if (!applyRLMeta(data)) {
+      Log.info("[RL] Q-table schema mismatch, not loading: " + fi.absolutePath());
+      return false;
+    }
     rlQTable = data.q != null ? data.q : null;
-    applyRLMeta(data);
     if (rlQTable == null) {
       Log.info("[RL] Q-table invalida (sem chave 'q').");
       return false;
@@ -2988,7 +3023,7 @@ function loadQTable() {
     return true;
   } catch (e) {
     if ((state.tick - rlQTableLastErrorTick) > 600) {
-      Log.info("[RL] Erro ao carregar Q-table.");
+      Log.info("[RL] Erro ao carregar Q-table: " + e);
       rlQTableLastErrorTick = state.tick;
     }
     rlQTable = null;
@@ -3080,7 +3115,11 @@ function loadNNModel() {
     var text = fi.readString();
     var data = JSON.parse(String(text));
     if (data == null) throw "invalid";
-    applyRLMeta(data);
+    // Validate metadata before assignment
+    if (!applyRLMeta(data)) {
+      Log.info("[RL] NN model schema mismatch, not loading: " + fi.absolutePath());
+      return false;
+    }
     if (data.layers != null && data.readOnly == null) data.readOnly = true;
     if (data.algorithm == "ppo-style" && data.policy == null) data.policy = "categorical";
     if (data.algorithm == "ppo-style" && data.output == null) data.output = "logits";
@@ -3095,7 +3134,7 @@ function loadNNModel() {
     return true;
   } catch (e) {
     if ((state.tick - state.nnLastErrorTick) > 600) {
-      Log.info("[RL] Erro ao carregar NN model.");
+      Log.info("[RL] Erro ao carregar NN model: " + e);
       state.nnLastErrorTick = state.tick;
     }
     state.nnModel = null;

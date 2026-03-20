@@ -13,7 +13,7 @@ Para iniciar o jogo carregando um mapa e/ou conectando-se automaticamente a um s
 Exemplo:
 
 ```powershell
-Mindustry.exe -map "maze" -mode survival -autoplay -name Bot -connect 127.0.0.1:6567
+Mindustry.exe -map "maze" -mode survival -autoplay -name Bot +connect 127.0.0.1:6567
 ```
 
 ## Comandos de Chat

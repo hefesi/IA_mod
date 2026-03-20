@@ -26,6 +26,13 @@ param(
     [string]$Token = ""
 )
 
+
+# Enforce: If -BindPublic is set, require a non-empty -Token
+if ($BindPublic -and [string]::IsNullOrWhiteSpace($Token)) {
+    Write-Error "Por seguranca, -Token obrigatorio quando -BindPublic for usado. Forneca um valor seguro para -Token."
+    exit 1
+}
+
 # Guard: -NoWait cannot be used without explicit timeout/transitions
 if ($NoWait -and $Timeout -eq 0 -and $MaxTransitions -eq 0) {
     Write-Error "Use -Timeout ou -MaxTransitions junto com -NoWait para evitar coleta infinita."
