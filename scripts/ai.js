@@ -162,7 +162,7 @@ var config = {
   campaignSafeMode: true,
   warnInterval: 300,
   // Default runtime value on world load. Player-unit takeover is opt-in.
-  aiControlPlayerUnit: false,
+  aiControlPlayerUnit: true,
   // Default runtime value on world load. Observer mode keeps the player's unit manual.
   observerMode: false,
   // Penalty applied (negative) when the AI reassigns controller (resets player control).
