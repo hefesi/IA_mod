@@ -40,6 +40,7 @@ var Executors = Packages.java.util.concurrent.Executors;
 var config = {
   buildDelay: 30,
   commandInterval: 120,
+  unitControlInterval: 6,
   waveCooldown: 600,
   waveMinTotal: 10,
   waveMinGround: 6,
@@ -297,7 +298,9 @@ var config = {
   // When true, the AI will move the camera to follow the controlled unit.
   aiControlCamera: true,
   // How fast the camera interpolates to the unit position (0 = instant, 1 = no move).
-  aiCameraLerp: 0.3
+  aiCameraLerp: 0.3,
+  // Unit control retreat threshold: fraction of max health below which units retreat to core
+  unitRetreatHealthThreshold: 0.4
 };
 
 var industryBlueprints = {};
@@ -681,7 +684,8 @@ function getUnitSummary(team, includePlayerUnit) {
 }
 
 function shouldExcludePlayerUnit(includePlayerUnit) {
-  return includePlayerUnit !== true || !shouldCommandPlayerUnit();
+  // Exclude player unit if: not requested, AI not enabled, or controller not successfully assigned to AI
+  return includePlayerUnit !== true || !shouldCommandPlayerUnit() || state.playerControllerMode !== "ai";
 }
 
 function hasBucketizedFeatures(features) {
@@ -1592,6 +1596,23 @@ function isUnitUsable(unit) {
   return true;
 }
 
+function isCommandAIController(controller) {
+  if (controller == null) return false;
+  try {
+    if (controller instanceof CommandAI) return true;
+  } catch (e) {
+    // ignore instanceof check
+  }
+  // Fallback: check class name string if instanceof fails
+  try {
+    var className = String(controller.getClass().getSimpleName());
+    return className === "CommandAI";
+  } catch (e2) {
+    // ignore class name check
+  }
+  return false;
+}
+
 function ensurePlayerControlled() {
   var player = getLocalPlayer();
   if (player == null) return;
@@ -1610,7 +1631,8 @@ function ensurePlayerControlled() {
   var unitId = unit.id;
 
   // If the player switched unit (respawn, etc), force reassignment.
-  if (state.playerControlledUnitId !== unitId) {
+  var fastReassign = (state.playerControlledUnitId !== unitId);
+  if (fastReassign) {
     state.playerControllerMode = null;
   }
 
@@ -1627,8 +1649,8 @@ function ensurePlayerControlled() {
   // Stable ownership contract: use controller class semantics, not object identity.
   // Player mode is determined by: controller is not CommandAI AND this unit is the player's current unit.
   // This avoids wrapper instability while maintaining deterministic ownership semantics.
-  var currentModeIsAi = controller instanceof CommandAI;
-  var currentModeIsPlayer = (controller != null && !(controller instanceof CommandAI) && player.unit() === unit);
+  var currentModeIsAi = isCommandAIController(controller);
+  var currentModeIsPlayer = (controller != null && !isCommandAIController(controller) && player.unit() === unit);
   var currentModeMatches = (desiredMode === "ai" && currentModeIsAi) || (desiredMode === "player" && currentModeIsPlayer);
 
   // Avoid repeatedly reassigning controller every tick when the mode is already correct.
@@ -1640,15 +1662,40 @@ function ensurePlayerControlled() {
   }
 
   // If we got here, the mode changed or current ownership mismatches desired state; throttle reassignment.
-  if ((state.tick - state.lastControllerAttemptTick) < 60) return;
+  var throttle = fastReassign ? 20 : 60;
+  if ((state.tick - state.lastControllerAttemptTick) < throttle) return;
   state.lastControllerAttemptTick = state.tick;
 
   if (desiredMode === "player") {
+    var assignmentSuccess = false;
+    // Attempt 1: unit.controller(player) method call
     try {
       unit.controller(player);
+      assignmentSuccess = true;
       Log.info("[IA] player control restored (previous mode: " + (currentModeIsAi ? "ai" : "other") + ")");
     } catch (e) {
-      // ignore
+      // Attempt 2: unit.controller = player property assignment
+      try {
+        unit.controller = player;
+        assignmentSuccess = true;
+        Log.info("[IA] player control restored via property assignment (previous mode: " + (currentModeIsAi ? "ai" : "other") + ")");
+      } catch (e2) {
+        // Attempt 3: Call.unitControl if available
+        try {
+          if (typeof Call !== "undefined" && Call.unitControl != null) {
+            Call.unitControl(player, unit);
+            assignmentSuccess = true;
+            Log.info("[IA] player control restored via Call.unitControl (previous mode: " + (currentModeIsAi ? "ai" : "other") + ")");
+          }
+        } catch (e3) {
+          // All attempts failed
+        }
+      }
+    }
+    if (!assignmentSuccess) {
+      Log.warn("[IA] WARN: failed to assign controller (mode=player) for unit " + unitId);
+      // Do not update state on failure; retry on next call
+      return;
     }
     state.playerControllerMode = "player";
     state.playerControlledUnitId = unitId;
@@ -1657,11 +1704,36 @@ function ensurePlayerControlled() {
   }
 
   // desiredMode == "ai"
+  var assignmentSuccess = false;
+  var commandAI = new CommandAI();
+  // Attempt 1: unit.controller(newController) method call
   try {
-    unit.controller(new CommandAI());
+    unit.controller(commandAI);
+    assignmentSuccess = true;
     Log.info("[IA] ai control assigned (previous mode: " + (currentModeIsPlayer ? "player" : "other") + ")");
-  } catch (e2) {
-    // ignore
+  } catch (e) {
+    // Attempt 2: unit.controller = newController property assignment
+    try {
+      unit.controller = commandAI;
+      assignmentSuccess = true;
+      Log.info("[IA] ai control assigned via property assignment (previous mode: " + (currentModeIsPlayer ? "player" : "other") + ")");
+    } catch (e2) {
+      // Attempt 3: unit.set(newController) if available
+      try {
+        if (unit.set != null) {
+          unit.set(commandAI);
+          assignmentSuccess = true;
+          Log.info("[IA] ai control assigned via unit.set (previous mode: " + (currentModeIsPlayer ? "player" : "other") + ")");
+        }
+      } catch (e3) {
+        // All attempts failed
+      }
+    }
+  }
+  if (!assignmentSuccess) {
+    Log.warn("[IA] WARN: failed to assign controller (mode=ai) for unit " + unitId);
+    // Do not update state on failure; retry on next call
+    return;
   }
   state.playerControllerMode = "ai";
   state.playerControlledUnitId = unitId;
@@ -5318,7 +5390,26 @@ function buildPlan(core) {
     if (!actionMine(core, null)) break;
   }
 
-  // 3) Defesas basicas em cruz ao redor do core.
+  // 3) Fabrica de unidades basica logo apos mineracao
+  if (blockUnlocked(Blocks.groundFactory) && coreHasItemsFor(Blocks.groundFactory, team)) {
+    var factorySpot = findPlacementSpot(Blocks.groundFactory, cx + 3, cy - 3, 4, team, null, false);
+    if (factorySpot != null) {
+      var factoryResult = placeBlock(Blocks.groundFactory, factorySpot.x, factorySpot.y, 0, team);
+      if (factoryResult) {
+        state.factoryBlocks++;
+        // Configure factory to produce basic ground units
+        var unitType = unitTypeForRole("ground");
+        if (unitType != null) {
+          var factoryTile = tileAt(factorySpot.x, factorySpot.y);
+          if (factoryTile != null && factoryTile.build != null) {
+            configureBuild(factoryTile.build, unitType);
+          }
+        }
+      }
+    }
+  }
+
+  // 4) Defesas basicas em cruz ao redor do core.
   var defenseOffsets = [
     { dx: 6, dy: 0 },
     { dx: -6, dy: 0 },
@@ -5333,7 +5424,7 @@ function buildPlan(core) {
     }
   }
 
-  // 4) Muros diagonais para nao travar esteiras.
+  // 5) Muros diagonais para nao travar esteiras.
   var wallOffsets = [
     { dx: 2, dy: 2 }, { dx: -2, dy: 2 },
     { dx: 2, dy: -2 }, { dx: -2, dy: -2 }
@@ -6232,6 +6323,221 @@ function commandUnitIds(team, ids, buildTarget, pos, includePlayerUnit) {
       }
     }
   }
+}
+
+// Unit control helper functions for active player AI
+
+function findNearestEnemy(unit, team, radius) {
+  if (unit == null || unit.tile == null) return null;
+  var searchRadius = radius != null ? radius : 15;
+  var maxDist2 = searchRadius * searchRadius;
+  var nearest = null;
+  var minDist2 = Infinity;
+  
+  // Check enemy units
+  Groups.unit.each(function(u){
+    if (u == null || u.team == null || u.team == team || u.tile == null) return;
+    var dx = u.tile.x - unit.tile.x;
+    var dy = u.tile.y - unit.tile.y;
+    var dist2 = dx * dx + dy * dy;
+    if (dist2 > maxDist2 || dist2 >= minDist2) return;
+    nearest = u;
+    minDist2 = dist2;
+  });
+  
+  // Check enemy turrets if no unit found
+  if (nearest == null) {
+    Groups.build.each(function(b){
+      if (b == null || b.team == null || b.team == team || b.tile == null || b.block == null) return;
+      if (b.block.group != BlockGroup.turrets) return;
+      var dx = b.tile.x - unit.tile.x;
+      var dy = b.tile.y - unit.tile.y;
+      var dist2 = dx * dx + dy * dy;
+      if (dist2 > maxDist2 || dist2 >= minDist2) return;
+      nearest = b;
+      minDist2 = dist2;
+    });
+  }
+  
+  return nearest;
+}
+
+function commandUnit(unit, mode, targetX, targetY) {
+  if (unit == null) return;
+  try {
+    if (mode == "attack" && targetX != null && targetY != null) {
+      unit.aimAt(targetX, targetY);
+      if (unit.canShoot && unit.canShootThrough) unit.attack(true);
+    } else if (mode == "move" && targetX != null && targetY != null) {
+      unit.moveTo(targetX, targetY);
+    } else if (mode == "retreat" && targetX != null && targetY != null) {
+      unit.moveTo(targetX, targetY);
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+function assignUnitRoles(buckets, attackPlan, core, enemyCore) {
+  var roles = { defender: [], attacker: [], rally: [], scout: [] };
+  if (buckets == null) return roles;
+  
+  var totalUnits = (buckets.ground != null ? buckets.ground.size : 0) + 
+                   (buckets.air != null ? buckets.air.size : 0) + 
+                   (buckets.support != null ? buckets.support.size : 0);
+  var defendersNeeded = Math.max(1, Math.floor(totalUnits * 0.3));
+  var scoutsNeeded = Math.max(0, Math.floor(totalUnits * 0.1));
+  var defendersAssigned = 0;
+  var scoutsAssigned = 0;
+  
+  var assignSeq = function(seq){
+    for (var i = 0; i < seq.size; i++) {
+      var unitId = seq.get(i);
+      var unit = null;
+      try {
+        unit = Groups.unit.getByID(unitId);
+      } catch (e) {
+        continue;
+      }
+      if (unit == null) continue;
+      
+      if (defendersAssigned < defendersNeeded) {
+        roles.defender.push(unitId);
+        defendersAssigned++;
+      } else if (scoutsAssigned < scoutsNeeded) {
+        roles.scout.push(unitId);
+        scoutsAssigned++;
+      } else if (attackPlan != null && attackPlan.canCommit) {
+        roles.attacker.push(unitId);
+      } else if (attackPlan != null && attackPlan.shouldRally) {
+        roles.rally.push(unitId);
+      } else {
+        roles.defender.push(unitId);
+      }
+    }
+  };
+  
+  if (buckets.ground != null) assignSeq(buckets.ground);
+  if (buckets.air != null) assignSeq(buckets.air);
+  if (buckets.support != null) assignSeq(buckets.support);
+  
+  return roles;
+}
+
+function executeUnitBehavior(unit, role, ctx) {
+  if (unit == null) return;
+  
+  var core = ctx.core;
+  var enemyCore = ctx.enemyCore;
+  var team = ctx.team;
+  var rallyPoint = ctx.rallyPoint;
+  
+  try {
+    // Health-based retreat check: if unit is damaged below threshold, retreat to core
+    var shouldRetreat = unit.health != null && unit.maxHealth != null && 
+                        (unit.health / unit.maxHealth) < config.unitRetreatHealthThreshold;
+    
+    if (shouldRetreat && core != null) {
+      // Retreat toward core
+      var corePos = tileCenterToWorld(core.tile.x, core.tile.y);
+      commandUnit(unit, "retreat", corePos.x, corePos.y);
+      return;
+    }
+    
+    if (role == "defender") {
+      // Patrol around core and attack nearby enemies
+      var nearby = findNearestEnemy(unit, team, 15);
+      if (nearby != null) {
+        var targetPos = nearby.tile != null ? tileCenterToWorld(nearby.tile.x, nearby.tile.y) : 
+                        { x: nearby.x, y: nearby.y };
+        commandUnit(unit, "attack", targetPos.x, targetPos.y);
+      } else if (core != null) {
+        // Patrol in circle around core
+        var angle = state.tick * 0.02; // Slowly rotating angle
+        var patrolRadius = 8;
+        var coreCenterPos = tileCenterToWorld(core.tile.x, core.tile.y);
+        var tileSize = tilesToWorld(1);
+        var px = coreCenterPos.x + patrolRadius * tileSize * Math.cos(angle);
+        var py = coreCenterPos.y + patrolRadius * tileSize * Math.sin(angle);
+        commandUnit(unit, "move", px, py);
+      }
+    } else if (role == "attacker") {
+      // Move toward enemy core and attack
+      var nearby = findNearestEnemy(unit, team, 20);
+      if (nearby != null) {
+        var targetPos = nearby.tile != null ? tileCenterToWorld(nearby.tile.x, nearby.tile.y) : 
+                        { x: nearby.x, y: nearby.y };
+        commandUnit(unit, "attack", targetPos.x, targetPos.y);
+      } else if (enemyCore != null) {
+        var targetPos = tileCenterToWorld(enemyCore.tile.x, enemyCore.tile.y);
+        commandUnit(unit, "move", targetPos.x, targetPos.y);
+      }
+    } else if (role == "rally") {
+      // Move to rally point
+      if (rallyPoint != null) {
+        commandUnit(unit, "move", rallyPoint.x, rallyPoint.y);
+      }
+    } else if (role == "scout") {
+      // Explore edges of map (simple circular patrol)
+      var angle = (state.tick + unit.id) * 0.01;
+      var exploreRadius = 20;
+      var tileSize = tilesToWorld(1);
+      var ex = tileSize * 100 + exploreRadius * tileSize * Math.cos(angle);
+      var ey = tileSize * 100 + exploreRadius * tileSize * Math.sin(angle);
+      commandUnit(unit, "move", ex, ey);
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+function runUnitControl(team, core, enemyCore) {
+  if (core == null) return;
+  
+  // Collect units, including player-controlled unit if takeover is enabled
+  var includePlayerUnit = shouldCommandPlayerUnit();
+  var buckets = collectUnitBuckets(team, includePlayerUnit);
+  if (buckets == null) return;
+  
+  var totalUnits = (buckets.ground != null ? buckets.ground.size : 0) + 
+                   (buckets.air != null ? buckets.air.size : 0) + 
+                   (buckets.support != null ? buckets.support.size : 0);
+  if (totalUnits == 0) return;
+  
+  // Get attack plan
+  var enemies = countEnemyUnits(team);
+  var attackPlan = evaluateAttackPlan(core, enemyCore, team, buckets, enemies);
+  
+  // Assign roles
+  var roles = assignUnitRoles(buckets, attackPlan, core, enemyCore);
+  
+  // Context for behavior execution
+  var ctx = {
+    core: core,
+    enemyCore: enemyCore,
+    team: team,
+    rallyPoint: attackPlan != null ? attackPlan.rallyPoint : null
+  };
+  
+  // Execute behaviors for each role
+  var executeRoleUnits = function(roleUnits, roleType){
+    for (var i = 0; i < roleUnits.length; i++) {
+      var unitId = roleUnits[i];
+      var unit = null;
+      try {
+        unit = Groups.unit.getByID(unitId);
+      } catch (e) {
+        continue;
+      }
+      if (unit == null || unit.team != team) continue;
+      executeUnitBehavior(unit, roleType, ctx);
+    }
+  };
+  
+  executeRoleUnits(roles.defender, "defender");
+  executeRoleUnits(roles.attacker, "attacker");
+  executeRoleUnits(roles.rally, "rally");
+  executeRoleUnits(roles.scout, "scout");
 }
 
 function isLogicBlock(block) {
@@ -8091,6 +8397,16 @@ function runAiLogic() {
       buildPlan(core);
       state.built = true;
       Log.info("[IA] Base inicial montada.");
+    }
+  }
+
+  // Unit control runs at a faster interval for responsive gameplay, independent of command decisions
+  if (state.tick % config.unitControlInterval == 0) {
+    var team_uc = getTeam();
+    var core_uc = getCore(team_uc);
+    if (core_uc != null) {
+      var enemyCore_uc = findEnemyCore(team_uc);
+      runUnitControl(team_uc, core_uc, enemyCore_uc);
     }
   }
 
