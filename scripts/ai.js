@@ -1616,7 +1616,7 @@ function ensurePlayerControlled() {
 
   var desiredMode = shouldCommandPlayerUnit() ? "ai" : "player";
 
-  // Prevent spamming controller assignments when the game re-assigns control at spawn.
+  // Retrieve current controller.
   var controller = null;
   try {
     controller = unit.controller();
@@ -1624,29 +1624,29 @@ function ensurePlayerControlled() {
     // ignore
   }
 
-  // Avoid repeatedly reassigning controller every tick when it is already correct.
-  if (state.playerControllerMode === desiredMode && state.playerControlledUnitId === unitId) {
+  // Stable ownership contract: use controller class semantics, not object identity.
+  // Player mode is determined by: controller is not CommandAI AND this unit is the player's current unit.
+  // This avoids wrapper instability while maintaining deterministic ownership semantics.
+  var currentModeIsAi = controller instanceof CommandAI;
+  var currentModeIsPlayer = (controller != null && !(controller instanceof CommandAI) && player.unit() === unit);
+  var currentModeMatches = (desiredMode === "ai" && currentModeIsAi) || (desiredMode === "player" && currentModeIsPlayer);
+
+  // Avoid repeatedly reassigning controller every tick when the mode is already correct.
+  if (state.playerControllerMode === desiredMode && state.playerControlledUnitId === unitId && currentModeMatches) {
     if (desiredMode === "ai") {
-      if (controller instanceof CommandAI) {
-        updateCameraToUnit(unit);
-        return;
-      }
-      // If the controller isn't actually CommandAI, allow a retry but throttle it.
-      if ((state.tick - state.lastControllerAttemptTick) < 60) return;
-    } else {
-      // When player control is desired, avoid forcing it too often.
-      if (controller === player) return;
-      if ((state.tick - state.lastControllerAttemptTick) < 60) return;
+      updateCameraToUnit(unit);
     }
+    return;
   }
 
-  // If we got here, we need to attempt switching the controller.
+  // If we got here, the mode changed or current ownership mismatches desired state; throttle reassignment.
+  if ((state.tick - state.lastControllerAttemptTick) < 60) return;
   state.lastControllerAttemptTick = state.tick;
 
   if (desiredMode === "player") {
     try {
       unit.controller(player);
-      Log.info("[IA] player control restored");
+      Log.info("[IA] player control restored (previous mode: " + (currentModeIsAi ? "ai" : "other") + ")");
     } catch (e) {
       // ignore
     }
@@ -1659,7 +1659,7 @@ function ensurePlayerControlled() {
   // desiredMode == "ai"
   try {
     unit.controller(new CommandAI());
-    Log.info("[IA] ai control assigned");
+    Log.info("[IA] ai control assigned (previous mode: " + (currentModeIsPlayer ? "player" : "other") + ")");
   } catch (e2) {
     // ignore
   }
@@ -7932,6 +7932,7 @@ Events.on(GameOverEvent, function(e){
 Events.on(PlayerChatEvent, function(e){
   if (!config.aiChatToggle) return;
   if (e == null || e.message == null) return;
+  if (e.player != null && e.player.isLocal != null && !e.player.isLocal()) return;
   var msg = String(e.message).trim().toLowerCase();
   if (msg.length == 0) return;
   var parts = msg.split(/\s+/);
