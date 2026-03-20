@@ -1,9 +1,10 @@
-// Regression check for socket transport module
-const { rlSocketQueue } = require('../scripts/ai_socket');
-
-function testQueue() {
-  // Should not throw when queueing
-  rlSocketQueue('test');
+// Deprecation check for ai_socket.js
+let threw = false;
+try {
+  require('../scripts/ai_socket');
+} catch (e) {
+  threw = true;
+  if (!/deprecated/.test(e.message)) throw e;
 }
-testQueue();
-console.log('ai_socket regression check passed');
+if (!threw) throw new Error('ai_socket.js should throw deprecation error');
+console.log('ai_socket deprecation check passed');

@@ -1,12 +1,8 @@
-// UI/chat controls logic extracted from ai.js
-// Handles UI, chat, and player notification helpers
-
-function notify(msg, player) {
-  // ...existing code for notify...
+// DEPRECATED MODULE: ai_ui.js
+// This file is not a reusable module. Do not import except from the monolithic runtime.
+function deprecated() {
+	throw new Error('ai_ui.js is deprecated and not a reusable module.');
 }
-
-// ... (other UI/chat helpers)
-
 module.exports = {
-  notify
+	notify: deprecated
 };

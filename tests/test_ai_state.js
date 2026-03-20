@@ -1,9 +1,10 @@
-// Regression check for state snapshot module
-const { snapshotState } = require('../scripts/ai_state');
-
-function testSnapshot() {
-  // Should not throw for minimal input
-  snapshotState(null, null, 0, null);
+// Deprecation check for ai_state.js
+let threw = false;
+try {
+  require('../scripts/ai_state');
+} catch (e) {
+  threw = true;
+  if (!/deprecated/.test(e.message)) throw e;
 }
-testSnapshot();
-console.log('ai_state regression check passed');
+if (!threw) throw new Error('ai_state.js should throw deprecation error');
+console.log('ai_state deprecation check passed');

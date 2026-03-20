@@ -1,9 +1,10 @@
-// Regression check for UI/chat controls module
-const { notify } = require('../scripts/ai_ui');
-
-function testNotify() {
-  // Should not throw for minimal input
-  notify('test', null);
+// Deprecation check for ai_ui.js
+let threw = false;
+try {
+  require('../scripts/ai_ui');
+} catch (e) {
+  threw = true;
+  if (!/deprecated/.test(e.message)) throw e;
 }
-testNotify();
-console.log('ai_ui regression check passed');
+if (!threw) throw new Error('ai_ui.js should throw deprecation error');
+console.log('ai_ui deprecation check passed');

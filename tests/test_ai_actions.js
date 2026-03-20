@@ -1,9 +1,10 @@
-// Regression check for action executor module
-const { executeAction } = require('../scripts/ai_actions');
-
-function testExecuteAction() {
-  // Should not throw for minimal input
-  executeAction('noop', {});
+// Deprecation check for ai_actions.js
+let threw = false;
+try {
+  require('../scripts/ai_actions');
+} catch (e) {
+  threw = true;
+  if (!/deprecated/.test(e.message)) throw e;
 }
-testExecuteAction();
-console.log('ai_actions regression check passed');
+if (!threw) throw new Error('ai_actions.js should throw deprecation error');
+console.log('ai_actions deprecation check passed');

@@ -1,12 +1,8 @@
-// Action executor logic extracted from ai.js
-// Handles action execution, command dispatch, and related helpers
-
-function executeAction(action, state) {
-  // ...existing code for action execution...
+// DEPRECATED MODULE: ai_actions.js
+// This file is not a reusable module. Do not import except from the monolithic runtime.
+function deprecated() {
+	throw new Error('ai_actions.js is deprecated and not a reusable module.');
 }
-
-// ... (other action helpers)
-
 module.exports = {
-  executeAction
+	executeAction: deprecated
 };

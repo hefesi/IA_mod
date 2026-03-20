@@ -1,12 +1,8 @@
-// State snapshot and reward logic extracted from ai.js
-// Handles snapshotState, reward calculation, and related helpers
-
-function snapshotState(core, enemyCore, enemies, team) {
-  // ...existing code from ai.js snapshotState...
+// DEPRECATED MODULE: ai_state.js
+// This file is not a reusable module. Do not import except from the monolithic runtime.
+function deprecated() {
+	throw new Error('ai_state.js is deprecated and not a reusable module.');
 }
-
-// ... (other state and reward helpers)
-
 module.exports = {
-  snapshotState
+	snapshotState: deprecated
 };

@@ -1,12 +1,8 @@
-// Policy selection logic extracted from ai.js
-// Handles policy mode, Q-table, NN model selection, and related helpers
-
-function selectPolicy(state) {
-  // ...existing code for policy selection...
+// DEPRECATED MODULE: ai_policy.js
+// This file is not a reusable module. Do not import except from the monolithic runtime.
+function deprecated() {
+	throw new Error('ai_policy.js is deprecated and not a reusable module.');
 }
-
-// ... (other policy helpers)
-
 module.exports = {
-  selectPolicy
+	selectPolicy: deprecated
 };
