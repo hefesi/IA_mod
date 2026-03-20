@@ -21,6 +21,8 @@ def main():
         print(json.dumps(rows, ensure_ascii=False, indent=2))
     except Exception as exc:
         print("duckdb_query_failed={}".format(exc))
+        import sys
+        sys.exit(1)
 
 
 if __name__ == "__main__":

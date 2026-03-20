@@ -60,6 +60,14 @@ $outMeta = "ppo_meta.json"
 $outNNJson = "nn_model.json"
 $bindHost = if ($BindPublic) { "0.0.0.0" } else { "127.0.0.1" }
 
+# Resolve absolute path for the socket server script before creating the job
+$socketServerPath = Join-Path $PSScriptRoot "rl_socket_server.py"
+if (-not (Test-Path $socketServerPath)) {
+    Write-Error "Socket server script não encontrado em: $socketServerPath"
+    exit 1
+}
+$socketServerPath = (Resolve-Path $socketServerPath).Path
+
 # Detecta os IPs locais para instruir o celular sobre para onde enviar os logs.
 function Get-LocalIPv4s {
     $ips = @()
@@ -85,17 +93,26 @@ $localIPs = Get-LocalIPv4s
 
 Write-Host "Usando Python: $python"
 Write-Host "Iniciando socket server (porta $port)." -ForegroundColor Cyan
+Write-Host "Socket server path: $socketServerPath" -ForegroundColor DarkGray
 
 $job = Start-Job -Name "RL-Socket" -ScriptBlock {
-    param($python, $host, $port, $logFile, $timeout, $maxTrans, $token)
-    $args = @("--host", $host, "--port", $port, "--out", $logFile, "--verbose")
+    param($python, $scriptPath, $host, $port, $logFile, $timeout, $maxTrans, $token)
+    $args = @($scriptPath, "--host", $host, "--port", $port, "--out", $logFile, "--verbose")
     if ($timeout -gt 0) { $args += @("--timeout", $timeout) }
     if ($maxTrans -gt 0) { $args += @("--max-transitions", $maxTrans) }
     if ($token) { $args += @("--token", $token) }
-    & $python scripts/rl_socket_server.py @args
-} -ArgumentList $python, $bindHost, $port, $logFile, $Timeout, $MaxTransitions, $Token
+    & $python @args
+} -ArgumentList $python, $socketServerPath, $bindHost, $port, $logFile, $Timeout, $MaxTransitions, $Token
 
-Write-Host "Socket server em execução como job 'RL-Socket'." -ForegroundColor Green
+# Validate job startup
+Start-Sleep -Milliseconds 1000
+$jobState = (Get-Job -Name "RL-Socket" -ErrorAction SilentlyContinue).State
+if ($jobState -ne "Running") {
+    Write-Error "Socket server job falhou ao iniciar. Estado: $jobState"
+    Remove-Job -Name "RL-Socket" -ErrorAction SilentlyContinue
+    exit 1
+}
+Write-Host "Socket server iniciado com sucesso." -ForegroundColor Green
 if ($BindPublic) {
     Write-Host "Aviso: Socket server ligado em 0.0.0.0 (permite conexões externas). Use apenas em redes confiáveis!" -ForegroundColor Yellow
 } else {

@@ -107,7 +107,8 @@ if gym is not None and np is not None:
             return np.asarray(vec_from_state(self.current_state or {}), dtype=np.float32)
 
         def reset(self, *, seed=None, options=None):
-            super().reset(seed=seed if seed is not None else self._default_seed)
+            if seed is not None:
+                super().reset(seed=seed)
             options = options or {}
 
             if "state" in options:
@@ -126,7 +127,7 @@ if gym is not None and np is not None:
             self.episode_reward = 0.0
             info = {
                 "reset_source": source,
-                "seed": seed if seed is not None else self._default_seed,
+                "seed": seed,
                 "planet": infer_planet_label(self.current_state or {}),
             }
             return self._obs(), info
@@ -262,7 +263,8 @@ if gym is not None and np is not None:
             return self.scenarios[choice]
 
         def reset(self, *, seed=None, options=None):
-            super().reset(seed=seed if seed is not None else self._default_seed)
+            if seed is not None:
+                super().reset(seed=seed)
             self.current_scenario = self._select_scenario(options=options)
             self.current_step_index = 0
             self.current_state = dict(self.current_scenario["steps"][0]["state"])
@@ -271,7 +273,7 @@ if gym is not None and np is not None:
             info = {
                 "scenario_name": self.current_scenario["name"],
                 "planet": self.current_scenario.get("planet", "unknown"),
-                "seed": seed if seed is not None else self._default_seed,
+                "seed": seed,
             }
             return self._obs(), info
 

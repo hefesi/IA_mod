@@ -191,6 +191,18 @@ def main():
 
     env_mode = resolve_env_mode(args)
 
+    # Validate scenario path upfront when env mode requires it
+    if env_mode == "scenarios":
+        if not args.scenarios or args.scenarios.strip() == "":
+            parser.error("--scenarios path required and must be non-empty when env='scenarios' or when --scenarios is provided")
+        
+        scenario_path = Path(args.scenarios)
+        if not scenario_path.exists():
+            parser.error("scenario file not found: {} does not exist".format(args.scenarios))
+        
+        if not scenario_path.is_file():
+            parser.error("scenario path is not a file: {}".format(args.scenarios))
+
     try:
         import numpy as np
         import torch

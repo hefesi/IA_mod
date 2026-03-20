@@ -62,15 +62,32 @@ if (-not $NoLaunch -and -not (Test-Path $Exe)) {
 Write-Host "Usando Python: $python"
 Write-Host "Iniciando socket server em 127.0.0.1:4567..." -ForegroundColor Cyan
 
+# Resolve absolute path for the socket server script before creating the job
+$socketServerPath = Join-Path $PSScriptRoot "rl_socket_server.py"
+if (-not (Test-Path $socketServerPath)) {
+    Write-Error "Socket server script não encontrado em: $socketServerPath"
+    exit 1
+}
+$socketServerPath = (Resolve-Path $socketServerPath).Path
+Write-Host "Socket server path: $socketServerPath" -ForegroundColor DarkGray
+
 $serverJob = Start-Job -Name "RL-Socket-PC" -ScriptBlock {
-    param($python, $logFile, $timeout, $maxTransitions)
-    $args = @("scripts/rl_socket_server.py", "--host", "127.0.0.1", "--port", "4567", "--out", $logFile, "--verbose")
+    param($python, $scriptPath, $logFile, $timeout, $maxTransitions)
+    $args = @($scriptPath, "--host", "127.0.0.1", "--port", "4567", "--out", $logFile, "--verbose")
     if ($timeout -gt 0) { $args += @("--timeout", $timeout) }
     if ($maxTransitions -gt 0) { $args += @("--max-transitions", $maxTransitions) }
     & $python @args
-} -ArgumentList $python, $LogFile, $Timeout, $MaxTransitions
+} -ArgumentList $python, $socketServerPath, $LogFile, $Timeout, $MaxTransitions
 
-Start-Sleep -Milliseconds 600
+# Validate job startup
+Start-Sleep -Milliseconds 1000
+$jobState = (Get-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue).State
+if ($jobState -ne "Running") {
+    Write-Error "Socket server job falhou ao iniciar. Estado: $jobState"
+    Remove-Job -Name "RL-Socket-PC" -ErrorAction SilentlyContinue
+    exit 1
+}
+Write-Host "Socket server iniciado com sucesso." -ForegroundColor Green
 
 $mindustryProc = $null
 if (-not $NoLaunch) {

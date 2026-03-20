@@ -15,7 +15,8 @@ def main():
         stats = convert_log_to_parquet(args.log, args.out, limit=args.limit, transition_type=args.transition_type)
     except Exception as exc:
         print("parquet_export_failed={}".format(exc))
-        return
+        import sys
+        sys.exit(1)
 
     print("rows={rows} columns={columns} out={out_path}".format(**stats))
 

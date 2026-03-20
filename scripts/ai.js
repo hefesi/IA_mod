@@ -694,22 +694,114 @@ function hasBucketizedFeatures(features) {
 }
 
 function applyRLMeta(data) {
-  if (data == null) return false;
-  var changed = false;
-  if (data.actions != null && data.actions.length != null) {
-    rlQMeta.actions = data.actions;
-    changed = true;
+  if (data == null) {
+    Log.info("[RL] Schema validation failed: data is null");
+    return false;
   }
-  // Keep bucketized state features separate from NN feature-name lists.
-  if (hasBucketizedFeatures(data.features)) {
-    rlQMeta.features = data.features;
-    changed = true;
+  
+  // Validate actions: must be list of non-empty unique strings
+  var actions = data.actions;
+  if (!Array.isArray(actions)) {
+    Log.info("[RL] Schema validation failed: actions must be a list");
+    return false;
   }
-  if (data.norms != null) {
-    rlQMeta.norms = data.norms;
-    changed = true;
+  
+  var seenActions = {};
+  for (var i = 0; i < actions.length; i++) {
+    var action = actions[i];
+    if (typeof action !== "string" || action.length === 0) {
+      Log.info("[RL] Schema validation failed: action[" + i + "] must be a non-empty string, got: " + action);
+      return false;
+    }
+    if (seenActions[action] === true) {
+      Log.info("[RL] Schema validation failed: duplicate action name: " + action);
+      return false;
+    }
+    seenActions[action] = true;
   }
-  return changed;
+  
+  // Validate features using hasBucketizedFeatures pattern
+  if (!hasBucketizedFeatures(data.features)) {
+    Log.info("[RL] Schema validation failed: features must be a list of {name, bins} objects");
+    return false;
+  }
+  
+  var features = data.features;
+  var seenFeatureNames = {};
+  for (var fi = 0; fi < features.length; fi++) {
+    var feature = features[fi];
+    if (typeof feature !== "object" || feature === null) {
+      Log.info("[RL] Schema validation failed: feature[" + fi + "] must be an object");
+      return false;
+    }
+    
+    var featureName = feature.name;
+    if (typeof featureName !== "string" || featureName.length === 0) {
+      Log.info("[RL] Schema validation failed: feature[" + fi + "].name must be a non-empty string, got: " + featureName);
+      return false;
+    }
+    
+    if (seenFeatureNames[featureName] === true) {
+      Log.info("[RL] Schema validation failed: duplicate feature name: " + featureName);
+      return false;
+    }
+    seenFeatureNames[featureName] = true;
+    
+    var bins = feature.bins;
+    if (!Array.isArray(bins)) {
+      Log.info("[RL] Schema validation failed: feature[" + fi + "].bins must be a list");
+      return false;
+    }
+  }
+  
+  // Validate norms: must be object with keys matching feature names exactly
+  var norms = data.norms;
+  if (typeof norms !== "object" || norms === null || Array.isArray(norms)) {
+    Log.info("[RL] Schema validation failed: norms must be an object");
+    return false;
+  }
+  
+  // Check exact parity between norms keys and feature names
+  var normKeys = [];
+  for (var key in norms) {
+    if (norms.hasOwnProperty(key)) {
+      normKeys.push(key);
+    }
+  }
+  
+  var featureNames = [];
+  for (var f = 0; f < features.length; f++) {
+    featureNames.push(features[f].name);
+  }
+  
+  // Check for missing norms
+  for (var fn = 0; fn < featureNames.length; fn++) {
+    if (norms[featureNames[fn]] === undefined) {
+      Log.info("[RL] Schema validation failed: missing norms for feature: " + featureNames[fn]);
+      return false;
+    }
+  }
+  
+  // Check for extra norms
+  for (var nk = 0; nk < normKeys.length; nk++) {
+    if (seenFeatureNames[normKeys[nk]] !== true) {
+      Log.info("[RL] Schema validation failed: extra norm key not in features: " + normKeys[nk]);
+      return false;
+    }
+  }
+  
+  // All validations passed, apply the metadata
+  rlQMeta.actions = actions;
+  rlQMeta.features = features;
+  rlQMeta.norms = {};
+  for (var key in norms) {
+    if (norms.hasOwnProperty(key)) {
+      rlQMeta.norms[key] = norms[key];
+    }
+  }
+  
+  Log.info("[RL] Schema applied: " + rlQMeta.actions.length + " actions, " + rlQMeta.features.length + " features");
+  return true;
 }
 
 function resolveSchemaFi() {
@@ -750,16 +842,26 @@ function loadRLSchema(force) {
   try {
     var text = fi.readString();
     var data = JSON.parse(String(text));
-    if (!applyRLMeta(data) || rlQMeta.features.length == 0) {
-      Log.info("[RL] Schema invalido.");
+    
+    // Apply metadata with strict validation; only update if valid
+    if (!applyRLMeta(data)) {
+      // Validation failed, keep previous valid metadata unchanged
+      Log.info("[RL] Schema validation failed, keeping previous valid metadata");
       return false;
     }
+    
+    // Extra check: ensure we have actual features after applying
+    if (rlQMeta.features == null || rlQMeta.features.length == 0) {
+      Log.info("[RL] Schema loaded but contains no features");
+      return false;
+    }
+    
     rlSchemaLastLoadTick = state.tick;
     Log.info("[RL] Schema carregado: " + fi.absolutePath());
     return true;
   } catch (e4) {
     if ((state.tick - rlSchemaLastErrorTick) > 600) {
-      Log.info("[RL] Erro ao carregar schema RL.");
+      Log.info("[RL] Erro ao carregar schema RL: " + e4);
       rlSchemaLastErrorTick = state.tick;
     }
     return false;
@@ -791,11 +893,14 @@ function rlSocketStopBackgroundThread() {
     }
     try {
       rlSocket.backgroundThread.join(5000);  // Wait up to 5 seconds
+      // Thread terminated successfully, now safe to clear flag and reference
+      rlSocket.backgroundThread = null;
+      rlSocket.stopRequested = false;
     } catch (e) {
-      // ignore
+      // Join timed out: keep stopRequested asserted and do NOT null the thread reference
+      // This prevents the thread from being restarted and corrupting the shutdown sequence
+      Log.info("[RL] Socket worker thread join timeout, keeping stopRequested=true");
     }
-    rlSocket.backgroundThread = null;
-    rlSocket.stopRequested = false;
   }
 }
 
@@ -929,10 +1034,60 @@ function rlSocketQueue(line) {
   rlSocketEnsureBackground();
 }
 
-function rlSocketFlush() {
-  // With background thread, just ensure the thread is running
-  // The actual flushing happens asynchronously on the background thread
+function rlSocketFlush(blockingDrainTimeoutMs) {
+  // If blockingDrainTimeoutMs provided, drain queue synchronously before background thread processing
+  // This is used for shutdown paths to ensure no queued payloads are lost on socket close
   if (!config.rlSocketEnabled) return true;
+  
+  if (blockingDrainTimeoutMs != null && blockingDrainTimeoutMs >= 0) {
+    var drainStartMs = Date.now();
+    var maxDrainMs = blockingDrainTimeoutMs;
+    var drainLimit = 100;  // Process up to 100 items per drain cycle
+    var drainCycles = 0;
+    
+    // Drain all queued items synchronously with timeout
+    while (drainCycles < 50) {  // Safety limit: max 50 cycles
+      var elapsedMs = Date.now() - drainStartMs;
+      if (elapsedMs >= maxDrainMs) {
+        break;  // Timeout reached, stop draining
+      }
+      
+      if (rlSocket.queue == null || rlSocket.queueSize == null || rlSocket.queueSize.get() <= 0) {
+        break;  // Queue empty, done draining
+      }
+      
+      // Attempt to connect if needed
+      if (!rlSocketConnected()) {
+        if (!rlSocketConnect()) {
+          break;  // Cannot connect, stop draining
+        }
+      }
+      
+      // Drain a batch
+      var count = 0;
+      while (count < drainLimit && rlSocket.queueSize.get() > 0) {
+        try {
+          var line = rlSocketPollQueue();
+          if (line == null) break;
+          if (rlSocket.out != null) {
+            rlSocket.out.println(line);
+          }
+          count++;
+        } catch (e) {
+          Log.info("[RL] Error draining socket queue: " + e);
+          break;
+        }
+      }
+      
+      if (count == 0) {
+        break;  // No items processed, queue is stalled
+      }
+      
+      drainCycles++;
+    }
+  }
+  
+  // Ensure background thread is running for async processing
   rlSocketEnsureBackground();
   return true;
 }
@@ -1548,6 +1703,7 @@ function itemByName(name) {
         // ignore
       }
     });
+    contentLookupCache.items[name] = found;
     return found;
   } catch (e3) {
     // ignore
@@ -1579,6 +1735,7 @@ function liquidByName(name) {
         // ignore
       }
     });
+    contentLookupCache.liquids[name] = found;
     return found;
   } catch (e3) {
     // ignore
@@ -1619,6 +1776,7 @@ function blockByName(name) {
         // ignore
       }
     });
+    contentLookupCache.blocks[name] = found;
     return found;
   } catch (e3) {
     // ignore
@@ -7763,6 +7921,11 @@ Events.on(GameOverEvent, function(e){
     won: team != null && winner != null && team == winner ? 1 : 0,
     lost: team != null && winner != null && team != winner ? 1 : 0
   });
+  
+  // Hardened shutdown sequence: drain queued payloads, stop worker, close socket
+  // Use blocking drain with 2s timeout to ensure terminal event is flushed
+  rlSocketFlush(2000);
+  rlSocketStopBackgroundThread();
   rlSocketClose();
 });
 

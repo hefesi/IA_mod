@@ -62,7 +62,9 @@ param(
     [int]$MinPlanetActions = 3,
     [switch]$AppendLog,
     [switch]$NoWait,
-    [switch]$NoHost
+    [switch]$NoHost,
+    [switch]$BindPublic,
+    [string]$Token = ""
 )
 
 function Get-PythonCommand {
@@ -293,16 +295,19 @@ function Start-SocketCollectionJob {
         [string]$SocketScript,
         [string]$LogPath,
         [int]$SliceTimeout,
-        [int]$SliceMaxTransitions
+        [int]$SliceMaxTransitions,
+        [string]$BindHost = "127.0.0.1",
+        [string]$Token = ""
     )
 
     $job = Start-Job -Name $JobName -ScriptBlock {
-        param($python, $script, $logFile, $timeout, $maxTransitions)
-        $args = @($script, "--host", "127.0.0.1", "--port", "4567", "--out", $logFile, "--verbose", "--stop-on-event", "gameOver")
+        param($python, $script, $logFile, $timeout, $maxTransitions, $bindHost, $token)
+        $args = @($script, "--host", $bindHost, "--port", "4567", "--out", $logFile, "--verbose", "--stop-on-event", "gameOver")
         if ($timeout -gt 0) { $args += @("--timeout", $timeout) }
         if ($maxTransitions -gt 0) { $args += @("--max-transitions", $maxTransitions) }
+        if ($token) { $args += @("--token", $token) }
         & $python @args
-    } -ArgumentList $Python, $SocketScript, $LogPath, $SliceTimeout, $SliceMaxTransitions
+    } -ArgumentList $Python, $SocketScript, $LogPath, $SliceTimeout, $SliceMaxTransitions, $BindHost, $Token
     return $job
 }
 
@@ -335,27 +340,54 @@ function Start-HeadlessLogJobs {
         [string]$Prefix
     )
 
-    Start-Job -Name "${Prefix}-Out" -ScriptBlock {
-        param($reader, $logFile)
-        while (-not $reader.EndOfStream) {
-            $line = $reader.ReadLine()
-            if ($line -ne $null) {
-                $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                Add-Content -Path $logFile -Value "[$t] $line"
-            }
+    # Use process events instead of Start-Job with streams for reliable async reading
+    # Event handlers are garbage-collected after process exits
+    
+    $outputScript = {
+        param($logFile)
+        if ($null -ne $Event.SourceEventArgs.Data) {
+            $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Add-Content -Path $logFile -Value "[$t] $($Event.SourceEventArgs.Data)"
         }
-    } -ArgumentList $Process.StandardOutput, $LogFile | Out-Null
+    }
+    
+    $errorScript = {
+        param($logFile)
+        if ($null -ne $Event.SourceEventArgs.Data) {
+            $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Add-Content -Path $logFile -Value "[$t] [ERR] $($Event.SourceEventArgs.Data)"
+        }
+    }
+    
+    # Register event handlers for process output
+    $outEventName = "Process-Output-$($Process.Id)"
+    $errEventName = "Process-Error-$($Process.Id)"
+    
+    Register-ObjectEvent -InputObject $Process -EventName OutputDataReceived -SourceIdentifier $outEventName -Action $outputScript -ArgumentList $LogFile | Out-Null
+    Register-ObjectEvent -InputObject $Process -EventName ErrorDataReceived -SourceIdentifier $errEventName -Action $errorScript -ArgumentList $LogFile | Out-Null
+    
+    # Start async reading of streams
+    $Process.BeginOutputReadLine()
+    $Process.BeginErrorReadLine()
+    
+    return @{
+        Process = $Process
+        OutEventName = $outEventName
+        ErrEventName = $errEventName
+    }
+}
 
-    Start-Job -Name "${Prefix}-Err" -ScriptBlock {
-        param($reader, $logFile)
-        while (-not $reader.EndOfStream) {
-            $line = $reader.ReadLine()
-            if ($line -ne $null) {
-                $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                Add-Content -Path $logFile -Value "[$t] [ERR] $line"
-            }
+function Stop-HeadlessLogJobs {
+    param([hashtable]$LogJobInfo)
+    
+    if ($null -ne $LogJobInfo -and $LogJobInfo.OutEventName -and $LogJobInfo.ErrEventName) {
+        try {
+            Unregister-Event -SourceIdentifier $LogJobInfo.OutEventName -ErrorAction SilentlyContinue
+            Unregister-Event -SourceIdentifier $LogJobInfo.ErrEventName -ErrorAction SilentlyContinue
+        } catch {
+            # ignore
         }
-    } -ArgumentList $Process.StandardError, $LogFile | Out-Null
+    }
 }
 
 function Stop-JobSafe {
@@ -505,7 +537,8 @@ foreach ($spec in $specs) {
     Write-Host "Iniciando coleta $runLabel" -ForegroundColor Cyan
     Write-Host "Iniciando socket server em 127.0.0.1:4567..." -ForegroundColor Cyan
 
-    $serverJob = Start-SocketCollectionJob -JobName $socketJobName -Python $python -SocketScript $socketScript -LogPath $logPath -SliceTimeout $Timeout -SliceMaxTransitions $MaxTransitions
+    $bindHost = if ($BindPublic) { "0.0.0.0" } else { "127.0.0.1" }
+    $serverJob = Start-SocketCollectionJob -JobName $socketJobName -Python $python -SocketScript $socketScript -LogPath $logPath -SliceTimeout $Timeout -SliceMaxTransitions $MaxTransitions -BindHost $bindHost -Token $Token
     Start-Sleep -Milliseconds 600
 
     Write-Host "Iniciando headless server: gradlew server:run" -ForegroundColor Cyan
@@ -513,7 +546,7 @@ foreach ($spec in $specs) {
     Write-Host "Headless PID: $($process.Id)"
     Write-Host "Server log:   $serverLogPath"
 
-    Start-HeadlessLogJobs -Process $process -LogFile $serverLogPath -Prefix $logJobPrefix
+    $logJobInfo = Start-HeadlessLogJobs -Process $process -LogFile $serverLogPath -Prefix $logJobPrefix
 
     if (-not [string]::IsNullOrWhiteSpace($spec.Command)) {
         Write-Host "Enviando comando: $($spec.Command)" -ForegroundColor Cyan
@@ -532,11 +565,10 @@ foreach ($spec in $specs) {
 
     Write-Host "Parando headless server..." -ForegroundColor Cyan
     Stop-HeadlessProcess -Process $process
+    Stop-HeadlessLogJobs -LogJobInfo $logJobInfo
 
     Write-Host "Parando socket server..." -ForegroundColor Cyan
     Stop-JobSafe -JobName $socketJobName
-    Stop-JobSafe -JobName "${logJobPrefix}-Out"
-    Stop-JobSafe -JobName "${logJobPrefix}-Err"
 
     if ($CurriculumDelay -gt 0 -and $spec.Index -lt $specs.Count) {
         Write-Host "Aguardando $CurriculumDelay s antes da proxima rodada..." -ForegroundColor DarkGray

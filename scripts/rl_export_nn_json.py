@@ -3,7 +3,7 @@ import json
 import sys
 
 
-def load_state_dict(path):
+def load_state_dict(path, allow_unsafe_load=False):
     try:
         import torch
     except Exception as exc:
@@ -11,11 +11,28 @@ def load_state_dict(path):
         print("install=torch (pip install torch)")
         sys.exit(1)
 
-    sd = torch.load(path, map_location="cpu")
+    # Load with weights_only=True for safety (requires torch >= 2.13)
+    try:
+        sd = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError as te:
+        # weights_only parameter not supported in this torch version
+        if not allow_unsafe_load:
+            print("unsafe_checkpoint_deserialization_blocked: torch.load does not support weights_only=True")
+            print("torch_version_requirement: PyTorch >= 2.13 required for safe checkpoint loading")
+            print("remediation: upgrade torch with 'pip install --upgrade torch' or use --allow-unsafe-load for trusted local files only")
+            raise ValueError(
+                "unsafe_load_required_but_disabled: this torch version lacks weights_only support. "
+                "upgrade to torch>=2.13 or use --allow-unsafe-load flag for trusted files only."
+            )
+        # Unsafe fallback only if explicitly enabled
+        sd = torch.load(path, map_location="cpu")
+        if not isinstance(sd, dict):
+            raise ValueError("invalid_state_dict: checkpoint is not a tensor dictionary")
+    
     if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
         sd = sd["state_dict"]
     if not isinstance(sd, dict):
-        raise ValueError("invalid_state_dict")
+        raise ValueError("invalid_state_dict: expected dict or dict with 'state_dict' key")
     return sd
 
 
@@ -83,15 +100,16 @@ def extract_linear_layers(sd, prefix="net"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export PyTorch policy checkpoint to Mindustry nn_model.json format.")
+    parser = argparse.ArgumentParser(description="Export PyTorch policy checkpoint to Mindustry nn_model.json format. Requires PyTorch >= 2.13 for safe checkpoint loading.")
     parser.add_argument("--model", required=True, help="Path to .pt state_dict.")
     parser.add_argument("--meta", required=True, help="Path to meta JSON (actions/features/norms).")
     parser.add_argument("--out", default="nn_model.json", help="Output JSON for the mod.")
     parser.add_argument("--prefix", default="", help="State dict prefix for the policy head. Defaults to meta.policy_prefix or auto-detect.")
     parser.add_argument("--export-activation", default="", help="Activation for hidden layers (overrides metadata if provided; falls back to metadata, then 'relu').")
+    parser.add_argument("--allow-unsafe-load", action="store_true", help="UNSAFE: Allow deserialization without weights_only=True for trusted local .pt files only. Requires torch >= 2.13 for safe loading.")
     args = parser.parse_args()
 
-    sd = load_state_dict(args.model)
+    sd = load_state_dict(args.model, allow_unsafe_load=args.allow_unsafe_load)
     with open(args.meta, "r", encoding="utf-8") as f:
         meta = json.load(f)
 

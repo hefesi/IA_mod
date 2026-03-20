@@ -129,6 +129,8 @@ Use esses nomes exatamente como apareceram no log ao preencher `-Map`, `-Curricu
 - `-AppendLog`: preserva o `rl_socket.log` existente em vez de limpar no inicio.
 - `-NoHost`: nao envia o comando `host` automaticamente.
 - `-NoWait`: nao espera ENTER; util com timeout/transitions.
+- `-BindPublic`: liga o socket em `0.0.0.0` em vez de `127.0.0.1` (padrão). **Use apenas em redes confiáveis!** Recomendado apenas para treino remoto com `-Token`.
+- `-Token`: exige autenticacao por token compartilhado entre servidor e cliente. O cliente deve definir `config.rlSocketToken` no `scripts/ai.js` com o mesmo valor.
 - `-ParquetOut`: exporta o log consolidado para Parquet ao fim da coleta.
 - `-Validate`: roda a suite deterministica `scripts/validate_rl_stack.py` ao final.
 - `-WandbProject`: ativa tracking do treino PPO no Weights & Biases.
