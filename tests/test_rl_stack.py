@@ -1,7 +1,9 @@
 import json
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -10,9 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from rl_common import DEFAULT_ACTIONS  # noqa: E402
+from rl_common import DEFAULT_ACTIONS, encode_state  # noqa: E402
 from rl_data import convert_log_to_parquet, run_duckdb_query  # noqa: E402
 from rl_env import IMPORT_ERROR, MindustryScenarioEnv  # noqa: E402
+from rl_socket_server import handle_connection  # noqa: E402
 
 
 SCENARIOS_PATH = ROOT / "tests" / "fixtures" / "rl_validation_scenarios.json"
@@ -93,7 +96,7 @@ class RLStackTests(unittest.TestCase):
                 for row in sample_rows:
                     fh.write(json.dumps(row) + "\n")
 
-            stats = convert_log_to_parquet(log_path, parquet_path)
+            stats = convert_log_to_parquet(log_path, parquet_path, batch_size=2)
             self.assertEqual(stats["rows"], 3)
             counts = run_duckdb_query(
                 parquet_path,
@@ -106,6 +109,98 @@ class RLStackTests(unittest.TestCase):
 
             self.assertEqual(counts, [(3, 1)])
             self.assertEqual(actions, [("mine",), ("industry",), ("attackWave",)])
+
+    def test_qlearn_terminal_transition_uses_immediate_reward_target(self):
+        state_terminal = {"resourceTier1": 100, "corePresent": 1, "enemyCore": 0, "coreHealthFrac": 1.0}
+        state_start = {"resourceTier1": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0}
+        sample_rows = [
+            {
+                "t": 1,
+                "s": state_terminal,
+                "a": "noop",
+                "s2": state_terminal,
+                "info": {"reward": 10.0},
+            },
+            {
+                "t": 2,
+                "s": state_start,
+                "a": "attackWave",
+                "s2": state_terminal,
+                "info": {"reward": 1.0, "terminal": True},
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            log_path = td_path / "sample.log"
+            out_path = td_path / "q_table.json"
+            with log_path.open("w", encoding="utf-8") as fh:
+                for row in sample_rows:
+                    fh.write(json.dumps(row) + "\n")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "rl_qlearn.py"),
+                    "--log",
+                    str(log_path),
+                    "--out",
+                    str(out_path),
+                    "--epochs",
+                    "1",
+                    "--alpha",
+                    "1.0",
+                    "--gamma",
+                    "0.9",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stdout + "\n" + proc.stderr)
+
+            payload = json.loads(out_path.read_text(encoding="utf-8"))
+            key = ",".join(map(str, encode_state(state_start)))
+            action_index = payload["actions"].index("attackWave")
+            self.assertAlmostEqual(payload["q"][key][action_index], 1.0, places=6)
+
+    def test_socket_stop_event_with_token_enabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            log_path = td_path / "socket.log"
+            server_sock, client_sock = socket.socketpair()
+            global_state = {"total_transitions": 0, "max_transitions": 0, "max_remaining": 0}
+            result = {}
+
+            def run_server():
+                result["value"] = handle_connection(
+                    server_sock,
+                    ("local", 0),
+                    log_path,
+                    False,
+                    global_state,
+                    required_token="secret-token",
+                    stop_on_event="gameOver",
+                    recv_timeout=0.5,
+                    max_line_size=4096,
+                )
+
+            thread = threading.Thread(target=run_server)
+            thread.start()
+            try:
+                invalid_payload = {"type": "event", "event": "gameOver", "t": 1, "data": {"kind": "invalid"}}
+                valid_payload = {"type": "event", "event": "gameOver", "t": 2, "token": "secret-token", "data": {"kind": "valid"}}
+                client_sock.sendall((json.dumps(invalid_payload) + "\n").encode("utf-8"))
+                client_sock.sendall((json.dumps(valid_payload) + "\n").encode("utf-8"))
+            finally:
+                client_sock.close()
+
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(), "socket handler did not stop on authenticated event")
+            self.assertEqual(result.get("value"), (0, "gameOver"))
+            self.assertEqual(global_state["total_transitions"], 0)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "")
 
     @unittest.skipUnless(HAS_SB3_DEPS, "requires stable-baselines3 stack")
     def test_sb3_ppo_smoke_training_on_fixed_scenarios(self):

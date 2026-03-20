@@ -17,7 +17,13 @@ def socket_event_name(payload):
     return name
 
 
-def handle_connection(conn, addr, out_path, verbose, global_state, required_token="", allowlist=None, stop_on_event=""):
+def payload_has_valid_token(payload, required_token):
+    if not required_token:
+        return True
+    return payload.get("token") == required_token
+
+
+def handle_connection(conn, addr, out_path, verbose, global_state, required_token="", allowlist=None, stop_on_event="", recv_timeout=30, max_line_size=65536):
     """
     Handle a single client connection with optional token authentication.
     
@@ -30,16 +36,22 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
         required_token: if set, clients must include this token in payload metadata
         allowlist: list of allowed client IPs (None = allow all)
         stop_on_event: name of event that triggers server stop
+        recv_timeout: per-connection receive timeout in seconds
+        max_line_size: maximum buffered line size before reset
     
     Returns:
         tuple of (connection_transitions, stop_event_name)
     """
+    client_ip = addr[0] if isinstance(addr, tuple) else str(addr)
+    if max_line_size <= 0:
+        raise ValueError("max_line_size must be > 0")
+
     # Check IP allowlist if specified
     if allowlist is not None and len(allowlist) > 0:
-        client_ip = addr[0] if isinstance(addr, tuple) else str(addr)
         if client_ip not in allowlist:
             if verbose:
                 print("client_rejected_not_in_allowlist client_ip={}".format(client_ip))
+            conn.close()
             return 0, None
     
     buf = ""
@@ -48,7 +60,10 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
     max_remaining = global_state.get("max_remaining", 0)
     
     with conn, open(out_path, "a", encoding="utf-8") as f:
-        client_ip = addr[0] if isinstance(addr, tuple) else str(addr)
+        if recv_timeout and recv_timeout > 0:
+            conn.settimeout(recv_timeout)
+        else:
+            conn.settimeout(None)
         if verbose:
             print("client_connected={} global_total={}".format(addr, global_state["total_transitions"]))
         while True:
@@ -57,14 +72,26 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
                 if verbose:
                     print("global_max_transitions_reached")
                 break
-            
-            data = conn.recv(4096)
+
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                print("client_recv_timeout client_ip={} recv_timeout={} closing_connection".format(client_ip, recv_timeout))
+                break
+            except OSError as exc:
+                print("client_recv_error client_ip={} error={} closing_connection".format(client_ip, exc))
+                break
             if not data:
                 break
             buf += data.decode("utf-8", errors="ignore")
             while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
+                raw_line, buf = buf.split("\n", 1)
+                if len(raw_line) > max_line_size:
+                    print("client_line_limit_exceeded client_ip={} line_chars={} max_line_size={} closing_connection".format(
+                        client_ip, len(raw_line), max_line_size))
+                    buf = ""
+                    return count, None
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
@@ -73,11 +100,10 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
                     continue
                 
                 # Check token if required
-                if required_token:
-                    if tr.get("token") != required_token:
-                        if verbose:
-                            print("payload_rejected_invalid_token client_ip={}".format(client_ip))
-                        continue
+                if not payload_has_valid_token(tr, required_token):
+                    if verbose:
+                        print("payload_rejected_invalid_token client_ip={}".format(client_ip))
+                    continue
                 
                 event_name = socket_event_name(tr)
                 if event_name is not None:
@@ -99,6 +125,11 @@ def handle_connection(conn, addr, out_path, verbose, global_state, required_toke
                 # Check if we've hit the global limit
                 if max_remaining > 0 and global_state["total_transitions"] >= global_state["max_transitions"]:
                     return count, None
+            if len(buf) > max_line_size:
+                print("client_buffer_limit_exceeded client_ip={} buffered_chars={} max_line_size={} closing_connection".format(
+                    client_ip, len(buf), max_line_size))
+                buf = ""
+                break
     
     if verbose and count:
         avg = total / count
@@ -115,10 +146,17 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print per-transition rewards.")
     parser.add_argument("--max-transitions", type=int, default=0, help="Stop server after this many transitions globally (0 = unlimited).")
     parser.add_argument("--timeout", type=float, default=0.0, help="Stop server after this many seconds of no connection (0 = unlimited).")
+    parser.add_argument("--recv-timeout", type=float, default=30.0, help="Per-connection receive timeout in seconds (0 = unlimited).")
+    parser.add_argument("--max-line-size", type=int, default=65536, help="Maximum decoded line/buffer size allowed per client connection.")
     parser.add_argument("--stop-on-event", default="", help="Stop server when a socket control event with this name is received.")
     parser.add_argument("--token", default="", help="Optional shared token for payload authentication (clients must include in payload metadata).")
     parser.add_argument("--allowlist", default="", help="Optional comma-separated list of allowed client IPs (e.g., '127.0.0.1,192.168.1.100'). If empty, all IPs allowed.")
     args = parser.parse_args()
+
+    if args.recv_timeout < 0:
+        parser.error("--recv-timeout must be >= 0")
+    if args.max_line_size <= 0:
+        parser.error("--max-line-size must be > 0")
 
     # Parse allowlist
     allowlist = None
@@ -140,6 +178,8 @@ def main():
             s.settimeout(args.timeout)
         print("listening_on={}:{}".format(args.host, args.port))
         print("max_transitions={}".format(args.max_transitions if args.max_transitions > 0 else "unlimited"))
+        print("recv_timeout={}".format(args.recv_timeout if args.recv_timeout > 0 else "unlimited"))
+        print("max_line_size={}".format(args.max_line_size))
         if args.token:
             print("authentication=token_required")
         if allowlist:
@@ -161,6 +201,8 @@ def main():
                     required_token=args.token,
                     allowlist=allowlist,
                     stop_on_event=args.stop_on_event,
+                    recv_timeout=args.recv_timeout,
+                    max_line_size=args.max_line_size,
                 )
                 if stop_event:
                     print("stop_event_received={} global_transitions={} stopping_server".format(

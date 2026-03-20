@@ -47,6 +47,10 @@ FEATURE_BUCKETS = [(feature["name"], list(feature["bins"])) for feature in FEATU
 FEATURES = [feature["name"] for feature in FEATURE_DEFS]
 NORMS = dict(SCHEMA["norms"])
 
+REWARD_INCREMENT_CLAMP = 120.0
+REWARD_CORE_LOST = -500.0
+REWARD_WIN = 500.0
+
 
 def num(d, key):
     try:
@@ -65,9 +69,10 @@ def bucketize(val, bins):
 
 def reward(s, s2):
     r = 0.0
-    r += 0.005 * (num(s2, "copper") - num(s, "copper"))
-    r += 0.007 * (num(s2, "lead") - num(s, "lead"))
-    r += 0.02 * (num(s2, "titanium") - num(s, "titanium"))
+    # Basic resources
+    r += 0.02 * (num(s2, "copper") - num(s, "copper"))
+    r += 0.02 * (num(s2, "lead") - num(s, "lead"))
+    r += 0.03 * (num(s2, "titanium") - num(s, "titanium"))
     r += 0.004 * (num(s2, "resourceTier1") - num(s, "resourceTier1"))
     r += 0.006 * (num(s2, "resourceTier2") - num(s, "resourceTier2"))
     r += 0.01 * (num(s2, "resourceTier3") - num(s, "resourceTier3"))
@@ -76,15 +81,21 @@ def reward(s, s2):
     r += 0.005 * (num(s2, "resourceIndustrial") - num(s, "resourceIndustrial"))
     r += 0.008 * (num(s2, "resourceStrategic") - num(s, "resourceStrategic"))
     r += 0.004 * (num(s2, "combatStock") - num(s, "combatStock"))
-    r += 3.0 * (num(s2, "industryFactories") - num(s, "industryFactories"))
-    r += 10.0 * (num(s2, "economyStage") - num(s, "economyStage"))
-    r += 2.0 * (num(s2, "drills") - num(s, "drills"))
-    r += 4.0 * (num(s2, "turrets") - num(s, "turrets"))
-    r += 1.5 * (num(s2, "power") - num(s, "power"))
+    # Infrastructure
+    r += 6.0 * (num(s2, "industryFactories") - num(s, "industryFactories"))
+    r += 12.0 * (num(s2, "economyStage") - num(s, "economyStage"))
+    r += 4.0 * (num(s2, "drills") - num(s, "drills"))
+    r += 6.0 * (num(s2, "turrets") - num(s, "turrets"))
+    r += 3.0 * (num(s2, "power") - num(s, "power"))
+    r += 2.0 * (num(s2, "pumps") - num(s, "pumps"))
+    r += 3.0 * (num(s2, "liquidHubs") - num(s, "liquidHubs"))
+    r += 5.0 * (num(s2, "thermals") - num(s, "thermals"))
+    r += 0.2 * (num(s2, "unitsTotal") - num(s, "unitsTotal"))
     r += 1.5 * (num(s2, "factoryCapacity") - num(s, "factoryCapacity"))
     r += 1.8 * (num(s2, "upgradeCapacity") - num(s, "upgradeCapacity"))
     r += 0.4 * (num(s2, "factoryVariety") - num(s, "factoryVariety"))
     r += 0.08 * (num(s2, "unitCapacity") - num(s, "unitCapacity"))
+    # Supply chains and pressures
     r += 25.0 * (num(s2, "chainCoverage") - num(s, "chainCoverage"))
     r -= 18.0 * (num(s2, "chainPressure") - num(s, "chainPressure"))
     r -= 14.0 * (num(s2, "powerPressure") - num(s, "powerPressure"))
@@ -93,13 +104,15 @@ def reward(s, s2):
     r -= 8.0 * (num(s2, "ammoPressureKinetic") - num(s, "ammoPressureKinetic"))
     r -= 9.0 * (num(s2, "ammoPressureExplosive") - num(s, "ammoPressureExplosive"))
     r -= 9.0 * (num(s2, "ammoPressureEnergy") - num(s, "ammoPressureEnergy"))
-    r += 6.0 * max(0.0, num(s, "enemies") - num(s2, "enemies"))
-    r -= 1.5 * max(0.0, num(s, "unitsTotal") - num(s2, "unitsTotal"))
-    r += 50.0 * (num(s2, "coreHealthFrac") - num(s, "coreHealthFrac"))
+    # Combat and tactical
+    r += 200.0 * (num(s2, "coreHealthFrac") - num(s, "coreHealthFrac"))
+    if REWARD_INCREMENT_CLAMP > 0:
+        r = max(-REWARD_INCREMENT_CLAMP, min(REWARD_INCREMENT_CLAMP, r))
+    # Match JS runtime contract: clamp the incremental reward, then apply terminal bonuses.
     if num(s, "enemyCore") == 1 and num(s2, "enemyCore") == 0:
-        r += 200.0
+        r += REWARD_WIN
     if num(s, "corePresent") == 1 and num(s2, "corePresent") == 0:
-        r -= 250.0
+        r += REWARD_CORE_LOST
     return r
 
 

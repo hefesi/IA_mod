@@ -36,6 +36,22 @@ function Log($msg) {
     Add-Content -Path $LogFile -Value $line
 }
 
+function Cleanup-EventRunResources($SourceIds, $Jobs) {
+    foreach ($sourceId in $SourceIds) {
+        if ([string]::IsNullOrWhiteSpace($sourceId)) {
+            continue
+        }
+        Get-EventSubscriber | Where-Object { $_.SourceIdentifier -eq $sourceId } | Unregister-Event -Force -ErrorAction SilentlyContinue
+        Get-Event | Where-Object { $_.SourceIdentifier -eq $sourceId } | Remove-Event -ErrorAction SilentlyContinue
+    }
+    foreach ($job in $Jobs) {
+        if ($null -eq $job) {
+            continue
+        }
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if (-not (Test-Path $Exe)) {
     Write-Error "Executable not found: $Exe"
     exit 1
@@ -63,44 +79,52 @@ while ($true) {
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
+    $outSourceId = "training-loop.stdout.$PID.$restartCount"
+    $errSourceId = "training-loop.stderr.$PID.$restartCount"
+    $eventMessageData = @{ LogFile = $LogFile }
+    $outEventJob = $null
+    $errEventJob = $null
 
     $process.Start() | Out-Null
 
-    # Log stdout/stderr in background
-    $outReader = $process.StandardOutput
-    $errReader = $process.StandardError
-
-    Start-Job -Name "TrainOut" -ScriptBlock {
-        param($reader, $logFile)
-        while (-not $reader.EndOfStream) {
-            $line = $reader.ReadLine()
-            if ($line -ne $null) {
-                $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                $l = "[$t] $line"
-                Add-Content -Path $logFile -Value $l
-            }
+    # Log stdout/stderr asynchronously using event handlers
+    $outEventAction = {
+        param([object]$sender, [System.Diagnostics.DataReceivedEventArgs]$e)
+        $logPath = $Event.MessageData.LogFile
+        if (-not [string]::IsNullOrEmpty($e.Data) -and -not [string]::IsNullOrEmpty($logPath)) {
+            $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $l = "[$t] $($e.Data)"
+            Add-Content -Path $logPath -Value $l
         }
-    } -ArgumentList $outReader, $LogFile | Out-Null
+    }
 
-    Start-Job -Name "TrainErr" -ScriptBlock {
-        param($reader, $logFile)
-        while (-not $reader.EndOfStream) {
-            $line = $reader.ReadLine()
-            if ($line -ne $null) {
-                $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                $l = "[$t] [ERR] $line"
-                Add-Content -Path $logFile -Value $l
-            }
+    $errEventAction = {
+        param([object]$sender, [System.Diagnostics.DataReceivedEventArgs]$e)
+        $logPath = $Event.MessageData.LogFile
+        if (-not [string]::IsNullOrEmpty($e.Data) -and -not [string]::IsNullOrEmpty($logPath)) {
+            $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $l = "[$t] [ERR] $($e.Data)"
+            Add-Content -Path $logPath -Value $l
         }
-    } -ArgumentList $errReader, $LogFile | Out-Null
+    }
 
-    $process.WaitForExit()
-    $exitCode = $process.ExitCode
-    Log "Process exited with code $exitCode";
+    try {
+        $outEventJob = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -SourceIdentifier $outSourceId -MessageData $eventMessageData -Action $outEventAction
+        $errEventJob = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -SourceIdentifier $errSourceId -MessageData $eventMessageData -Action $errEventAction
 
-    # Stop background jobs so they don't keep running
-    Get-Job -Name "TrainOut" -ErrorAction SilentlyContinue | Stop-Job -Force | Remove-Job -Force | Out-Null
-    Get-Job -Name "TrainErr" -ErrorAction SilentlyContinue | Stop-Job -Force | Remove-Job -Force | Out-Null
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        Log "Process exited with code $exitCode"
+    }
+    finally {
+        try { $process.CancelOutputRead() } catch {}
+        try { $process.CancelErrorRead() } catch {}
+        Cleanup-EventRunResources -SourceIds @($outSourceId, $errSourceId) -Jobs @($outEventJob, $errEventJob)
+        $process.Dispose()
+    }
 
     # If the process exited cleanly (exit code 0), stop here unless the user explicitly asked to restart.
     if ($exitCode -eq 0 -and -not $RestartOnNormalExit) {

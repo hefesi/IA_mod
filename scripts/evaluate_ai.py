@@ -1,6 +1,7 @@
 import argparse
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -123,7 +124,7 @@ def evaluate(log_path, strict_model=False, min_real_actions=1):
             for row in sample:
                 fh.write(json.dumps(row) + "\n")
 
-        qlearn_proc = run_cmd(["python3", "scripts/rl_qlearn.py", "--log", str(log_tmp), "--out", str(out_q), "--epochs", "1"])
+        qlearn_proc = run_cmd([sys.executable, "scripts/rl_qlearn.py", "--log", str(log_tmp), "--out", str(out_q), "--epochs", "1"])
         qlearn_text = (qlearn_proc.stdout + qlearn_proc.stderr).strip()
         qlearn_detail = " | ".join(qlearn_text.splitlines()[-3:])
         qlearn_ok = qlearn_proc.returncode == 0 and out_q.exists()
@@ -137,7 +138,7 @@ def evaluate(log_path, strict_model=False, min_real_actions=1):
         checks.append(CheckResult("q-learning exporta schema compartilhado", qlearn_schema_ok, "q_table.json -> features/norms"))
         checks.append(CheckResult("adaptabilidade: acao custom entra na q-table", qlearn_custom_ok, "customModAction em actions"))
 
-        proc = run_cmd(["python3", "scripts/rl_ppo.py", "--log", str(log_tmp), "--out", str(out_model), "--out-meta", str(out_meta), "--epochs", "1", "--batch", "2"])
+        proc = run_cmd([sys.executable, "scripts/rl_ppo.py", "--log", str(log_tmp), "--out", str(out_model), "--out-meta", str(out_meta), "--epochs", "1", "--batch", "2"])
         combined = (proc.stdout + proc.stderr).strip()
         short = " | ".join(combined.splitlines()[-4:])
         torch_missing = "pytorch_missing=" in combined
@@ -156,7 +157,7 @@ def evaluate(log_path, strict_model=False, min_real_actions=1):
             has_custom = False
             export_detail = "export not run"
             if ok_train:
-                export_proc = run_cmd(["python3", "scripts/rl_export_nn_json.py", "--model", str(out_model), "--meta", str(out_meta), "--out", str(out_json)])
+                export_proc = run_cmd([sys.executable, "scripts/rl_export_nn_json.py", "--model", str(out_model), "--meta", str(out_meta), "--out", str(out_json)])
                 export_text = (export_proc.stdout + export_proc.stderr).strip()
                 export_detail = " | ".join(export_text.splitlines()[-3:])
                 export_ok = export_proc.returncode == 0 and out_json.exists()
@@ -165,6 +166,70 @@ def evaluate(log_path, strict_model=False, min_real_actions=1):
                     has_custom = "customModAction" in exported.get("actions", [])
             checks.append(CheckResult("export PPO gera nn_model.json", export_ok, export_detail))
             checks.append(CheckResult("adaptabilidade: acao custom entra na policy", has_custom, "customModAction em actions"))
+
+    # Comprehensive reward parity test between JS and Python
+    # Test each major reward component to ensure training and in-game rewards stay aligned
+    try:
+        from rl_common import reward
+
+        reward_tests = [
+            (
+                "basic_resources",
+                {"copper": 0, "lead": 0, "titanium": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                {"copper": 10, "lead": 5, "titanium": 2, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                0.36,
+            ),
+            (
+                "infrastructure",
+                {"copper": 0, "lead": 0, "titanium": 0, "industryFactories": 0, "drills": 0, "turrets": 0, "power": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                {"copper": 0, "lead": 0, "titanium": 0, "industryFactories": 1, "drills": 2, "turrets": 1, "power": 50, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                120.0,
+            ),
+            (
+                "pressures",
+                {"copper": 0, "lead": 0, "titanium": 0, "chainCoverage": 0, "chainPressure": 0, "powerPressure": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                {"copper": 0, "lead": 0, "titanium": 0, "chainCoverage": 10, "chainPressure": 5, "powerPressure": 2, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                120.0,
+            ),
+            (
+                "terminal_enemy_core",
+                {"copper": 0, "lead": 0, "titanium": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                {"copper": 0, "lead": 0, "titanium": 0, "corePresent": 1, "enemyCore": 0, "coreHealthFrac": 1.0},
+                500.0,
+            ),
+            (
+                "terminal_ally_core",
+                {"copper": 0, "lead": 0, "titanium": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                {"copper": 0, "lead": 0, "titanium": 0, "corePresent": 0, "enemyCore": 1, "coreHealthFrac": 0.0},
+                -620.0,
+            ),
+            (
+                "core_health_damage",
+                {"copper": 0, "lead": 0, "titanium": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                {"copper": 0, "lead": 0, "titanium": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 0.8},
+                -40.0,
+            ),
+            (
+                "incremental_clamp_before_terminal_bonus",
+                {"copper": 0, "lead": 0, "titanium": 0, "power": 0, "corePresent": 1, "enemyCore": 1, "coreHealthFrac": 1.0},
+                {"copper": 0, "lead": 0, "titanium": 0, "power": 50, "corePresent": 1, "enemyCore": 0, "coreHealthFrac": 1.0},
+                620.0,
+            ),
+        ]
+
+        reward_failed = []
+        for test_name, prev_state, next_state, expected in reward_tests:
+            computed = reward(prev_state, next_state)
+            if abs(computed - expected) < 0.01:
+                continue
+            reward_failed.append(f"{test_name}(got {computed:.2f}, want {expected:.2f})")
+
+        reward_passed = len(reward_tests) - len(reward_failed)
+        reward_ok = len(reward_failed) == 0
+        reward_detail = f"{reward_passed}/{len(reward_tests)} parity tests passed" + (f"; failures: {', '.join(reward_failed[:2])}" if reward_failed else "")
+        checks.append(CheckResult("parity completa: recompensas JS/Python alinhadas", reward_ok, reward_detail))
+    except Exception as exc:
+        checks.append(CheckResult("parity completa: recompensas JS/Python alinhadas", False, f"error: {exc}"))
 
     checks.append(check_real_log(log_path))
     if log_path.exists():

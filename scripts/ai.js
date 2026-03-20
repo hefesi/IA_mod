@@ -30,6 +30,7 @@ var PrintWriter = Packages.java.io.PrintWriter;
 var Fi = Packages.arc.files.Fi;
 var Thread = Packages.java.lang.Thread;
 var ConcurrentLinkedQueue = Packages.java.util.concurrent.ConcurrentLinkedQueue;
+var AtomicInteger = Packages.java.util.concurrent.atomic.AtomicInteger;
 var Executors = Packages.java.util.concurrent.Executors;
 
 var config = {
@@ -70,7 +71,7 @@ var config = {
   memorySize: 3,
   repeatPenalty: 25,
   actionCooldown: 180,
-  modName: "auto-game",
+  modName: "auto game",
   rlLogEnabled: true,
   rlSocketEnabled: false,
   rlSocketHost: "127.0.0.1",
@@ -450,6 +451,7 @@ var rlSocket = {
   lastConnectTick: -9999,
   lastErrorTick: -9999,
   queue: null,  // ConcurrentLinkedQueue initialized on first use
+  queueSize: new AtomicInteger(0),
   backgroundThread: null,
   stopRequested: false,
   threadLock: new java.lang.Object()
@@ -830,6 +832,11 @@ function rlSocketStopBackgroundThread() {
   if (rlSocket.backgroundThread != null) {
     rlSocket.stopRequested = true;
     try {
+      rlSocket.backgroundThread.interrupt();
+    } catch (e0) {
+      // ignore
+    }
+    try {
       rlSocket.backgroundThread.join(5000);  // Wait up to 5 seconds
     } catch (e) {
       // ignore
@@ -837,6 +844,25 @@ function rlSocketStopBackgroundThread() {
     rlSocket.backgroundThread = null;
     rlSocket.stopRequested = false;
   }
+}
+
+function rlSocketEnsureQueue() {
+  if (rlSocket.queue == null) {
+    rlSocket.queue = new ConcurrentLinkedQueue();
+  }
+  if (rlSocket.queueSize == null) {
+    rlSocket.queueSize = new AtomicInteger(0);
+  }
+}
+
+function rlSocketPollQueue() {
+  if (rlSocket.queue == null) return null;
+  var line = rlSocket.queue.poll();
+  if (line != null && rlSocket.queueSize != null) {
+    var remaining = rlSocket.queueSize.decrementAndGet();
+    if (remaining < 0) rlSocket.queueSize.set(0);
+  }
+  return line;
 }
 
 function rlSocketConnect() {
@@ -884,9 +910,10 @@ function rlSocketBackgroundWorker() {
       
       // Drain queue items
       var count = 0;
-      while (count < queueDrainLimit && rlSocket.queue != null && rlSocket.queue.size() > 0) {
+      while (count < queueDrainLimit && rlSocket.queue != null && rlSocket.queueSize != null && rlSocket.queueSize.get() > 0) {
         try {
-          var line = rlSocket.queue.poll();
+          var line = rlSocketPollQueue();
+          if (line == null) break;
           if (line != null && rlSocket.out != null) {
             rlSocket.out.println(line);
           }
@@ -898,7 +925,9 @@ function rlSocketBackgroundWorker() {
         }
       }
     } catch (e) {
-      Log.info("[RL] Background thread error: " + e);
+      if (!rlSocket.stopRequested) {
+        Log.info("[RL] Background thread error: " + e);
+      }
     }
   }
   
@@ -911,9 +940,7 @@ function rlSocketEnsureBackground() {
   if (rlSocket.backgroundThread != null) return;
   
   // Initialize concurrent queue if needed
-  if (rlSocket.queue == null) {
-    rlSocket.queue = new ConcurrentLinkedQueue();
-  }
+  rlSocketEnsureQueue();
   
   // Start background thread
   try {
@@ -934,17 +961,16 @@ function rlSocketQueue(line) {
   if (!config.rlSocketEnabled) return;
   
   // Initialize concurrent queue if needed
-  if (rlSocket.queue == null) {
-    rlSocket.queue = new ConcurrentLinkedQueue();
-  }
+  rlSocketEnsureQueue();
   
   // Apply queue size limit: drop oldest if at max
-  if (rlSocket.queue.size() >= config.rlSocketQueueMax) {
-    rlSocket.queue.poll();
+  if (config.rlSocketQueueMax != null && config.rlSocketQueueMax > 0 && rlSocket.queueSize.get() >= config.rlSocketQueueMax) {
+    rlSocketPollQueue();
   }
   
   // Add to queue
   rlSocket.queue.add(line);
+  rlSocket.queueSize.incrementAndGet();
   
   // Ensure background thread is running
   rlSocketEnsureBackground();
@@ -1083,17 +1109,26 @@ function snapshotState(core, enemyCore, enemies, team) {
 }
 
 function emitTransition(prevState, actionName, nextState, info) {
-  var payload = { type: "transition", s: prevState, a: actionName, s2: nextState, info: info, t: state.tick };
+  var logPayload = { type: "transition", s: prevState, a: actionName, s2: nextState, info: info, t: state.tick };
+  var socketPayload = { type: "transition", s: prevState, a: actionName, s2: nextState, info: info, t: state.tick };
   if (config.rlSocketToken && config.rlSocketToken.length > 0) {
-    payload.token = config.rlSocketToken;
+    socketPayload.token = config.rlSocketToken;
   }
-  var line = JSON.stringify(payload);
-  if (config.rlLogEnabled) Log.info("[RL]" + line);
-  rlSocketSend(line);
+  if (config.rlLogEnabled) Log.info("[RL]" + JSON.stringify(logPayload));
+  rlSocketSend(JSON.stringify(socketPayload));
 }
 
 function emitMicroTransition(prevState, policyName, decisionName, nextState, info) {
-  var payload = {
+  var logPayload = {
+    type: "micro",
+    policy: policyName,
+    a: decisionName,
+    s: prevState,
+    s2: nextState,
+    info: info != null ? info : {},
+    t: state.tick
+  };
+  var socketPayload = {
     type: "micro",
     policy: policyName,
     a: decisionName,
@@ -1103,17 +1138,20 @@ function emitMicroTransition(prevState, policyName, decisionName, nextState, inf
     t: state.tick
   };
   if (config.rlSocketToken && config.rlSocketToken.length > 0) {
-    payload.token = config.rlSocketToken;
+    socketPayload.token = config.rlSocketToken;
   }
-  var line = JSON.stringify(payload);
-  if (config.rlLogEnabled) Log.info("[RL]" + line);
-  rlSocketSend(line);
+  if (config.rlLogEnabled) Log.info("[RL]" + JSON.stringify(logPayload));
+  rlSocketSend(JSON.stringify(socketPayload));
 }
 
 function emitSocketEvent(eventName, data) {
-  var payload = { type: "event", event: eventName, t: state.tick, data: data != null ? data : {} };
-  if (config.rlLogEnabled) Log.info("[RL-EVENT]" + JSON.stringify(payload));
-  rlSocketSend(JSON.stringify(payload));
+  var logPayload = { type: "event", event: eventName, t: state.tick, data: data != null ? data : {} };
+  var socketPayload = { type: "event", event: eventName, t: state.tick, data: data != null ? data : {} };
+  if (config.rlSocketToken && config.rlSocketToken.length > 0) {
+    socketPayload.token = config.rlSocketToken;
+  }
+  if (config.rlLogEnabled) Log.info("[RL-EVENT]" + JSON.stringify(logPayload));
+  rlSocketSend(JSON.stringify(socketPayload));
 }
 
 function safeTeamName(team) {
@@ -3296,13 +3334,14 @@ function pickPolicyOrder(actions) {
   return ordered.length > 0 ? ordered : actions;
 }
 
-function updateNNModel(prevState, actionName, nextState, reward) {
+function updateNNModel(prevState, actionName, nextState, reward, terminal) {
   if (!config.rlNNEnabled) return false;
   if (state.nnModel == null) return false;
   if (state.nnModel.layers != null) return false;
   if (state.nnModel.actions == null || state.nnModel.features == null) return false;
   var model = state.nnModel;
   if (model.hiddenSize == null || model.inputSize == null || model.outputSize == null) return false;
+  var isTerminal = terminal === true || isTerminalTransition(prevState, nextState, null);
   var actionIndex = -1;
   for (var i = 0; i < model.actions.length; i++) {
     if (model.actions[i] == actionName) { actionIndex = i; break; }
@@ -3310,15 +3349,19 @@ function updateNNModel(prevState, actionName, nextState, reward) {
   if (actionIndex < 0) return false;
 
   var fwd1 = nnForward(prevState);
-  var fwd2 = nnForward(nextState);
-  if (fwd1 == null || fwd2 == null) return false;
+  if (fwd1 == null) return false;
 
-  var maxNext = -999999;
-  for (var i = 0; i < fwd2.output.length; i++) {
-    if (fwd2.output[i] > maxNext) maxNext = fwd2.output[i];
+  var maxNext = 0;
+  if (!isTerminal) {
+    var fwd2 = nnForward(nextState);
+    if (fwd2 == null) return false;
+    maxNext = -999999;
+    for (var i = 0; i < fwd2.output.length; i++) {
+      if (fwd2.output[i] > maxNext) maxNext = fwd2.output[i];
+    }
   }
   var gamma = config.rlNNGamma != null ? config.rlNNGamma : 0.9;
-  var target = reward + gamma * maxNext;
+  var target = isTerminal ? reward : reward + gamma * maxNext;
 
   var pred = fwd1.output[actionIndex];
   var delta = pred - target;
@@ -3447,6 +3490,14 @@ function maxArray(arr) {
   return max;
 }
 
+function isTerminalTransition(prevState, nextState, info) {
+  if (info != null && info.terminal === true) return true;
+  if (prevState == null || nextState == null) return false;
+  if (prevState.corePresent == 1 && nextState.corePresent == 0) return true;
+  if (prevState.enemyCore == 1 && nextState.enemyCore == 0) return true;
+  return false;
+}
+
 function computeReward(prevState, nextState, info) {
   if (prevState == null || nextState == null) return 0;
   var reward = 0;
@@ -3508,22 +3559,27 @@ function computeReward(prevState, nextState, info) {
   return reward;
 }
 
-function updateOnlineQTable(prevState, actionName, nextState, reward) {
+function updateOnlineQTable(prevState, actionName, nextState, reward, terminal) {
   if (!config.rlOnlineEnabled) return false;
   if (rlQMeta == null || rlQMeta.actions == null || rlQMeta.features == null) return false;
   if (rlQMeta.features.length == 0) return false;
   var aIndex = qActionIndex(actionName);
   if (aIndex < 0) return false;
+  var isTerminal = terminal === true || isTerminalTransition(prevState, nextState, null);
 
   var sKey = encodeStateKey(prevState, rlQMeta.features);
-  var s2Key = encodeStateKey(nextState, rlQMeta.features);
   var qRow = ensureQRow(sKey);
-  var qNext = ensureQRow(s2Key);
-  var maxNext = maxArray(qNext);
   var oldQ = qRow[aIndex] != null ? qRow[aIndex] : 0;
   var alpha = config.rlAlpha != null ? config.rlAlpha : 0.1;
   var gamma = config.rlGamma != null ? config.rlGamma : 0.9;
-  var updated = oldQ + alpha * (reward + gamma * maxNext - oldQ);
+  var target = reward;
+  if (!isTerminal) {
+    var s2Key = encodeStateKey(nextState, rlQMeta.features);
+    var qNext = ensureQRow(s2Key);
+    var maxNext = maxArray(qNext);
+    target += gamma * maxNext;
+  }
+  var updated = oldQ + alpha * (target - oldQ);
   qRow[aIndex] = updated;
   return true;
 }
@@ -4005,6 +4061,22 @@ function consumeCoreItems(block, team, ignoreReserveItems) {
   return true;
 }
 
+function refundCoreItems(block, team) {
+  if (block == null) return;
+  if (Vars.state != null && Vars.state.rules != null && Vars.state.rules.infiniteResources) return;
+  var t = team != null ? team : getTeam();
+  var core = getCore(t);
+  if (core == null || core.items == null) return;
+  var reqs = block.requirements;
+  if (reqs == null || reqs.length == 0) return;
+  var mult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
+  for (var i = 0; i < reqs.length; i++) {
+    var stack = reqs[i];
+    if (stack == null || stack.item == null || stack.amount == null) continue;
+    core.items.add(stack.item, Math.ceil(stack.amount * mult));
+  }
+}
+
 function getStrategyProfile(name) {
   if (config.strategyProfiles != null && config.strategyProfiles[name] != null) return config.strategyProfiles[name];
   if (config.strategyProfiles != null && config.strategyProfiles.balanced != null) return config.strategyProfiles.balanced;
@@ -4180,21 +4252,8 @@ function placeBlock(block, x, y, rotation, team, ignoreReserveItems) {
     try {
       Call.constructFinish(tile, block, builderUnit, rotation || 0, team, null);
     } catch (e) {
-      if (config.aiDebugHud) state.lastPlaceFail = "construct-fail:" + block.name;
-      // Attempt rollback: restore consumed resources
-      var requirements = block.requirements;
-      if (requirements != null && requirements.length > 0) {
-        var rollbackMult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
-        var core = getCore(team);
-        if (core != null && core.items != null) {
-          for (var ri = 0; ri < requirements.length; ri++) {
-            var requirement = requirements[ri];
-            if (requirement != null && requirement.item != null && requirement.amount != null) {
-              core.items.add(requirement.item, Math.ceil(requirement.amount * rollbackMult));
-            }
-          }
-        }
-      }
+      if (config.aiDebugHud) state.lastPlaceFail = "construct-fail:" + block.name + ":" + String(e);
+      refundCoreItems(block, team);
       return false;
     }
   } else {
@@ -4206,20 +4265,7 @@ function placeBlock(block, x, y, rotation, team, ignoreReserveItems) {
       }
     } catch (e) {
       if (config.aiDebugHud) state.lastPlaceFail = "place-fail:" + block.name;
-      // Attempt rollback: restore consumed resources
-      var requirements = block.requirements;
-      if (requirements != null && requirements.length > 0) {
-        var rollbackMult = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.buildCostMultiplier : 1;
-        var core = getCore(team);
-        if (core != null && core.items != null) {
-          for (var ri = 0; ri < requirements.length; ri++) {
-            var requirement = requirements[ri];
-            if (requirement != null && requirement.item != null && requirement.amount != null) {
-              core.items.add(requirement.item, Math.ceil(requirement.amount * rollbackMult));
-            }
-          }
-        }
-      }
+      refundCoreItems(block, team);
       return false;
     }
   }
@@ -6957,6 +7003,7 @@ Events.on(WorldLoadEvent, function(){
   rlSocketStopBackgroundThread();
   rlSocketClose();
   if (rlSocket.queue != null) rlSocket.queue.clear();
+  if (rlSocket.queueSize != null) rlSocket.queueSize.set(0);
   rlQMeta = emptyRLMeta();
   rlSchemaLastLoadTick = -9999;
   rlSchemaLastErrorTick = -9999;
@@ -6989,10 +7036,11 @@ Events.on(GameOverEvent, function(e){
   var prevState = state.lastRLState != null ? state.lastRLState : terminalState;
   var terminalInfo = {
     ok: true,
-    terminal: true,
     reason: "gameOver",
-    winner: safeTeamName(winner)
+    winner: safeTeamName(winner),
+    terminal: true
   };
+  terminalInfo.terminal = isTerminalTransition(prevState, terminalState, terminalInfo);
   terminalInfo.reward = computeReward(prevState, terminalState, terminalInfo);
   emitTransition(prevState, "noop", terminalState, terminalInfo);
   state.lastRLState = terminalState;
@@ -7488,17 +7536,22 @@ function runAiStep(core, team) {
   var enemyCore2 = findEnemyCore(team);
   var enemies2 = countEnemyUnits(team);
   var afterState = snapshotState(core2, enemyCore2, enemies2, team);
-  var reward = computeReward(beforeState, afterState, { ok: did });
+  var transitionInfo = { ok: did };
+  var terminal = isTerminalTransition(beforeState, afterState, transitionInfo);
+  transitionInfo.terminal = terminal;
+  var reward = computeReward(beforeState, afterState, transitionInfo);
+  transitionInfo.reward = reward;
   state.lastReward = reward;
   state.lastMicroReward = reward;
-  updateOnlineQTable(beforeState, pickedName, afterState, reward);
-  updateNNModel(beforeState, pickedName, afterState, reward);
+  updateOnlineQTable(beforeState, pickedName, afterState, reward, terminal);
+  updateNNModel(beforeState, pickedName, afterState, reward, terminal);
   saveQTableIfNeeded();
   saveNNModelIfNeeded();
   if (state.pendingMicroTransition != null) {
     var microInfo = {
       ok: did,
       reward: reward,
+      terminal: terminal,
       selectionMode: state.pendingMicroTransition.selectionMode
     };
     if (config.rlMicroLogCandidates) microInfo.actionSpace = state.pendingMicroTransition.options;
@@ -7511,7 +7564,7 @@ function runAiStep(core, team) {
     );
     state.pendingMicroTransition = null;
   }
-  emitTransition(beforeState, pickedName, afterState, { ok: did, reward: reward });
+  emitTransition(beforeState, pickedName, afterState, transitionInfo);
   state.lastRLState = afterState;
 }
 

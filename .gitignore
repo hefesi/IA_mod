@@ -4,6 +4,8 @@ treino-pc.md
 .venv
 node_modules
 __pycache__/
+scripts/__pycache__/
+*.pyc
 .pytest_cache/
 wandb/
 *.parquet

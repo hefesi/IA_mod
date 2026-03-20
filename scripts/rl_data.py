@@ -43,25 +43,56 @@ def iter_rows(log_path, limit=0, transition_type="any"):
         yield flatten_transition(tr)
 
 
-def convert_log_to_parquet(log_path, out_path, limit=0, transition_type="any"):
+def iter_row_batches(log_path, limit=0, transition_type="any", batch_size=2048):
+    if batch_size <= 0:
+        raise ValueError("batch_size_must_be_positive")
+
+    batch = []
+    for row in iter_rows(log_path, limit=limit, transition_type=transition_type):
+        batch.append(row)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+
+    if batch:
+        yield batch
+
+
+def convert_log_to_parquet(log_path, out_path, limit=0, transition_type="any", batch_size=2048):
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
     except Exception as exc:
         raise optional_dependency_error("pyarrow", exc)
 
-    rows = list(iter_rows(log_path, limit=limit, transition_type=transition_type))
-    if not rows:
-        raise ValueError("no_rows_to_export")
-
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist(rows)
-    pq.write_table(table, out)
+    writer = None
+    row_count = 0
+    column_count = 0
+    schema = None
+
+    try:
+        for rows in iter_row_batches(log_path, limit=limit, transition_type=transition_type, batch_size=batch_size):
+            if schema is None:
+                table = pa.Table.from_pylist(rows)
+                schema = table.schema
+                column_count = len(schema.names)
+                writer = pq.ParquetWriter(out, schema)
+            else:
+                table = pa.Table.from_pylist(rows, schema=schema)
+            writer.write_table(table)
+            row_count += len(rows)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if row_count == 0:
+        raise ValueError("no_rows_to_export")
 
     return {
-        "rows": len(rows),
-        "columns": len(rows[0]),
+        "rows": row_count,
+        "columns": column_count,
         "out_path": str(out),
     }
 

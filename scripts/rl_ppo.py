@@ -189,9 +189,6 @@ def main():
     env_factory = build_env_factory(env_mode, args, action_list)
     train_env = VecMonitor(DummyVecEnv([env_factory]))
     eval_env = VecMonitor(DummyVecEnv([env_factory]))
-    train_env.seed(args.seed)
-    eval_seed = args.seed + 1000
-    eval_env.seed(eval_seed)
 
     policy_kwargs = dict(
         activation_fn=torch.nn.Tanh,

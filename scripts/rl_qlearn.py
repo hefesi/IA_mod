@@ -8,6 +8,7 @@ from rl_common import (
     FEATURE_DEFS,
     NORMS,
     encode_state,
+    is_terminal_transition,
     load_transitions,
     reward_from_transition,
 )
@@ -41,13 +42,17 @@ def main():
             a = tr.get("a", "noop")
             a_idx = action_index.get(a, action_index.get("noop", 0))
             r = reward_from_transition(tr)
+            terminal = is_terminal_transition(tr)
             total_r += r
 
             key = encode_state(s)
-            key2 = encode_state(s2)
-            best_next = max(q[key2])
             old = q[key][a_idx]
-            q[key][a_idx] = old + args.alpha * (r + args.gamma * best_next - old)
+            target = r
+            if not terminal:
+                key2 = encode_state(s2)
+                best_next = max(q[key2])
+                target += args.gamma * best_next
+            q[key][a_idx] = old + args.alpha * (target - old)
 
         avg_r = total_r / max(1, len(transitions))
         print("epoch={} avg_reward={:.3f}".format(epoch + 1, avg_r))
