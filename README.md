@@ -1,4 +1,15 @@
-﻿# IA_mod
+﻿# Deprecation Policy for Scripts
+
+**Deprecated modules under scripts/ (ai_socket.js, ai_schema.js, ai_policy.js, ai_actions.js, ai_state.js, ai_ui.js) follow a call-time throw contract:**
+
+- Importing a deprecated module does NOT throw an error immediately.
+- Any attempt to call an exported function from a deprecated module will throw a deprecation error at runtime.
+- Tests for deprecated modules must import the module and invoke at least one exported function, asserting that the deprecation error is thrown.
+
+This contract ensures that static analysis and migration tools can import deprecated modules without breaking, while any actual use of deprecated functionality is immediately and clearly rejected at runtime.
+
+**If you deprecate a module in the future, follow this pattern and update its test accordingly.**
+# IA_mod
 
 ## Executando com argumentos de linha de comando
 
