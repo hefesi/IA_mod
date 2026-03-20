@@ -8,6 +8,19 @@
 
 This contract ensures that static analysis and migration tools can import deprecated modules without breaking, while any actual use of deprecated functionality is immediately and clearly rejected at runtime.
 
+### Comprehensive Coverage of Legacy Public Surfaces
+
+Each deprecated module exposes a complete set of stubs covering the entire legacy public surface:
+
+- **ai_actions.js**: 4 exported functions (executeAction, executeActionDecision, runDirectAction, runActionPlan) - all stubbed with individual deprecation errors
+- **ai_policy.js**: 7 exported functions (selectPolicy, pickPolicyOrder, qScoresForState, nnScoresForState, applyCommandBias, rankActions, policyReadyActions) - all stubbed with individual deprecation errors
+- **ai_schema.js**: 2 exported functions (hasBucketizedFeatures, applyRLMeta) - all stubbed with individual deprecation errors
+- **ai_state.js**: 5 exported functions (snapshotState, emitTransition, emitMicroTransition, emitSocketEvent, safeTeamName) - all stubbed with individual deprecation errors
+- **ai_socket.js**: 13 exported functions + rlSocket object with 3 methods - all stubbed with individual deprecation errors
+- **ai_ui.js**: 3 exported functions (notify, ensureHudButton, buildHudButton) - all stubbed with individual deprecation errors
+
+Each test file (tests/test_ai_*.js) validates that all critical legacy symbols throw explicit deprecation errors when called, ensuring no undefined behavior from accidental usage.
+
 **If you deprecate a module in the future, follow this pattern and update its test accordingly.**
 # IA_mod
 
