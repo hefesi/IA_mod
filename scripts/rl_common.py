@@ -19,6 +19,10 @@ def load_schema(path=SCHEMA_PATH):
         raise ValueError("invalid_rl_schema: features must be a list")
     if not isinstance(norms, dict):
         raise ValueError("invalid_rl_schema: norms must be an object")
+    if any(not isinstance(action, str) or not action for action in actions):
+        raise ValueError("invalid_rl_schema: actions must be non-empty strings")
+    if len(set(actions)) != len(actions):
+        raise ValueError("invalid_rl_schema: actions must be unique")
 
     normalized_features = []
     for idx, feature in enumerate(features):
@@ -32,6 +36,18 @@ def load_schema(path=SCHEMA_PATH):
             raise ValueError("invalid_rl_schema: feature[{}].bins must be a list".format(idx))
         normalized_features.append({"name": name, "bins": list(bins)})
 
+    feature_names = [feature["name"] for feature in normalized_features]
+    if len(set(feature_names)) != len(feature_names):
+        raise ValueError("invalid_rl_schema: feature names must be unique")
+    missing_norms = [name for name in feature_names if name not in norms]
+    extra_norms = [name for name in norms.keys() if name not in feature_names]
+    if missing_norms or extra_norms:
+        raise ValueError(
+            "invalid_rl_schema: norm keys must match features missing={} extra={}".format(
+                missing_norms, extra_norms
+            )
+        )
+
     return {
         "version": raw.get("version", 1),
         "actions": list(actions),
@@ -41,6 +57,7 @@ def load_schema(path=SCHEMA_PATH):
 
 
 SCHEMA = load_schema()
+SCHEMA_VERSION = int(SCHEMA["version"])
 DEFAULT_ACTIONS = list(SCHEMA["actions"])
 FEATURE_DEFS = [{"name": feature["name"], "bins": list(feature["bins"])} for feature in SCHEMA["features"]]
 FEATURE_BUCKETS = [(feature["name"], list(feature["bins"])) for feature in FEATURE_DEFS]
@@ -57,6 +74,24 @@ def num(d, key):
         return float(d.get(key, 0))
     except Exception:
         return 0.0
+
+
+def infer_planet_label(state):
+    if not isinstance(state, dict):
+        return "unknown"
+    if num(state, "planetSerpulo") >= 0.5:
+        return "serpulo"
+    if num(state, "planetErekir") >= 0.5:
+        return "erekir"
+    return "unknown"
+
+
+def transition_planet_label(tr):
+    next_state = tr.get("s2") or {}
+    label = infer_planet_label(next_state)
+    if label != "unknown":
+        return label
+    return infer_planet_label(tr.get("s") or {})
 
 
 def bucketize(val, bins):

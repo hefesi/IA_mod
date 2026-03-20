@@ -129,10 +129,12 @@ def main():
         "policy": meta.get("policy", "categorical"),
         "output": meta.get("output", "logits"),
         "readOnly": True,
+        "schema_version": meta.get("schema_version"),
         "layers": out_layers,
         "features": meta.get("features"),
         "actions": meta.get("actions"),
         "norms": meta.get("norms"),
+        "planet_coverage": meta.get("planet_coverage", {}),
     }
 
     with open(args.out, "w", encoding="utf-8") as f:

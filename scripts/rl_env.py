@@ -6,6 +6,7 @@ from rl_common import (
     DEFAULT_ACTIONS,
     FEATURES,
     encode_state,
+    infer_planet_label,
     is_terminal_transition,
     load_transitions,
     reward_from_transition,
@@ -126,6 +127,7 @@ if gym is not None and np is not None:
             info = {
                 "reset_source": source,
                 "seed": seed if seed is not None else self._default_seed,
+                "planet": infer_planet_label(self.current_state or {}),
             }
             return self._obs(), info
 
@@ -174,6 +176,7 @@ if gym is not None and np is not None:
                 "matched_action": tr.get("a", "noop") == action_name,
                 "episode_reward": self.episode_reward,
                 "step_tick": tr.get("t"),
+                "planet": infer_planet_label(next_state),
             }
             return self._obs(), reward, terminated, truncated, info
 
@@ -236,6 +239,7 @@ if gym is not None and np is not None:
             return {
                 "name": str(name),
                 "steps": steps,
+                "planet": infer_planet_label(steps[0]["state"]),
                 "max_steps": int(raw.get("max_steps", len(steps))),
             }
 
@@ -266,6 +270,7 @@ if gym is not None and np is not None:
             self.episode_reward = 0.0
             info = {
                 "scenario_name": self.current_scenario["name"],
+                "planet": self.current_scenario.get("planet", "unknown"),
                 "seed": seed if seed is not None else self._default_seed,
             }
             return self._obs(), info
@@ -300,6 +305,7 @@ if gym is not None and np is not None:
             truncated = self.steps >= self.max_episode_steps and not terminated
             info = {
                 "scenario_name": self.current_scenario["name"],
+                "planet": self.current_scenario.get("planet", "unknown"),
                 "selected_action": action_name,
                 "preferred_action": step_def.get("preferred_action") or "",
                 "episode_reward": self.episode_reward,

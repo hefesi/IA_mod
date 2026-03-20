@@ -5,7 +5,7 @@ import sys
 from collections import OrderedDict
 from pathlib import Path
 
-from rl_common import DEFAULT_ACTIONS, FEATURES, NORMS, load_transitions
+from rl_common import DEFAULT_ACTIONS, FEATURES, NORMS, SCHEMA_VERSION, infer_planet_label, load_transitions, transition_planet_label
 from rl_data import convert_log_to_parquet
 from rl_env import MindustryDatasetEnv, MindustryScenarioEnv, missing_dependency_message
 
@@ -114,6 +114,50 @@ def maybe_init_wandb(args):
     return run, WandbCallback(verbose=0)
 
 
+def summarize_planet_coverage_from_transitions(transitions):
+    coverage = {}
+    for tr in transitions:
+        label = transition_planet_label(tr)
+        bucket = coverage.setdefault(label, {"transitions": 0, "actions": set()})
+        bucket["transitions"] += 1
+        bucket["actions"].add(tr.get("a", "noop"))
+    return {
+        planet: {
+            "transitions": stats["transitions"],
+            "unique_actions": sorted(stats["actions"]),
+        }
+        for planet, stats in coverage.items()
+    }
+
+
+def summarize_planet_coverage_from_scenarios(path):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    coverage = {}
+    for scenario in payload.get("scenarios") or []:
+        steps = scenario.get("steps") or []
+        if not steps:
+            continue
+        label = infer_planet_label((steps[0] or {}).get("state") or {})
+        bucket = coverage.setdefault(label, {"transitions": 0, "actions": set(), "scenarios": 0})
+        bucket["scenarios"] += 1
+        for step in steps:
+            bucket["transitions"] += 1
+            preferred = step.get("preferred_action")
+            if preferred:
+                bucket["actions"].add(preferred)
+            for action_name in (step.get("transitions") or {}).keys():
+                if action_name != "*":
+                    bucket["actions"].add(action_name)
+    return {
+        planet: {
+            "scenarios": stats["scenarios"],
+            "transitions": stats["transitions"],
+            "unique_actions": sorted(stats["actions"]),
+        }
+        for planet, stats in coverage.items()
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Stable-Baselines3 PPO trainer for Mindustry decision logs/scenarios.")
     parser.add_argument("--env", choices=["auto", "dataset", "scenarios"], default="auto", help="Training environment source.")
@@ -163,6 +207,7 @@ def main():
     action_list = list(DEFAULT_ACTIONS)
     dataset_size = 0
     scenario_count = 0
+    planet_coverage = {}
 
     if env_mode == "dataset":
         transitions, action_list, _ = load_transitions(args.log, limit=args.limit, default_actions=DEFAULT_ACTIONS)
@@ -170,6 +215,7 @@ def main():
         if not transitions:
             print("no_transitions_found")
             sys.exit(1)
+        planet_coverage = summarize_planet_coverage_from_transitions(transitions)
         if args.parquet_out:
             try:
                 stats = convert_log_to_parquet(args.log, args.parquet_out, limit=args.limit, transition_type="any")
@@ -184,6 +230,7 @@ def main():
         if scenario_count == 0:
             print("no_scenarios_found")
             sys.exit(1)
+        planet_coverage = summarize_planet_coverage_from_scenarios(args.scenarios)
 
     set_global_seed(args.seed, np_module=np, torch_module=torch)
     env_factory = build_env_factory(env_mode, args, action_list)
@@ -251,6 +298,7 @@ def main():
         "output": "logits",
         "policy_prefix": "policy_net",
         "value_prefix": "value_net",
+        "schema_version": SCHEMA_VERSION,
         "hidden_activation": "tanh",
         "actions": action_list,
         "features": FEATURES,
@@ -272,6 +320,7 @@ def main():
         "eval_mean_length": eval_mean_length,
         "dataset_transitions": dataset_size,
         "scenario_count": scenario_count,
+        "planet_coverage": planet_coverage,
         "sb3_model": out_sb3,
         "parquet_out": args.parquet_out or "",
     }

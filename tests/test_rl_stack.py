@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from rl_common import DEFAULT_ACTIONS, encode_state  # noqa: E402
+from rl_common import DEFAULT_ACTIONS, FEATURES, SCHEMA_VERSION, encode_state, infer_planet_label  # noqa: E402
 from rl_data import convert_log_to_parquet, run_duckdb_query  # noqa: E402
 from rl_env import IMPORT_ERROR, MindustryScenarioEnv  # noqa: E402
 from rl_socket_server import handle_connection  # noqa: E402
@@ -38,7 +38,21 @@ class RLStackTests(unittest.TestCase):
     def test_scenario_fixture_matches_schema_actions(self):
         payload = json.loads(SCENARIOS_PATH.read_text(encoding="utf-8"))
         self.assertEqual(payload.get("actions"), DEFAULT_ACTIONS)
-        self.assertGreaterEqual(len(payload.get("scenarios") or []), 3)
+        self.assertGreaterEqual(len(payload.get("scenarios") or []), 4)
+
+    def test_scenario_fixture_covers_both_planets(self):
+        payload = json.loads(SCENARIOS_PATH.read_text(encoding="utf-8"))
+        coverage = {}
+        for scenario in payload.get("scenarios") or []:
+            steps = scenario.get("steps") or []
+            self.assertTrue(steps, f"scenario without steps: {scenario.get('name')}")
+            planet = infer_planet_label((steps[0] or {}).get("state") or {})
+            coverage.setdefault(planet, []).append(scenario.get("name"))
+
+        self.assertIn("serpulo", coverage)
+        self.assertIn("erekir", coverage)
+        self.assertGreaterEqual(len(coverage["serpulo"]), 2)
+        self.assertGreaterEqual(len(coverage["erekir"]), 2)
 
     @unittest.skipUnless(HAS_ENV_DEPS, "requires numpy + gymnasium")
     def test_scenario_env_is_deterministic_with_seed(self):
@@ -48,19 +62,30 @@ class RLStackTests(unittest.TestCase):
 
         traj_a = []
         obs, info = env_a.reset(seed=23, options={"scenario_name": "economy-bootstrap"})
-        traj_a.append((obs.tolist(), info["scenario_name"]))
+        traj_a.append((obs.tolist(), info["scenario_name"], info["planet"]))
         for action in actions:
             obs, reward, terminated, truncated, step_info = env_a.step(action)
-            traj_a.append((obs.tolist(), reward, terminated, truncated, step_info["selected_action"]))
+            traj_a.append((obs.tolist(), reward, terminated, truncated, step_info["selected_action"], step_info["planet"]))
 
         traj_b = []
         obs, info = env_b.reset(seed=23, options={"scenario_name": "economy-bootstrap"})
-        traj_b.append((obs.tolist(), info["scenario_name"]))
+        traj_b.append((obs.tolist(), info["scenario_name"], info["planet"]))
         for action in actions:
             obs, reward, terminated, truncated, step_info = env_b.step(action)
-            traj_b.append((obs.tolist(), reward, terminated, truncated, step_info["selected_action"]))
+            traj_b.append((obs.tolist(), reward, terminated, truncated, step_info["selected_action"], step_info["planet"]))
 
         self.assertEqual(traj_a, traj_b)
+        self.assertEqual(traj_a[0][2], "serpulo")
+
+    @unittest.skipUnless(HAS_ENV_DEPS, "requires numpy + gymnasium")
+    def test_scenario_env_exposes_planet_context(self):
+        env = MindustryScenarioEnv.from_file(SCENARIOS_PATH, seed=11)
+
+        _, info = env.reset(seed=11, options={"scenario_name": "erekir-supply-ramp"})
+        self.assertEqual(info["planet"], "erekir")
+
+        _, _, _, _, step_info = env.step(DEFAULT_ACTIONS.index("mine"))
+        self.assertEqual(step_info["planet"], "erekir")
 
     @unittest.skipUnless(HAS_DATA_DEPS, "requires pyarrow + duckdb")
     def test_parquet_and_duckdb_roundtrip(self):
@@ -240,6 +265,13 @@ class RLStackTests(unittest.TestCase):
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertEqual(meta.get("algorithm"), "stable-baselines3-ppo")
             self.assertEqual(meta.get("env_mode"), "scenarios")
+            self.assertEqual(meta.get("schema_version"), SCHEMA_VERSION)
+            self.assertEqual(meta.get("features"), FEATURES)
+            self.assertEqual(meta.get("actions"), DEFAULT_ACTIONS)
+            self.assertIn("serpulo", meta.get("planet_coverage", {}))
+            self.assertIn("erekir", meta.get("planet_coverage", {}))
+            self.assertGreater(meta["planet_coverage"]["serpulo"].get("transitions", 0), 0)
+            self.assertGreater(meta["planet_coverage"]["erekir"].get("transitions", 0), 0)
             self.assertTrue(model_path.exists())
             self.assertTrue(meta_path.exists())
             self.assertTrue(raw_path.exists())

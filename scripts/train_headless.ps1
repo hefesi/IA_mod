@@ -30,7 +30,14 @@ param(
     [string[]]$CurriculumMaps = @(),
     [string[]]$CurriculumModes = @(),
     [string[]]$CurriculumCommands = @(),
+    [string[]]$SerpuloMaps = @(),
+    [string[]]$SerpuloModes = @(),
+    [string[]]$SerpuloCommands = @(),
+    [string[]]$ErekirMaps = @(),
+    [string[]]$ErekirModes = @(),
+    [string[]]$ErekirCommands = @(),
     [int]$CurriculumRuns = 0,
+    [int]$PlanetCurriculumRuns = 0,
     [switch]$CurriculumRandomize,
     [int]$CurriculumSeed = 7,
     [int]$CurriculumDelay = 2,
@@ -51,6 +58,8 @@ param(
     [string]$WandbRunName = "",
     [switch]$WandbOffline,
     [switch]$Validate,
+    [int]$MinPlanetTransitions = 40,
+    [int]$MinPlanetActions = 3,
     [switch]$AppendLog,
     [switch]$NoWait,
     [switch]$NoHost
@@ -200,6 +209,73 @@ function New-CurriculumSpecs {
     return $specs
 }
 
+function Clone-CurriculumSpec {
+    param(
+        [pscustomobject]$Spec,
+        [int]$Index,
+        [string]$Planet
+    )
+
+    $planetLabel = if ([string]::IsNullOrWhiteSpace($Planet)) { "mixed" } else { $Planet.Trim().ToLowerInvariant() }
+    return [pscustomobject]@{
+        Index = $Index
+        Label = "$planetLabel/$($Spec.Label)"
+        Command = $Spec.Command
+        Map = $Spec.Map
+        Mode = $Spec.Mode
+        Planet = $planetLabel
+    }
+}
+
+function New-PlanetBalancedSpecs {
+    param(
+        [string[]]$SerpuloMapList,
+        [string[]]$SerpuloModeList,
+        [string[]]$SerpuloCommandList,
+        [string[]]$ErekirMapList,
+        [string[]]$ErekirModeList,
+        [string[]]$ErekirCommandList,
+        [int]$RunCount,
+        [switch]$Randomize,
+        [int]$Seed
+    )
+
+    $serpuloRequested = (Get-CleanList -Items $SerpuloMapList).Count -gt 0 -or (Get-CleanList -Items $SerpuloModeList).Count -gt 0 -or (Get-CleanList -Items $SerpuloCommandList).Count -gt 0
+    $erekirRequested = (Get-CleanList -Items $ErekirMapList).Count -gt 0 -or (Get-CleanList -Items $ErekirModeList).Count -gt 0 -or (Get-CleanList -Items $ErekirCommandList).Count -gt 0
+
+    if (-not $serpuloRequested -and -not $erekirRequested) {
+        return @()
+    }
+
+    $targetRuns = if ($RunCount -gt 0) { $RunCount } else { 1 }
+    $serpuloSpecs = if ($serpuloRequested) {
+        New-CurriculumSpecs -BaseMap "" -BaseMode "" -MapList $SerpuloMapList -ModeList $SerpuloModeList -CommandList $SerpuloCommandList -RunCount $targetRuns -Randomize:$Randomize -Seed $Seed
+    } else {
+        @()
+    }
+    $erekirSpecs = if ($erekirRequested) {
+        New-CurriculumSpecs -BaseMap "" -BaseMode "" -MapList $ErekirMapList -ModeList $ErekirModeList -CommandList $ErekirCommandList -RunCount $targetRuns -Randomize:$Randomize -Seed ($Seed + 17)
+    } else {
+        @()
+    }
+
+    $combined = @()
+    $nextIndex = 1
+    $maxRuns = [Math]::Max($serpuloSpecs.Count, $erekirSpecs.Count)
+    for ($i = 0; $i -lt $maxRuns; $i++) {
+        if ($i -lt $serpuloSpecs.Count) {
+            $combined += Clone-CurriculumSpec -Spec $serpuloSpecs[$i] -Index $nextIndex -Planet "serpulo"
+            $nextIndex++
+        }
+        if ($i -lt $erekirSpecs.Count) {
+            $combined += Clone-CurriculumSpec -Spec $erekirSpecs[$i] -Index $nextIndex -Planet "erekir"
+            $nextIndex++
+        }
+    }
+
+    return $combined
+}
+
 function Clear-FileIfNeeded {
     param([string]$PathToClear, [switch]$KeepExisting)
     if ($KeepExisting) { return }
@@ -347,7 +423,7 @@ if ($NoWait -and $Timeout -eq 0 -and $MaxTransitions -eq 0) {
     exit 1
 }
 
-if ($NoHost -and (($CurriculumRuns -gt 1) -or $CurriculumMaps.Count -gt 0 -or $CurriculumModes.Count -gt 0 -or $CurriculumCommands.Count -gt 0)) {
+if ($NoHost -and (($CurriculumRuns -gt 1) -or $CurriculumMaps.Count -gt 0 -or $CurriculumModes.Count -gt 0 -or $CurriculumCommands.Count -gt 0 -or $SerpuloMaps.Count -gt 0 -or $SerpuloModes.Count -gt 0 -or $SerpuloCommands.Count -gt 0 -or $ErekirMaps.Count -gt 0 -or $ErekirModes.Count -gt 0 -or $ErekirCommands.Count -gt 0 -or $PlanetCurriculumRuns -gt 0)) {
     Write-Error "NoHost nao pode ser combinado com curriculo automatico."
     exit 1
 }
@@ -372,6 +448,7 @@ $socketScript = Resolve-PathIfRelative -Path "scripts/rl_socket_server.py" -Base
 $ppoScript = Resolve-PathIfRelative -Path "scripts/rl_ppo.py" -Base $modRoot
 $exportScript = Resolve-PathIfRelative -Path "scripts/rl_export_nn_json.py" -Base $modRoot
 $validateScript = Resolve-PathIfRelative -Path "scripts/validate_rl_stack.py" -Base $modRoot
+$evaluateScript = Resolve-PathIfRelative -Path "scripts/evaluate_ai.py" -Base $modRoot
 $logPath = Resolve-PathIfRelative -Path $LogFile -Base $modRoot
 $outModelPath = Resolve-PathIfRelative -Path $OutModel -Base $modRoot
 $outMetaPath = Resolve-PathIfRelative -Path $OutMeta -Base $modRoot
@@ -388,12 +465,20 @@ try {
             Command = ""
             Map = ""
             Mode = ""
+            Planet = ""
         })
+    } elseif ($SerpuloMaps.Count -gt 0 -or $SerpuloModes.Count -gt 0 -or $SerpuloCommands.Count -gt 0 -or $ErekirMaps.Count -gt 0 -or $ErekirModes.Count -gt 0 -or $ErekirCommands.Count -gt 0 -or $PlanetCurriculumRuns -gt 0) {
+        New-PlanetBalancedSpecs -SerpuloMapList $SerpuloMaps -SerpuloModeList $SerpuloModes -SerpuloCommandList $SerpuloCommands -ErekirMapList $ErekirMaps -ErekirModeList $ErekirModes -ErekirCommandList $ErekirCommands -RunCount $PlanetCurriculumRuns -Randomize:$CurriculumRandomize -Seed $CurriculumSeed
     } else {
         New-CurriculumSpecs -BaseMap $Map -BaseMode $Mode -MapList $CurriculumMaps -ModeList $CurriculumModes -CommandList $CurriculumCommands -RunCount $CurriculumRuns -Randomize:$CurriculumRandomize -Seed $CurriculumSeed
     }
 } catch {
     Write-Error $_
+    exit 1
+}
+
+if (-not $specs -or $specs.Count -eq 0) {
+    Write-Error "Nenhuma rodada de coleta foi definida. Informe mapas/comandos do curriculo."
     exit 1
 }
 
@@ -406,6 +491,9 @@ Write-Host "Usando Python: $python"
 Write-Host "Rodadas de coleta: $($specs.Count)"
 if ($CurriculumRandomize) {
     Write-Host "Curriculo aleatorio ativo (seed=$CurriculumSeed)." -ForegroundColor Cyan
+}
+if (($specs | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Planet) }).Count -gt 0) {
+    Write-Host "Curriculo balanceado por planeta ativo." -ForegroundColor Cyan
 }
 
 foreach ($spec in $specs) {
@@ -500,6 +588,13 @@ if ($Validate) {
     & $python $validateScript
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Falha na validacao automatica da stack RL"
+        exit 1
+    }
+
+    Write-Host "Validando contrato do modelo e cobertura minima por planeta..." -ForegroundColor Cyan
+    & $python $evaluateScript --log $logPath --min-planet-transitions $MinPlanetTransitions --min-planet-actions $MinPlanetActions
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Falha na avaliacao automatica de contrato/cobertura RL"
         exit 1
     }
 }

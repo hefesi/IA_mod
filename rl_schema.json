@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "actions": [
     "attackWave",
     "rally",
@@ -44,7 +44,18 @@
     { "name": "coreHealthFrac", "bins": [0.1, 0.25, 0.5, 0.75, 0.9] },
     { "name": "corePresent", "bins": [0.5] },
     { "name": "enemyCore", "bins": [0.5] },
-    { "name": "distEnemy", "bins": [5, 10, 20, 40, 80] }
+    { "name": "distEnemy", "bins": [5, 10, 20, 40, 80] },
+    { "name": "planetId", "bins": [0.5, 1.5, 2.5, 4.5, 8.5] },
+    { "name": "gamemodeId", "bins": [0.5, 1.5, 2.5, 3.5, 4.5] },
+    { "name": "planetSerpulo", "bins": [0.5] },
+    { "name": "planetErekir", "bins": [0.5] },
+    { "name": "campaignMode", "bins": [0.5] },
+    { "name": "wavesMode", "bins": [0.5] },
+    { "name": "attackMode", "bins": [0.5] },
+    { "name": "pvpMode", "bins": [0.5] },
+    { "name": "infiniteResourcesMode", "bins": [0.5] },
+    { "name": "unitAmmoMode", "bins": [0.5] },
+    { "name": "environmentId", "bins": [1, 2, 4, 8, 16] }
   ],
   "norms": {
     "resourceTier1": 2000.0,
@@ -79,6 +90,17 @@
     "coreHealthFrac": 1.0,
     "corePresent": 1.0,
     "enemyCore": 1.0,
-    "distEnemy": 100.0
+    "distEnemy": 100.0,
+    "planetId": 16.0,
+    "gamemodeId": 5.0,
+    "planetSerpulo": 1.0,
+    "planetErekir": 1.0,
+    "campaignMode": 1.0,
+    "wavesMode": 1.0,
+    "attackMode": 1.0,
+    "pvpMode": 1.0,
+    "infiniteResourcesMode": 1.0,
+    "unitAmmoMode": 1.0,
+    "environmentId": 64.0
   }
 }
