@@ -428,6 +428,15 @@ var aiHud = {
   useIcon: false
 };
 
+var runtimeGuardState = {
+  errorTicks: {},
+  pathSelections: {},
+  lastResolvedPaths: {},
+  modRootFi: null,
+  modRootSource: "",
+  modRootResolved: false
+};
+
 function rlSocketConnected() {
   return rlSocket.sock != null && rlSocket.out != null;
 }
@@ -448,6 +457,98 @@ function tileCenterToWorld(x, y) {
     x: x * size + size / 2,
     y: y * size + size / 2
   };
+}
+
+function runtimeGuardInterval() {
+  return config.safeModeLogInterval != null ? config.safeModeLogInterval : 600;
+}
+
+function pushUniqueText(list, value) {
+  if (list == null || value == null) return;
+  var text = null;
+  try {
+    text = String(value);
+  } catch (e) {
+    text = null;
+  }
+  if (text == null || text == "" || text == "undefined") return;
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] == text) return;
+  }
+  list.push(text);
+}
+
+function errorDetailString(err) {
+  var details = [];
+  pushUniqueText(details, err);
+  try {
+    if (err != null && err.message != null) pushUniqueText(details, err.message);
+  } catch (e) {
+    // ignore
+  }
+  try {
+    if (err != null && err.fileName != null) {
+      var location = String(err.fileName);
+      if (err.lineNumber != null) location += ":" + err.lineNumber;
+      pushUniqueText(details, location);
+    }
+  } catch (e2) {
+    // ignore
+  }
+  try {
+    if (err != null && err.javaException != null) pushUniqueText(details, err.javaException);
+  } catch (e3) {
+    // ignore
+  }
+  try {
+    if (err != null && err.rhinoException != null) pushUniqueText(details, err.rhinoException);
+  } catch (e4) {
+    // ignore
+  }
+  try {
+    if (err != null && err.stack != null) pushUniqueText(details, err.stack);
+  } catch (e5) {
+    // ignore
+  }
+  return details.length > 0 ? details.join(" | ") : "erro desconhecido";
+}
+
+function logFullError(label, err) {
+  Log.err("[IA] " + label + ": " + errorDetailString(err));
+  try {
+    if (err != null && err.rhinoException != null && err.rhinoException.printStackTrace != null) {
+      err.rhinoException.printStackTrace();
+    }
+  } catch (e) {
+    // ignore
+  }
+  try {
+    if (err != null && err.javaException != null && err.javaException.printStackTrace != null) {
+      err.javaException.printStackTrace();
+    }
+  } catch (e2) {
+    // ignore
+  }
+}
+
+function logThrottledError(key, label, err, interval) {
+  var nowTick = state != null && state.tick != null ? state.tick : 0;
+  var lastTick = runtimeGuardState.errorTicks[key];
+  var minInterval = interval != null ? interval : runtimeGuardInterval();
+  if (lastTick != null && nowTick >= lastTick && (nowTick - lastTick) < minInterval) return;
+  runtimeGuardState.errorTicks[key] = nowTick;
+  logFullError(label, err);
+}
+
+function runGuardedCallbackStep(key, label, fn) {
+  if (fn == null) return false;
+  try {
+    fn();
+    return true;
+  } catch (e) {
+    logThrottledError(key, label, e, runtimeGuardInterval());
+    return false;
+  }
 }
 
 function invalidatePlanningCaches(resetDemand) {
@@ -641,15 +742,69 @@ function emptyUnitSummary() {
   };
 }
 
+function safeValueOrCall(target, memberName, fallback) {
+  if (target == null || memberName == null) return fallback;
+  var member = null;
+  try {
+    member = target[memberName];
+  } catch (e) {
+    return fallback;
+  }
+  if (member == null || typeof member === "undefined") return fallback;
+  var memberType = typeof member;
+  if (memberType == "boolean" || memberType == "number" || memberType == "string") return member;
+  if (memberType != "function") return member;
+  try {
+    return target[memberName]();
+  } catch (e2) {
+    return fallback;
+  }
+}
+
+function hasCompatMember(target, memberName) {
+  if (target == null || memberName == null) return false;
+  try {
+    var member = target[memberName];
+    return member != null && typeof member !== "undefined";
+  } catch (e) {
+    return false;
+  }
+}
+
+function safePlayerTeam(player) {
+  return safeValueOrCall(player, "team", null);
+}
+
+function safePlayerCore(player) {
+  return safeValueOrCall(player, "core", null);
+}
+
+function safePlayerUnit(player) {
+  return safeValueOrCall(player, "unit", null);
+}
+
+function safePlayerIsLocal(player) {
+  var value = safeValueOrCall(player, "isLocal", false);
+  if (value === true || value === false) return value;
+  try {
+    var text = String(value).toLowerCase();
+    if (text == "true") return true;
+    if (text == "false") return false;
+  } catch (e0) {
+    // ignore
+  }
+  try {
+    return Boolean(value);
+  } catch (e) {
+    return false;
+  }
+}
+
 function getLocalPlayerUnitId() {
   var player = getLocalPlayer();
   if (player == null) return -1;
-  try {
-    var unit = player.unit();
-    if (unit != null) return unit.id;
-  } catch (e) {
-    // ignore
-  }
+  var unit = safePlayerUnit(player);
+  if (unit != null && unit.id != null) return unit.id;
   return -1;
 }
 
@@ -811,27 +966,248 @@ function applyRLMeta(data) {
   return true;
 }
 
-function resolveSchemaFi() {
-  if (config.rlSchemaPath != null && config.rlSchemaPath != "") {
-    try {
-      return new Fi(config.rlSchemaPath);
-    } catch (e) {
-      return null;
-    }
+function normalizeLookupName(value) {
+  if (value == null) return "";
+  try {
+    return String(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+  } catch (e) {
+    return "";
+  }
+}
+
+function appendUniqueValue(list, value) {
+  if (list == null || value == null) return;
+  var text = null;
+  try {
+    text = String(value);
+  } catch (e) {
+    text = null;
+  }
+  if (text == null || text == "") return;
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] == text) return;
+  }
+  list.push(text);
+}
+
+function fiChildPath(base, relativePath) {
+  if (base == null) return null;
+  if (relativePath == null || relativePath == "") return base;
+  var out = base;
+  var parts = String(relativePath).split(/[\\\/]+/);
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i] == null || parts[i] == "") continue;
+    out = out.child(parts[i]);
+    if (out == null) return null;
+  }
+  return out;
+}
+
+function fiAbsolutePathSafe(fi) {
+  if (fi == null) return "<null>";
+  try {
+    return String(fi.absolutePath());
+  } catch (e) {
+    // ignore
   }
   try {
-    var mod = Vars.mods.getMod(config.modName);
-    if (mod != null && mod.root != null) {
-      return mod.root.child(config.rlSchemaFile);
-    }
+    return String(fi.path());
   } catch (e2) {
     // ignore
   }
   try {
-    return new Fi(config.rlSchemaFile);
+    return String(fi);
   } catch (e3) {
+    return "<unavailable>";
+  }
+}
+
+function logPathSelection(kind, source, fi) {
+  if (kind == null || source == null || fi == null) return;
+  var path = fiAbsolutePathSafe(fi);
+  var key = String(kind) + "|" + String(source) + "|" + path;
+  if (runtimeGuardState.pathSelections[key] === true) return;
+  runtimeGuardState.pathSelections[key] = true;
+  runtimeGuardState.lastResolvedPaths[kind] = { source: String(source), path: path };
+  Log.info("[RL] " + kind + " path source=" + source + " path=" + path);
+}
+
+function resolvedPathLabel(kind, fallbackName) {
+  var info = runtimeGuardState.lastResolvedPaths[kind];
+  if (info == null) return String(fallbackName);
+  return info.path + " (source=" + info.source + ")";
+}
+
+function modCandidateNames(mod) {
+  var names = [];
+  if (mod == null) return names;
+  try {
+    appendUniqueValue(names, mod.name);
+  } catch (e) {
+    // ignore
+  }
+  try {
+    if (mod.meta != null) appendUniqueValue(names, mod.meta.name);
+  } catch (e2) {
+    // ignore
+  }
+  try {
+    if (mod.meta != null) appendUniqueValue(names, mod.meta.displayName);
+  } catch (e3) {
+    // ignore
+  }
+  return names;
+}
+
+function rootContainsPath(root, relativePath) {
+  var fi = fiChildPath(root, relativePath);
+  if (fi == null) return false;
+  try {
+    return fi.exists();
+  } catch (e) {
+    return false;
+  }
+}
+
+function resolveCurrentModRoot() {
+  if (runtimeGuardState.modRootResolved && runtimeGuardState.modRootFi != null) {
+    return {
+      fi: runtimeGuardState.modRootFi,
+      source: runtimeGuardState.modRootSource
+    };
+  }
+
+  runtimeGuardState.modRootResolved = true;
+  runtimeGuardState.modRootFi = null;
+  runtimeGuardState.modRootSource = "";
+
+  var targetNames = {};
+  var configName = normalizeLookupName(config.modName);
+  if (configName != "") targetNames[configName] = true;
+
+  var best = null;
+  try {
+    var mods = Vars.mods != null ? Vars.mods.list() : null;
+    eachSeq(mods, function(mod){
+      if (mod == null) return;
+      var root = null;
+      try {
+        root = mod.root;
+      } catch (e0) {
+        root = null;
+      }
+      if (root == null) return;
+
+      var names = modCandidateNames(mod);
+      var score = 0;
+      var reasons = [];
+      if (rootContainsPath(root, "scripts/ai.js")) {
+        score += 120;
+        reasons.push("scripts/ai.js");
+      }
+      if (rootContainsPath(root, "mod.json")) {
+        score += 30;
+        reasons.push("mod.json");
+      }
+      if (config.rlSchemaFile != null && config.rlSchemaFile != "" && rootContainsPath(root, config.rlSchemaFile)) {
+        score += 14;
+        reasons.push(config.rlSchemaFile);
+      }
+      if (config.rlQTableFile != null && config.rlQTableFile != "" && rootContainsPath(root, config.rlQTableFile)) {
+        score += 14;
+        reasons.push(config.rlQTableFile);
+      }
+      if (config.rlNNFile != null && config.rlNNFile != "" && rootContainsPath(root, config.rlNNFile)) {
+        score += 14;
+        reasons.push(config.rlNNFile);
+      }
+      if (config.rlMicroPolicyDir != null && config.rlMicroPolicyDir != "" && rootContainsPath(root, config.rlMicroPolicyDir)) {
+        score += 6;
+        reasons.push(config.rlMicroPolicyDir);
+      }
+      for (var i = 0; i < names.length; i++) {
+        if (targetNames[normalizeLookupName(names[i])] === true) {
+          score += 10;
+          reasons.push("name-match");
+          break;
+        }
+      }
+      if (score <= 0) return;
+      if (best == null || score > best.score) {
+        best = {
+          score: score,
+          fi: root,
+          source: "mods.list:" + (names.length > 0 ? names.join("/") : "unnamed") + " [" + reasons.join(", ") + "]"
+        };
+      }
+    });
+  } catch (e1) {
+    logThrottledError("mod-root-resolve", "Erro ao varrer mods para resolver a raiz", e1, runtimeGuardInterval());
+  }
+
+  if (best != null) {
+    runtimeGuardState.modRootFi = best.fi;
+    runtimeGuardState.modRootSource = best.source;
+    logPathSelection("mod-root", best.source, best.fi);
+  } else {
+    runtimeGuardState.modRootResolved = false;
+  }
+
+  return {
+    fi: runtimeGuardState.modRootFi,
+    source: runtimeGuardState.modRootSource
+  };
+}
+
+function resolveRLFileFi(kind, fileName, overridePath, relativeDir) {
+  if (fileName == null || fileName == "") return null;
+  if (overridePath != null && overridePath != "") {
+    try {
+      var overrideFi = new Fi(overridePath);
+      logPathSelection(kind, "config-path", overrideFi);
+      return overrideFi;
+    } catch (e) {
+      logThrottledError("resolve-path:" + kind, "Erro ao resolver override path de " + kind, e, runtimeGuardInterval());
+    }
+  }
+
+  var rootInfo = resolveCurrentModRoot();
+  if (rootInfo != null && rootInfo.fi != null) {
+    try {
+      var base = fiChildPath(rootInfo.fi, relativeDir);
+      var rootFi = fiChildPath(base, fileName);
+      if (rootFi != null) {
+        logPathSelection(kind, rootInfo.source, rootFi);
+        return rootFi;
+      }
+    } catch (e2) {
+      logThrottledError("resolve-mod-root:" + kind, "Erro ao resolver " + kind + " via mod root", e2, runtimeGuardInterval());
+    }
+  }
+
+  if (relativeDir != null && relativeDir != "") {
+    try {
+      var relativeDirFi = fiChildPath(new Fi(relativeDir), fileName);
+      if (relativeDirFi != null) {
+        logPathSelection(kind, "fs-relative-dir", relativeDirFi);
+        return relativeDirFi;
+      }
+    } catch (e3) {
+      // ignore
+    }
+  }
+
+  try {
+    var relativeFi = new Fi(fileName);
+    logPathSelection(kind, "fs-relative", relativeFi);
+    return relativeFi;
+  } catch (e4) {
     return null;
   }
+}
+
+function resolveSchemaFi() {
+  return resolveRLFileFi("schema", config.rlSchemaFile, config.rlSchemaPath, "");
 }
 
 function loadRLSchema(force) {
@@ -841,7 +1217,7 @@ function loadRLSchema(force) {
   var fi = resolveSchemaFi();
   if (fi == null || !fi.exists()) {
     if ((state.tick - rlSchemaLastErrorTick) > 600) {
-      Log.info("[RL] Schema nao encontrado: " + config.rlSchemaFile);
+      Log.info("[RL] Schema nao encontrado: " + resolvedPathLabel("schema", config.rlSchemaFile));
       rlSchemaLastErrorTick = state.tick;
     }
     return false;
@@ -1647,12 +2023,7 @@ function isCommandAIController(controller) {
 function ensurePlayerControlled() {
   var player = getLocalPlayer();
   if (player == null) return;
-  var unit = null;
-  try {
-    unit = player.unit();
-  } catch (e) {
-    unit = null;
-  }
+  var unit = safePlayerUnit(player);
   // Enquanto o player estiver sem unidade viva (spawn/morte), nao tenta reassumir controle.
   if (!isUnitUsable(unit)) {
     state.playerControllerMode = "player";
@@ -1681,7 +2052,9 @@ function ensurePlayerControlled() {
   // Player mode is determined by: controller is not CommandAI AND this unit is the player's current unit.
   // This avoids wrapper instability while maintaining deterministic ownership semantics.
   var currentModeIsAi = isCommandAIController(controller);
-  var currentModeIsPlayer = (controller != null && !isCommandAIController(controller) && player.unit() === unit);
+  var currentPlayerUnit = safePlayerUnit(player);
+  var currentPlayerUnitId = (currentPlayerUnit != null && currentPlayerUnit.id != null) ? currentPlayerUnit.id : -1;
+  var currentModeIsPlayer = (controller != null && !isCommandAIController(controller) && currentPlayerUnitId === unitId);
   var currentModeMatches = (desiredMode === "ai" && currentModeIsAi) || (desiredMode === "player" && currentModeIsPlayer);
 
   // Avoid repeatedly reassigning controller every tick when the mode is already correct.
@@ -2972,26 +3345,7 @@ function computePowerStatus(team) {
 }
 
 function resolveQTableFi() {
-  if (config.rlQTablePath != null && config.rlQTablePath != "") {
-    try {
-      return new Fi(config.rlQTablePath);
-    } catch (e) {
-      return null;
-    }
-  }
-  try {
-    var mod = Vars.mods.getMod(config.modName);
-    if (mod != null && mod.root != null) {
-      return mod.root.child(config.rlQTableFile);
-    }
-  } catch (e2) {
-    // ignore
-  }
-  try {
-    return new Fi(config.rlQTableFile);
-  } catch (e3) {
-    return null;
-  }
+  return resolveRLFileFi("qtable", config.rlQTableFile, config.rlQTablePath, "");
 }
 
 function loadQTable() {
@@ -2999,7 +3353,7 @@ function loadQTable() {
   var fi = resolveQTableFi();
   if (fi == null || !fi.exists()) {
     if ((state.tick - rlQTableLastErrorTick) > 600) {
-      Log.info("[RL] Q-table nao encontrada: " + config.rlQTableFile);
+      Log.info("[RL] Q-table nao encontrada: " + resolvedPathLabel("qtable", config.rlQTableFile));
       rlQTableLastErrorTick = state.tick;
     }
     rlQTable = null;
@@ -3032,26 +3386,7 @@ function loadQTable() {
 }
 
 function resolveNNFi() {
-  if (config.rlNNPath != null && config.rlNNPath != "") {
-    try {
-      return new Fi(config.rlNNPath);
-    } catch (e) {
-      return null;
-    }
-  }
-  try {
-    var mod = Vars.mods.getMod(config.modName);
-    if (mod != null && mod.root != null) {
-      return mod.root.child(config.rlNNFile);
-    }
-  } catch (e2) {
-    // ignore
-  }
-  try {
-    return new Fi(config.rlNNFile);
-  } catch (e3) {
-    return null;
-  }
+  return resolveRLFileFi("nn-model", config.rlNNFile, config.rlNNPath, "");
 }
 
 function initializeNNModel(features, actions) {
@@ -3100,7 +3435,7 @@ function loadNNModel() {
   var fi = resolveNNFi();
   if (fi == null || !fi.exists()) {
     if ((state.tick - state.nnLastErrorTick) > 600) {
-      Log.info("[RL] NN model nao encontrado: " + config.rlNNFile);
+      Log.info("[RL] NN model nao encontrado: " + resolvedPathLabel("nn-model", config.rlNNFile));
       state.nnLastErrorTick = state.tick;
     }
     if (config.rlNNBootstrapMissing && rlQMeta && rlQMeta.features && rlQMeta.actions) {
@@ -3203,19 +3538,7 @@ function initializeMicroPolicyModel(actionName) {
 function resolveMicroPolicyFi(actionName) {
   if (actionName == null || actionName == "") return null;
   var fileName = String(config.rlMicroPolicyFilePattern || "micro_{action}.json").replace("{action}", actionName);
-  try {
-    if (config.rlMicroPolicyDir != null && config.rlMicroPolicyDir != "") {
-      var mod = Vars.mods.getMod(config.modName);
-      if (mod != null && mod.root != null) return mod.root.child(config.rlMicroPolicyDir).child(fileName);
-    }
-  } catch (e) {
-    // ignore
-  }
-  try {
-    return new Fi(fileName);
-  } catch (e2) {
-    return null;
-  }
+  return resolveRLFileFi("micro-policy:" + actionName, fileName, "", config.rlMicroPolicyDir);
 }
 
 function microPolicyFileCandidates(actionName) {
@@ -3986,16 +4309,25 @@ function saveQTable() {
 
 function getTeam() {
   var player = getLocalPlayer();
-  if (player != null) return player.team();
-  return Vars.state.rules.defaultTeam;
+  var team = safePlayerTeam(player);
+  if (team != null) return team;
+  try {
+    if (Vars.state != null && Vars.state.rules != null) return Vars.state.rules.defaultTeam;
+  } catch (e) {
+    // ignore
+  }
+  return null;
 }
 
 function getCore(team) {
   var player = getLocalPlayer();
-  if (player != null && player.core() != null) return player.core();
+  var playerCore = safePlayerCore(player);
+  if (playerCore != null) return playerCore;
+  if (team == null) team = getTeam();
+  if (team == null) return null;
   try {
     var data = Vars.state.teams.get(team);
-    if (data != null) return data.core();
+    if (data != null) return safeValueOrCall(data, "core", null);
   } catch (e) {
     // ignore
   }
@@ -4008,7 +4340,7 @@ function getLocalPlayer() {
   var found = null;
   try {
     Groups.player.each(function(p){
-      if (found == null && p != null && p.isLocal != null && p.isLocal()) found = p;
+      if (found == null && p != null && hasCompatMember(p, "isLocal") && safePlayerIsLocal(p)) found = p;
     });
     if (found == null) {
       Groups.player.each(function(p){
@@ -5077,11 +5409,7 @@ function placeBlock(block, x, y, rotation, team, ignoreReserveItems) {
   }
   var builderUnit = null;
   if (player != null) {
-    try {
-      builderUnit = player.unit();
-    } catch (e) {
-      builderUnit = null;
-    }
+    builderUnit = safePlayerUnit(player);
   }
   if (player != null && isUnitUsable(builderUnit)) {
     try {
@@ -8153,88 +8481,109 @@ function ensureConfiguredBlock(block, prefX, prefY, radius, rotation, team, conf
 }
 
 Events.on(WorldLoadEvent, function(){
-  state.built = false;
-  state.lastMode = "";
-  state.tick = 0;
-  state.lastWaveTick = -9999;
-  state.lastRallyTick = -9999;
-  state.waveIndex = 0;
-  state.drillCount = 0;
-  state.turretCount = 0;
-  state.powerClusters = 0;
-  state.pumpCount = 0;
-  state.liquidHubCount = 0;
-  state.thermalCount = 0;
-  state.industryBlocks = 0;
-  state.factoryBlocks = 0;
-  state.actionHistory = [];
-  state.lastActionTicks = {};
-  state.lastMicroAction = "";
-  state.aiEnabled = config.aiEnabledDefault === true;
-  state.observerMode = config.observerMode === true;
-  state.playerTakeoverEnabled = config.aiControlPlayerUnit === true;
-  state.lastFactoryConfigTick = -9999;
-  state.lastErrorTick = -9999;
-  state.lastTapTick = -9999;
-  state.lastTapX = -1;
-  state.lastTapY = -1;
-  state.lastWarnTick = -9999;
-  state.lastReward = 0;
-  state.lastQSaveTick = -9999;
-  state.lastLogicTick = -9999;
-  state.currentStrategy = "balanced";
-  state.lastStrategyTick = -9999;
-  state.playerControlledUnitId = -1;
-  state.playerControllerMode = null;
-  state.playerControllerSet = false;
-  state.lastControllerAttemptTick = -9999;
-  state.controllerResetPenalty = 0;
-  state.nnModel = null;
-  state.nnLastLoadTick = -9999;
-  state.nnLastSaveTick = -9999;
-  state.nnLastErrorTick = -9999;
-  state.microPolicies = {};
-  state.microLastLoadTicks = {};
-  state.microLastErrorTicks = {};
-  state.pendingMicroTransition = null;
-  state.rlEpsilon = config.rlEpsilon != null ? config.rlEpsilon : -1;
-  state.lastRLState = null;
-  state.lastMicroReward = 0;
-  state.gameOverEventSent = false;
-  state.contentDemandTick = -9999;
-  state.contentDemand = {};
-  state.contentDemandSimple = {};
-  state.contentDemandProfile = {};
-  state.buildSummaryTick = -9999;
-  state.buildSummaryCache = {};
-  state.unitSummaryTick = -9999;
-  state.unitSummaryCache = {};
-  state.runtimeEconomyTick = -9999;
-  state.runtimeEconomyContext = "";
-  state.lastEconomicFocus = null;
-  state.logicControllers = { ground: null, air: null, naval: null };
-  unlockedProducerCountCache = null;
-  rlSocketStopBackgroundThread();
-  rlSocketClose();
-  if (rlSocket.queue != null) rlSocket.queue.clear();
-  if (rlSocket.queueSize != null) rlSocket.queueSize.set(0);
-  rlQMeta = emptyRLMeta();
-  rlSchemaLastLoadTick = -9999;
-  rlSchemaLastErrorTick = -9999;
-  rlQTable = null;
-  rlQTableLastLoadTick = -9999;
-  rlQTableLastErrorTick = -9999;
-  applyMobileSafeMode();
-  aiHud.table = null;
-  aiHud.button = null;
-  aiHud.debugLabel = null;
-  aiHud.useIcon = false;
-  ensureHudButton();
-  ensureRuntimeEconomyConfig(true);
-  loadRLSchema(true);
-  if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") loadQTable();
-  if (config.rlPolicyMode == "nn") loadNNModel();
-  Log.info("[IA] Mundo carregado. Preparando plano de base.");
+  try {
+    runtimeGuardState.errorTicks = {};
+    state.built = false;
+    state.lastMode = "";
+    state.tick = 0;
+    state.lastWaveTick = -9999;
+    state.lastRallyTick = -9999;
+    state.waveIndex = 0;
+    state.drillCount = 0;
+    state.turretCount = 0;
+    state.powerClusters = 0;
+    state.pumpCount = 0;
+    state.liquidHubCount = 0;
+    state.thermalCount = 0;
+    state.industryBlocks = 0;
+    state.factoryBlocks = 0;
+    state.actionHistory = [];
+    state.lastActionTicks = {};
+    state.lastMicroAction = "";
+    state.aiEnabled = config.aiEnabledDefault === true;
+    state.observerMode = config.observerMode === true;
+    state.playerTakeoverEnabled = config.aiControlPlayerUnit === true;
+    state.lastFactoryConfigTick = -9999;
+    state.lastErrorTick = -9999;
+    state.lastTapTick = -9999;
+    state.lastTapX = -1;
+    state.lastTapY = -1;
+    state.lastWarnTick = -9999;
+    state.lastReward = 0;
+    state.lastQSaveTick = -9999;
+    state.lastLogicTick = -9999;
+    state.currentStrategy = "balanced";
+    state.lastStrategyTick = -9999;
+    state.playerControlledUnitId = -1;
+    state.playerControllerMode = null;
+    state.playerControllerSet = false;
+    state.lastControllerAttemptTick = -9999;
+    state.controllerResetPenalty = 0;
+    state.nnModel = null;
+    state.nnLastLoadTick = -9999;
+    state.nnLastSaveTick = -9999;
+    state.nnLastErrorTick = -9999;
+    state.microPolicies = {};
+    state.microLastLoadTicks = {};
+    state.microLastErrorTicks = {};
+    state.pendingMicroTransition = null;
+    state.rlEpsilon = config.rlEpsilon != null ? config.rlEpsilon : -1;
+    state.lastRLState = null;
+    state.lastMicroReward = 0;
+    state.gameOverEventSent = false;
+    state.contentDemandTick = -9999;
+    state.contentDemand = {};
+    state.contentDemandSimple = {};
+    state.contentDemandProfile = {};
+    state.buildSummaryTick = -9999;
+    state.buildSummaryCache = {};
+    state.unitSummaryTick = -9999;
+    state.unitSummaryCache = {};
+    state.runtimeEconomyTick = -9999;
+    state.runtimeEconomyContext = "";
+    state.lastEconomicFocus = null;
+    state.logicControllers = { ground: null, air: null, naval: null };
+    unlockedProducerCountCache = null;
+    rlSocketStopBackgroundThread();
+    rlSocketClose();
+    if (rlSocket.queue != null) rlSocket.queue.clear();
+    if (rlSocket.queueSize != null) rlSocket.queueSize.set(0);
+    rlQMeta = emptyRLMeta();
+    rlSchemaLastLoadTick = -9999;
+    rlSchemaLastErrorTick = -9999;
+    rlQTable = null;
+    rlQTableLastLoadTick = -9999;
+    rlQTableLastErrorTick = -9999;
+    runGuardedCallbackStep("world-load:mobile-safe", "Falha ao aplicar mobile safe mode", function(){
+      applyMobileSafeMode();
+    });
+    aiHud.table = null;
+    aiHud.button = null;
+    aiHud.debugLabel = null;
+    aiHud.useIcon = false;
+    runGuardedCallbackStep("world-load:hud", "Falha ao inicializar HUD da IA", function(){
+      ensureHudButton();
+    });
+    runGuardedCallbackStep("world-load:runtime-economy", "Falha ao configurar economia em runtime", function(){
+      ensureRuntimeEconomyConfig(true);
+    });
+    runGuardedCallbackStep("world-load:rl-schema", "Falha ao carregar schema RL", function(){
+      loadRLSchema(true);
+    });
+    if (config.rlPolicyMode == "qtable" || config.rlPolicyMode == "hybrid") {
+      runGuardedCallbackStep("world-load:qtable", "Falha ao carregar Q-table", function(){
+        loadQTable();
+      });
+    }
+    if (config.rlPolicyMode == "nn") {
+      runGuardedCallbackStep("world-load:nn-model", "Falha ao carregar NN model", function(){
+        loadNNModel();
+      });
+    }
+    Log.info("[IA] Mundo carregado. Preparando plano de base.");
+  } catch (e) {
+    logThrottledError("world-load", "Erro geral no WorldLoadEvent", e, runtimeGuardInterval());
+  }
 });
 
 Events.on(GameOverEvent, function(e){
@@ -8277,7 +8626,7 @@ Events.on(GameOverEvent, function(e){
 Events.on(PlayerChatEvent, function(e){
   if (!config.aiChatToggle) return;
   if (e == null || e.message == null) return;
-  if (e.player != null && e.player.isLocal != null && !e.player.isLocal()) return;
+  if (e.player != null && hasCompatMember(e.player, "isLocal") && !safePlayerIsLocal(e.player)) return;
   var msg = String(e.message).trim().toLowerCase();
   if (msg.length == 0) return;
   var parts = msg.split(/\s+/);
@@ -8380,7 +8729,7 @@ Events.on(PlayerChatEvent, function(e){
 Events.on(TapEvent, function(e){
   if (!config.aiTapToggle) return;
   if (e == null || e.tile == null) return;
-  if (e.player != null && e.player.isLocal != null && !e.player.isLocal()) return;
+  if (e.player != null && hasCompatMember(e.player, "isLocal") && !safePlayerIsLocal(e.player)) return;
   var build = e.tile.build;
   if (build == null || build.block == null) return;
   var isCore = false;
@@ -8816,51 +9165,45 @@ function runAiStep(core, team) {
 
 
 Events.run(Trigger.update, function(){
-  state.tick++;
+  try {
+    state.tick++;
 
-  ensureHudButton();
-  ensurePlayerControlled();
+    ensureHudButton();
+    ensurePlayerControlled();
 
-  if (!state.aiEnabled) return;
-  if (Vars.state != null && Vars.state.gameOver) return;
+    if (!state.aiEnabled) return;
+    if (Vars.state != null && Vars.state.gameOver) return;
 
-  var headless = isHeadless();
-  var localPlayer = getLocalPlayer();
-  var fallbackTeam = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.defaultTeam : null;
-  var team = localPlayer != null ? localPlayer.team() : fallbackTeam;
-  if (team == null) team = getTeam();
-  var core = getCore(team);
-  if (core == null) {
-    warnBuildFail("Aguardando core...");
-    return;
-  }
-  if (!headless && localPlayer == null) {
+    var headless = isHeadless();
+    var localPlayer = getLocalPlayer();
+    var fallbackTeam = (Vars.state != null && Vars.state.rules != null) ? Vars.state.rules.defaultTeam : null;
+    var team = localPlayer != null ? safePlayerTeam(localPlayer) : fallbackTeam;
+    if (team == null) team = getTeam();
+    if (team == null) {
+      warnBuildFail("Aguardando team...");
+      return;
+    }
+    var core = localPlayer != null ? safePlayerCore(localPlayer) : null;
+    if (core == null) core = getCore(team);
+    if (core == null) {
+      warnBuildFail("Aguardando core...");
+      return;
+    }
+    if (!headless && localPlayer == null) {
     // Mobile/client edge case: em algumas versões o player local pode não estar pronto
     // no mesmo tick, mas já existe core/time; não bloquear IA por isso.
-    if ((state.tick - state.lastWarnTick) >= config.warnInterval) {
+      if ((state.tick - state.lastWarnTick) >= config.warnInterval) {
       warnBuildFail("Player local indisponível; IA rodando via team/core.");
     }
-  }
+    }
 
-  if (team == null) {
-    warnBuildFail("Aguardando team...");
+    var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
+    if (interval > 1 && (state.tick % interval) != 0) return;
+
+    runAiLogic();
+    updateHudDebug();
+  } catch (e2) {
+    logThrottledError("trigger-update", "Erro no Trigger.update", e2, runtimeGuardInterval());
     return;
   }
-
-  var interval = isMobileSafe() ? config.mobileLogicInterval : 1;
-  if (interval > 1 && (state.tick % interval) != 0) return;
-
-  if (isMobileSafe()) {
-    try {
-      runAiLogic();
-    } catch (e) {
-      if ((state.tick - state.lastErrorTick) > config.safeModeLogInterval) {
-        Log.info("[IA] Erro em safe mode. Continuando.");
-        state.lastErrorTick = state.tick;
-      }
-    }
-  } else {
-    runAiLogic();
-  }
-  updateHudDebug();
 });
